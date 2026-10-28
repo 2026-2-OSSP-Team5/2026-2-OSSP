@@ -1,0 +1,2 @@
+# Runtime and development tools are maintained in pyproject.toml.
+-e .[dev]
