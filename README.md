@@ -54,6 +54,37 @@ Watchdog 이벤트와 수정 시각·파일 크기를 변경 신호로 사용하
 `검사 완료`는 해당 버전의 분석을 마쳤다는 뜻이며, 가독성 문제가 없다는 뜻은 아닙니다.
 슬라이드 단위 변경 비교는 파일 단위 자동 검사 흐름을 안정화한 뒤 확장할 수 있습니다.
 
+### 저장 감지 실행
+
+프로젝트 폴더에서 PowerShell을 열고 실행합니다.
+
+```powershell
+# 감시할 폴더 준비
+New-Item -ItemType Directory -Path .\input -Force | Out-Null
+
+# 해당 폴더와 하위 폴더를 감시하고 콘솔·파일에 로그 출력
+.\.venv\Scripts\python.exe -m slideguard watch ".\input" --recursive --log-file ".\output\watch.log"
+```
+
+감시를 시작한 뒤 PowerPoint에서 해당 폴더에 `.pptx` 파일을 저장하거나, 기존 파일의 내용을 수정하고 저장합니다.
+콘솔과 `output/watch.log`에 다음 형식으로 저장 감지가 표시됩니다. 로그 파일은 UTF-8로 기록합니다.
+
+```text
+2026-10-29 10:00:00 INFO WATCH_STARTED | directory=C:\presentations | recursive=True | settle=0.80s | baseline=1
+2026-10-29 10:00:05 INFO SAVE_DETECTED | 저장 감지 | file=...\발표.pptx | sha256=... | bytes=...
+```
+
+- 폴더 경로를 생략하면 명령을 실행한 현재 폴더를 감시합니다.
+- `--recursive`를 생략하면 지정한 폴더 바로 아래 파일만 감시합니다.
+- `--settle-seconds 1.5`처럼 파일 변경이 멈춘 뒤 확인할 대기 시간을 조절할 수 있습니다. 기본값은 0.8초입니다.
+- 시작 시 이미 존재하는 정상 PPTX는 비교 기준으로 기록합니다. 기존 파일에 대한 `SAVE_DETECTED`는 이후 저장으로 파일 바이트가 달라졌을 때 출력합니다.
+- PowerPoint 잠금 파일과 임시 파일, 내용이 같은 파일의 중복 저장 알림은 제외합니다.
+- 읽기 실패나 불완전한 PPTX는 잠시 재시도하고, 계속 읽을 수 없으면 `SAVE_UNREADABLE`을 출력합니다. 이후 파일이 변경되면 다시 확인합니다.
+- `Ctrl+C`로 종료합니다. 감시 대상 폴더는 실행 전에 존재해야 합니다.
+
+`watch` 명령은 **PPTX 저장 감지와 콘솔·로그 출력**을 제공합니다. `.ppt`·`.pptm`과 가독성 자동 검사는 지원하지 않습니다.
+파일 비교 기준은 감시를 종료하면 초기화됩니다.
+
 ## 🛠️ 기술 스택
 
 | 구분             | 기술                         | 활용                                                                          |

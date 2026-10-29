@@ -10,9 +10,10 @@ jobs:
         with:
           python-version: '3.13'
       - run: python -m pip install -e ".[dev]"
-      - run: python -m ruff check src scripts
-      - run: python -m ruff format --check src scripts
+      - run: python -m ruff check src scripts tests
+      - run: python -m ruff format --check src scripts tests
       - run: python -m compileall -q src
       - run: python -m slideguard doctor
+      - run: python -m pytest -q
 
 # Hosted runners do not provide an activated desktop PowerPoint installation.
