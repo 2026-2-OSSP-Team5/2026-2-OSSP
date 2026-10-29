@@ -44,6 +44,13 @@ def main(argv=None) -> int:
     commands.add_parser("gui", help="Open the desktop window")
     inspect = commands.add_parser("inspect", help="Extract saved PPTX object metadata; rules not enabled")
     inspect.add_argument("file", type=Path)
+    watch = commands.add_parser("watch", help="Log saved PPTX changes in a directory")
+    watch.add_argument(
+        "directory", type=Path, nargs="?", default=Path.cwd(), help="Watch folder (default: cwd)"
+    )
+    watch.add_argument("--recursive", action="store_true", help="Include subfolders")
+    watch.add_argument("--settle-seconds", type=float, default=0.8, help="Quiet time before checking a save")
+    watch.add_argument("--log-file", type=Path, help="Also append UTF-8 logs to this .log file")
     args = parser.parse_args(argv)
     if args.command == "doctor":
         info = environment_info()
@@ -56,6 +63,18 @@ def main(argv=None) -> int:
         from .ui.desktop import main as desktop_main
 
         return desktop_main()
+    if args.command == "watch":
+        from .watch_cli import watch_directory
+
+        try:
+            return watch_directory(
+                args.directory,
+                recursive=args.recursive,
+                settle_seconds=args.settle_seconds,
+                log_file=args.log_file,
+            )
+        except (OSError, ValueError) as error:
+            parser.exit(2, f"Watch error: {error}\n")
     from .bootstrap import build_analyzer
     from .domain.policy import AnalysisPolicy
 
