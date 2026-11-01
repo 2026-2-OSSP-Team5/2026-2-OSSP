@@ -27,6 +27,12 @@ class PowerPointOpenError(PowerPointSessionError):
     """The supplied temporary PPTX copy could not be opened."""
 
 
+class PowerPointSourceChangedError(PowerPointOpenError):
+    """The source changed while preparing a copy; a fresh read can be scheduled."""
+
+    retryable = True
+
+
 class PowerPointExtractionError(PowerPointSessionError):
     """Extraction failed or returned data outside the snapshot contract."""
 
