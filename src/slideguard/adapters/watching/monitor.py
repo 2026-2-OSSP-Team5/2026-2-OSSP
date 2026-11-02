@@ -1,59 +1,32 @@
 import logging
 import math
-import os
 import threading
 import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
-from hashlib import file_digest
 from pathlib import Path
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+from slideguard.adapters.watching.paths import absolute_path, accepts_path, presentation_paths
+from slideguard.adapters.watching.revisions import FileSignature
+from slideguard.adapters.watching.revisions import file_signature as _signature
+from slideguard.adapters.watching.revisions import saved_revision as _saved_revision
 from slideguard.application.ports import FileRemoved, FileWatchCallback, FileWatchEvent, SavedRevision
 
 LOGGER = logging.getLogger("slideguard.watch")
-
-type _Signature = tuple[int, int, int]
 
 
 @dataclass
 class _PendingSave:
     last_change: float
     first_seen: float
-    signature: _Signature | None = None
+    signature: FileSignature | None = None
     last_attempt: float = 0
     waiting_logged: bool = False
     missing_since: float | None = None
-
-
-def _stat_signature(info: os.stat_result) -> _Signature:
-    return info.st_size, info.st_mtime_ns, info.st_ino
-
-
-def _signature(path: Path) -> _Signature:
-    return _stat_signature(path.stat())
-
-
-def _saved_revision(path: Path) -> tuple[SavedRevision, _Signature]:
-    """A readable, complete PPTX revision; a quiet interval is checked by the caller."""
-    path = Path(os.path.abspath(path))
-    before = _signature(path)
-    with path.open("rb") as stream:
-        if before != _stat_signature(os.fstat(stream.fileno())):
-            raise OSError("File was replaced before checking the saved revision")
-        with zipfile.ZipFile(stream) as package:
-            if "ppt/presentation.xml" not in package.namelist() or package.testzip() is not None:
-                raise ValueError("Incomplete PPTX archive")
-        stream.seek(0)
-        digest = file_digest(stream, "sha256").hexdigest()
-        if before != _stat_signature(os.fstat(stream.fileno())):
-            raise OSError("File changed while reading the saved revision")
-    if before != _signature(path):
-        raise OSError("File changed while checking the saved revision")
-    return SavedRevision(path, digest, before[0]), before
 
 
 class _FolderEvents(FileSystemEventHandler):
@@ -100,7 +73,7 @@ class SavedFileMonitor:
         self.recursive = recursive
         self.settle_seconds = settle_seconds
         self.retry_seconds = retry_seconds
-        self._known: dict[Path, tuple[SavedRevision, _Signature]] = {}
+        self._known: dict[Path, tuple[SavedRevision, FileSignature]] = {}
         self._present: set[Path] = set()
         self._pending: dict[Path, _PendingSave] = {}
         self._condition = threading.Condition()
@@ -120,23 +93,14 @@ class SavedFileMonitor:
         )
 
     def _accepts(self, path: Path) -> bool:
-        try:
-            relative = path.relative_to(self.path)
-        except ValueError:
-            return False
-        return (
-            path.suffix.lower() == ".pptx"
-            and not path.name.startswith(("~$", ".", "~"))
-            and (self.recursive or len(relative.parts) == 1)
-        )
+        return accepts_path(self.path, path, recursive=self.recursive)
 
     def _files(self):
-        candidates = self.path.rglob("*") if self.recursive else self.path.iterdir()
-        return (p for p in candidates if self._accepts(p) and p.is_file())
+        return presentation_paths(self.path, recursive=self.recursive)
 
     def _enqueue(self, path: Path) -> None:
         # Use absolute lexical paths so deleted/moved source paths can still be queued.
-        path = Path(os.path.abspath(path))
+        path = absolute_path(path)
         if not self._accepts(path):
             return
         now = time.monotonic()

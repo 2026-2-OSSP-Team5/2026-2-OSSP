@@ -14,6 +14,7 @@ from pptx import Presentation
 from pptx.util import Inches
 
 from slideguard.adapters.watching import monitor as watching
+from slideguard.adapters.watching import revisions as saved_files
 from slideguard.adapters.watching.monitor import SavedFileMonitor
 from slideguard.application.ports import FileRemoved, SavedRevision
 
@@ -630,14 +631,14 @@ def test_validation_rejects_bytes_changed_during_hashing(tmp_path, monkeypatch):
     path = tmp_path / "changing.pptx"
     original = pptx_bytes("initial")
     path.write_bytes(original)
-    original_digest = watching.file_digest
+    original_digest = saved_files.file_digest
 
     def read_then_change(stream, algorithm):
         digest = original_digest(stream, algorithm)
         path.write_bytes(original + b"\n")
         return digest
 
-    monkeypatch.setattr(watching, "file_digest", read_then_change)
+    monkeypatch.setattr(saved_files, "file_digest", read_then_change)
     with pytest.raises(OSError, match="changed"):
         watching._saved_revision(path)
 
