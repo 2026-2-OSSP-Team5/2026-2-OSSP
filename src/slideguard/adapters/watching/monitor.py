@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 import threading
 import time
 import zipfile
@@ -11,35 +12,48 @@ from pathlib import Path
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+from slideguard.application.ports import FileRemoved, FileWatchCallback, FileWatchEvent, SavedRevision
+
 LOGGER = logging.getLogger("slideguard.watch")
+
+type _Signature = tuple[int, int, int]
 
 
 @dataclass
 class _PendingSave:
     last_change: float
     first_seen: float
-    signature: tuple[int, int, int] | None = None
+    signature: _Signature | None = None
     last_attempt: float = 0
     waiting_logged: bool = False
+    missing_since: float | None = None
 
 
-def _signature(path: Path) -> tuple[int, int, int]:
-    stat = path.stat()
-    return stat.st_size, stat.st_mtime_ns, stat.st_ino
+def _stat_signature(info: os.stat_result) -> _Signature:
+    return info.st_size, info.st_mtime_ns, info.st_ino
 
 
-def _saved_revision(path: Path) -> tuple[str, tuple[int, int, int]]:
+def _signature(path: Path) -> _Signature:
+    return _stat_signature(path.stat())
+
+
+def _saved_revision(path: Path) -> tuple[SavedRevision, _Signature]:
     """A readable, complete PPTX revision; a quiet interval is checked by the caller."""
+    path = Path(os.path.abspath(path))
     before = _signature(path)
     with path.open("rb") as stream:
+        if before != _stat_signature(os.fstat(stream.fileno())):
+            raise OSError("File was replaced before checking the saved revision")
         with zipfile.ZipFile(stream) as package:
             if "ppt/presentation.xml" not in package.namelist() or package.testzip() is not None:
                 raise ValueError("Incomplete PPTX archive")
         stream.seek(0)
         digest = file_digest(stream, "sha256").hexdigest()
+        if before != _stat_signature(os.fstat(stream.fileno())):
+            raise OSError("File changed while reading the saved revision")
     if before != _signature(path):
         raise OSError("File changed while checking the saved revision")
-    return digest, before
+    return SavedRevision(path, digest, before[0]), before
 
 
 class _FolderEvents(FileSystemEventHandler):
@@ -63,6 +77,8 @@ class SavedFileMonitor:
 
     The in-memory baseline tracks last detected file bytes, not the last analysis result.
     Watchdog callbacks only queue paths; ZIP checks and user callbacks run in one worker.
+    Event callbacks should enqueue and return promptly. Downstream retry belongs to
+    the consumer; failed delivery does not roll back the last detected version.
     """
 
     def __init__(
@@ -70,6 +86,7 @@ class SavedFileMonitor:
         path: Path,
         on_saved: Callable[[Path], None] | None = None,
         *,
+        on_event: FileWatchCallback | None = None,
         recursive: bool = False,
         settle_seconds: float = 0.8,
         retry_seconds: float = 10.0,
@@ -79,10 +96,12 @@ class SavedFileMonitor:
                 raise ValueError(f"{name} must be a finite positive number")
         self.path = path.resolve()
         self.on_saved = on_saved
+        self.on_event = on_event
         self.recursive = recursive
         self.settle_seconds = settle_seconds
         self.retry_seconds = retry_seconds
-        self._known: dict[Path, tuple[str, tuple[int, int, int]]] = {}
+        self._known: dict[Path, tuple[SavedRevision, _Signature]] = {}
+        self._present: set[Path] = set()
         self._pending: dict[Path, _PendingSave] = {}
         self._condition = threading.Condition()
         self._stopped = threading.Event()
@@ -117,7 +136,7 @@ class SavedFileMonitor:
 
     def _enqueue(self, path: Path) -> None:
         # Use absolute lexical paths so deleted/moved source paths can still be queued.
-        path = path.absolute()
+        path = Path(os.path.abspath(path))
         if not self._accepts(path):
             return
         now = time.monotonic()
@@ -132,7 +151,7 @@ class SavedFileMonitor:
 
     def _reconcile(self) -> None:
         files = set(self._files())
-        for path in files | self._known.keys():
+        for path in files | self._known.keys() | self._present:
             try:
                 changed = path not in self._known or self._known[path][1] != _signature(path)
             except FileNotFoundError:
@@ -144,6 +163,21 @@ class SavedFileMonitor:
                 if not pending:
                     self._enqueue(path)
 
+    def _reconcile_missing(self) -> None:
+        # Windows can report only the old half of an out-of-scope folder rename,
+        # which Watchdog cannot turn into a paired move/child deletion event.
+        # Check known presence only; do not rescan folders or rehash file contents.
+        for path in tuple(self._present):
+            try:
+                path.stat()
+            except FileNotFoundError:
+                with self._condition:
+                    pending = path in self._pending
+                if not pending:
+                    self._enqueue(path)
+            except OSError:
+                continue  # Inaccessibility alone does not prove removal.
+
     def start(self) -> None:
         if self._observer is not None:
             raise RuntimeError("Create a new monitor to start another watch session")
@@ -151,6 +185,7 @@ class SavedFileMonitor:
             raise NotADirectoryError(f"Watch directory does not exist: {self.path}")
         # Existing files establish a baseline; they are not reported as new saves.
         for path in self._files():
+            self._present.add(path)
             try:
                 self._known[path] = _saved_revision(path)
             except (OSError, ValueError, zipfile.BadZipFile, RuntimeError):
@@ -179,11 +214,15 @@ class SavedFileMonitor:
         )
 
     def _run(self) -> None:
+        next_presence_check = time.monotonic() + 1.0
         while not self._stopped.is_set():
             with self._condition:
                 self._condition.wait(timeout=0.1)
                 rescan, self._rescan = self._rescan, False
                 pending = list(self._pending.items())
+            if time.monotonic() >= next_presence_check:
+                self._reconcile_missing()
+                next_presence_check = time.monotonic() + 1.0
             if rescan:
                 try:
                     self._reconcile()
@@ -199,19 +238,31 @@ class SavedFileMonitor:
         try:
             signature = _signature(path)
         except FileNotFoundError:
-            # Delay deletion to tolerate atomic replace saves.
-            if now - candidate.last_change >= self.settle_seconds:
+            # Start from observed absence, even when a deletion event arrives late.
+            if candidate.missing_since is None:
+                candidate.missing_since = now
+                return
+            if now - max(candidate.last_change, candidate.missing_since) >= self.settle_seconds:
                 with self._condition:
                     if self._pending.get(path) is not candidate:
                         return
                     self._pending.pop(path)
-                    existed = self._known.pop(path, None)
-                if existed is not None:
+                    existed = path in self._present
+                    self._present.discard(path)
+                    self._known.pop(path, None)
+                if existed:
                     LOGGER.info("FILE_REMOVED | file=%s", path)
+                    self._notify_event(FileRemoved(path))
             return
         except OSError as error:
+            candidate.missing_since = None  # An unreadable path is not confirmed absence.
             self._retry(path, candidate, error)
             return
+        with self._condition:
+            self._present.add(path)
+        if candidate.missing_since is not None:
+            candidate.missing_since = None
+            candidate.last_change = now
         if candidate.signature is not None and signature != candidate.signature:
             candidate.last_change = now
         candidate.signature = signature
@@ -219,7 +270,7 @@ class SavedFileMonitor:
             return
         candidate.last_attempt = now
         try:
-            digest, signature = _saved_revision(path)
+            revision, signature = _saved_revision(path)
         except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as error:
             self._retry(path, candidate, error)
             return
@@ -227,17 +278,32 @@ class SavedFileMonitor:
             if self._pending.get(path) is not candidate:
                 return  # A later event arrived while reading this revision.
             previous = self._known.get(path)
-            self._known[path] = (digest, signature)
+            self._known[path] = (revision, signature)
             self._pending.pop(path)
-        if previous is not None and previous[0] == digest:
+        if previous is not None and previous[0].source_sha256 == revision.source_sha256:
             return
-        LOGGER.info("SAVE_DETECTED | 저장 감지 | file=%s | sha256=%s | bytes=%d", path, digest, signature[0])
+        LOGGER.info(
+            "SAVE_DETECTED | 저장 감지 | file=%s | sha256=%s | bytes=%d",
+            path,
+            revision.source_sha256,
+            revision.size_bytes,
+        )
+        self._notify_event(revision)
         if self.on_saved is not None:
             try:
                 self.on_saved(path)
             except Exception:
                 # A consumer failure must not terminate filesystem monitoring.
                 LOGGER.exception("SAVE_CALLBACK_FAILED | file=%s", path)
+
+    def _notify_event(self, event: FileWatchEvent) -> None:
+        if self.on_event is not None:
+            try:
+                self.on_event(event)
+            except Exception:
+                LOGGER.exception(
+                    "EVENT_CALLBACK_FAILED | event=%s | file=%s", type(event).__name__, event.source_path
+                )
 
     def _retry(self, path: Path, candidate: _PendingSave, error: Exception) -> None:
         if not candidate.waiting_logged:
