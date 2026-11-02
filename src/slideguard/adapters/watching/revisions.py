@@ -1,5 +1,7 @@
+import lzma
 import os
 import zipfile
+import zlib
 from hashlib import file_digest
 from pathlib import Path
 
@@ -24,9 +26,12 @@ def saved_revision(path: Path) -> tuple[SavedRevision, FileSignature]:
     with path.open("rb") as stream:
         if before != _stat_signature(os.fstat(stream.fileno())):
             raise OSError("File was replaced before checking the saved revision")
-        with zipfile.ZipFile(stream) as package:
-            if "ppt/presentation.xml" not in package.namelist() or package.testzip() is not None:
-                raise ValueError("Incomplete PPTX archive")
+        try:
+            with zipfile.ZipFile(stream) as package:
+                if "ppt/presentation.xml" not in package.namelist() or package.testzip() is not None:
+                    raise ValueError("Incomplete PPTX archive")
+        except (zlib.error, lzma.LZMAError) as error:
+            raise ValueError(f"Damaged PPTX compressed data: {error}") from None
         stream.seek(0)
         digest = file_digest(stream, "sha256").hexdigest()
         if before != _stat_signature(os.fstat(stream.fileno())):

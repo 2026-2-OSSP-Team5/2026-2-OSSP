@@ -9,7 +9,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
-from slideguard.domain.models import Box, DeckSnapshot, Shape, TextRun
+from slideguard.domain.models import Box, DeckSnapshot, ObjectLocator, Shape, TextRun
 
 from .errors import (
     PowerPointBusyError,
@@ -21,6 +21,7 @@ from .errors import (
     PowerPointSessionError,
     PowerPointUnavailableError,
 )
+from .properties import com_hresult
 
 _BUSY_HRESULTS = {0x80010001, 0x8001010A}  # CALL_REJECTED, SERVERCALL_RETRYLATER
 _NOT_INSTALLED_HRESULTS = {0x80040154, 0x800401F3}  # CLASSNOTREG, CLASSSTRING
@@ -74,7 +75,7 @@ def _plain_snapshot(snapshot: DeckSnapshot) -> DeckSnapshot:
             return value
         if type(value) is tuple:
             return tuple(copy(item) for item in value)
-        if type(value) in (DeckSnapshot, Shape, TextRun, Box):
+        if type(value) in (DeckSnapshot, Shape, TextRun, Box, ObjectLocator):
             return type(value)(**{field.name: copy(getattr(value, field.name)) for field in fields(value)})
         raise TypeError("Snapshot fields must contain only domain models, tuples and plain Python scalars")
 
@@ -160,7 +161,7 @@ class PowerPointReadSession:
             except Exception as error:
                 hresult = None
                 if isinstance(error, runtime.com_error):
-                    hresult = error.hresult & 0xFFFFFFFF
+                    hresult = com_hresult(error)
                 busy = hresult in _BUSY_HRESULTS
                 error_type = _STAGE_ERRORS[operation]
                 if operation == "connect" and hresult in _NOT_INSTALLED_HRESULTS:

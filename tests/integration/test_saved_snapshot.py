@@ -86,7 +86,8 @@ def assert_revision(deck, fixture, path):
     assert deck.slide_count == 3
     assert deck.width_pt == pytest.approx(960)
     assert deck.height_pt == pytest.approx(540)
-    assert {(s.slide_number, s.shape_id, s.name) for s in deck.shapes} == set(fixture.shapes)
+    top_level = [s for s in deck.shapes if s.locator.kind == "shape" and len(s.locator.shape_path) == 1]
+    assert {(s.slide_number, s.shape_id, s.name) for s in top_level} == set(fixture.shapes)
     assert all(s.slide_number != 2 for s in deck.shapes)
     by_name = {shape.name: shape for shape in deck.shapes}
     basic = by_name["basic-text"]
@@ -107,7 +108,10 @@ def assert_revision(deck, fixture, path):
     for kind in ("table", "picture", "group"):
         unsupported = by_name[f"unsupported-{kind}"]
         assert not unsupported.supported and unsupported.text == "" and unsupported.runs == ()
-        assert any(f"Unsupported top-level shape type: {kind}" in note for note in unsupported.notes)
+        label = "Unsupported top-level" if kind == "picture" else "Container"
+        assert any(f"{label} shape type: {kind}" in note for note in unsupported.notes)
+    assert any(s.locator.kind == "table_cell" and s.text == "표 내부는 순회하지 않음" for s in deck.shapes)
+    assert any(len(s.locator.shape_path) == 2 and s.text == "그룹 내부는 순회하지 않음" for s in deck.shapes)
     assert deck.limitations
 
 

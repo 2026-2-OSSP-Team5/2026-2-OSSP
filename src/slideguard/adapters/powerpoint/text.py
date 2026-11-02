@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from slideguard.domain.models import Box, TextRun
 
 from .colors import read_color
-from .properties import number, read_optional, tristate
+from .properties import indexed_property, number, read_optional, tristate
 
 
 @dataclass(frozen=True)
@@ -15,7 +15,7 @@ class TextMeasurement:
     rendered_box: Box | None = None
 
 
-def _font(run, text: str, index: int, notes: list[str]) -> TextRun:
+def read_run(run, text: str, index: int, notes: list[str], *, modern: bool = False) -> TextRun:
     label = f"Run {index}"
     font = read_optional(lambda: run.Font, f"{label} font", notes)
     size = number(read_optional(lambda: font.Size, f"{label} font size", notes), f"{label} font size", notes)
@@ -23,25 +23,77 @@ def _font(run, text: str, index: int, notes: list[str]) -> TextRun:
         notes.append(f"{label} font size is mixed or nonpositive")
         size = None
     bold = tristate(read_optional(lambda: font.Bold, f"{label} bold", notes), f"{label} bold", notes)
+    if modern:
+        fill = read_optional(lambda: font.Fill, f"{label} text fill", notes)
+        fill_type = read_optional(lambda: fill.Type, f"{label} fill type", notes)
+        kinds = {1: "solid", 2: "pattern", 3: "gradient", 4: "texture", 5: "none", 6: "picture"}
+        kind = kinds.get(fill_type, "unknown") if type(fill_type) is int else "unknown"
+        visible = tristate(
+            read_optional(lambda: fill.Visible, f"{label} fill visibility", notes), label, notes
+        )
+        source_color = None
+        if kind == "solid":
+            color_format = read_optional(lambda: fill.ForeColor, f"{label} color", notes)
+            source_color = read_color(color_format, f"{label} color", notes)
+        transparency = (
+            number(
+                read_optional(lambda: fill.Transparency, f"{label} transparency", notes),
+                f"{label} transparency",
+                notes,
+                minimum=0,
+            )
+            if kind == "solid"
+            else None
+        )
+        if transparency is not None and transparency > 1:
+            transparency = None
+        color = source_color if visible is True and kind == "solid" and transparency == 0 else None
+        if color is None:
+            notes.append(f"{label} has transparent, non-solid or unverified text fill; opaque RGB is unknown")
+        return TextRun(text, size, color, bold, source_color, transparency, kind, visible)
+    notes.append(f"{label} text fill/transparency is unavailable; opaque RGB is unknown")
     color_format = read_optional(lambda: font.Color, f"{label} color", notes)
-    color = read_color(color_format, f"{label} color", notes)
-    return TextRun(text, font_size_pt=size, color=color, bold=bold)
+    return TextRun(text, size, None, bold, read_color(color_format, label, notes))
 
 
-def _runs(text_range, text: str, notes: list[str]) -> tuple[TextRun, ...]:
-    count = read_optional(lambda: text_range.Runs().Count, "Text run count", notes)
+def _runs(text_range, text: str, notes: list[str], *, modern: bool = False) -> tuple[TextRun, ...]:
+    # Office TextRange2 has no Count property. Runs(i) clamps to the last run,
+    # so stop on exact text coverage and reject repeated source positions.
+    count = (
+        len(text.encode("utf-16-le")) // 2
+        if modern
+        else read_optional(lambda: text_range.Runs().Count, "Text run count", notes)
+    )
     if type(count) is not int or count < 1:
         notes.append("Text run segmentation is unavailable; plain text was preserved")
         return ()
     runs = []
+    previous_start = None
     for index in range(1, count + 1):
-        run = read_optional(lambda index=index: text_range.Runs(index, 1), f"Run {index}", notes)
+        run = read_optional(
+            lambda index=index: (
+                indexed_property(text_range, "Runs", index, 1) if modern else text_range.Runs(index, 1)
+            ),
+            f"Run {index}",
+            notes,
+        )
         value = read_optional(lambda run=run: run.Text, f"Run {index} text", notes)
         if type(value) is not str:
             notes.append("Text run coverage could not be verified; partial run segmentation was discarded")
             return ()
+        if modern:
+            start = read_optional(lambda run=run: run.Start, f"Run {index} start", notes)
+            if start is not None and previous_start is not None and start <= previous_start:
+                notes.append("Text run traversal repeated a source position; segmentation was discarded")
+                return ()
+            previous_start = start
         if value:
-            runs.append(_font(run, value, index, notes))
+            runs.append(read_run(run, value, index, notes, modern=modern))
+        combined = "".join(item.text for item in runs)
+        if modern and combined == text:
+            return tuple(runs)
+        if modern and not text.startswith(combined):
+            break
     if "".join(run.text for run in runs) != text:
         notes.append("Text runs do not reproduce the full text; unverified segmentation was discarded")
         return ()
@@ -89,7 +141,18 @@ def _bounds(shape, frame, text_range, notes: list[str]) -> Box | None:
     return Box(*values)
 
 
-def read_text(shape, notes: list[str]) -> TextMeasurement:
+def read_range(text_range, notes: list[str], *, modern: bool = True) -> TextMeasurement:
+    """Read text/formatting without assuming this range has slide-space bounds."""
+    text = read_optional(lambda: text_range.Text, "Text range content", notes)
+    if type(text) is not str:
+        notes.append("Text range content is unavailable")
+        return TextMeasurement()
+    if not text:
+        return TextMeasurement()
+    return TextMeasurement(text, _runs(text_range, text, notes, modern=modern))
+
+
+def read_text(shape, notes: list[str], *, layout_shape=None) -> TextMeasurement:
     frame = read_optional(lambda: shape.TextFrame, "Shape text frame", notes)
     text_range = read_optional(lambda: frame.TextRange, "Shape text range", notes)
     text = read_optional(lambda: text_range.Text, "Shape text", notes)
@@ -99,6 +162,11 @@ def read_text(shape, notes: list[str]) -> TextMeasurement:
     if not text:
         notes.append("Empty text; no visible run formatting or rendered bounds were measured")
         return TextMeasurement()
-    runs = _runs(text_range, text, notes)
-    bounds = _bounds(shape, frame, text_range, notes)
+    modern_range = read_optional(lambda: shape.TextFrame2.TextRange, "Modern text range", notes)
+    modern_text = read_optional(lambda: modern_range.Text, "Modern text content", notes)
+    if type(modern_text) is str and modern_text == text:
+        runs = _runs(modern_range, text, notes, modern=True)
+    else:
+        runs = _runs(text_range, text, notes)
+    bounds = _bounds(layout_shape or shape, frame, text_range, notes)
     return TextMeasurement(text, runs, bounds)

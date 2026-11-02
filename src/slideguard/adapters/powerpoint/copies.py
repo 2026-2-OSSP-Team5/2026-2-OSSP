@@ -1,5 +1,6 @@
 """Prepare and validate a private saved PPTX revision without changing its source."""
 
+import lzma
 import os
 import shutil
 import stat
@@ -70,7 +71,15 @@ def _validate_package(path: Path) -> None:
                 raise ValueError("Missing PPTX parts or duplicate ZIP members")
             if package.testzip() is not None:
                 raise ValueError("PPTX ZIP member failed its CRC check")
-    except (ValueError, OSError, zipfile.BadZipFile, RuntimeError, NotImplementedError, zlib.error) as error:
+    except (
+        ValueError,
+        OSError,
+        zipfile.BadZipFile,
+        RuntimeError,
+        NotImplementedError,
+        zlib.error,
+        lzma.LZMAError,
+    ) as error:
         failure = PowerPointOpenError("validate", f"Invalid or incomplete PPTX copy: {error}")
     if failure is not None:
         raise failure from None

@@ -27,6 +27,8 @@ class _PendingSave:
     last_attempt: float = 0
     waiting_logged: bool = False
     missing_since: float | None = None
+    retry_count: int = 0
+    next_attempt: float = 0
 
 
 class _FolderEvents(FileSystemEventHandler):
@@ -112,6 +114,11 @@ class SavedFileMonitor:
         with self._condition:
             self._rescan = True
             self._condition.notify()
+
+    def request_retry(self, path: Path) -> None:
+        """Retry a repaired/unreadable file even if no new filesystem event arrives."""
+        if not self._stopped.is_set():
+            self._enqueue(path)
 
     def _reconcile(self) -> None:
         files = set(self._files())
@@ -220,7 +227,8 @@ class SavedFileMonitor:
             return
         except OSError as error:
             candidate.missing_since = None  # An unreadable path is not confirmed absence.
-            self._retry(path, candidate, error)
+            if now >= candidate.next_attempt:
+                self._retry(path, candidate, error)
             return
         with self._condition:
             self._present.add(path)
@@ -229,8 +237,15 @@ class SavedFileMonitor:
             candidate.last_change = now
         if candidate.signature is not None and signature != candidate.signature:
             candidate.last_change = now
+            candidate.first_seen = now
+            candidate.retry_count = 0
+            candidate.next_attempt = 0
         candidate.signature = signature
-        if now - candidate.last_change < self.settle_seconds or now - candidate.last_attempt < 0.25:
+        if (
+            now - candidate.last_change < self.settle_seconds
+            or now - candidate.last_attempt < 0.25
+            or now < candidate.next_attempt
+        ):
             return
         candidate.last_attempt = now
         try:
@@ -270,6 +285,11 @@ class SavedFileMonitor:
                 )
 
     def _retry(self, path: Path, candidate: _PendingSave, error: Exception) -> None:
+        with self._condition:
+            if self._pending.get(path) is not candidate:
+                return
+        candidate.retry_count += 1
+        candidate.next_attempt = time.monotonic() + min(5.0, 0.5 * 2 ** min(candidate.retry_count - 1, 4))
         if not candidate.waiting_logged:
             LOGGER.warning("SAVE_WAITING | file=%s | reason=%s", path, error)
             candidate.waiting_logged = True

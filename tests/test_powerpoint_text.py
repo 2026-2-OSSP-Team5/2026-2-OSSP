@@ -49,7 +49,20 @@ def fill(*, visible=-1, fill_type=1, transparency=0, rgb=0xFFFFFF, color_type=1)
 
 
 def run(text, *, size=24.0, bold=0, rgb=0x332211, color_type=1):
-    return Properties(Text=text, Font=Properties(Size=size, Bold=bold, Color=color(rgb, color_type)))
+    color_value = color(rgb, color_type)
+    return Properties(
+        Text=text,
+        Font=Properties(
+            Size=size,
+            Bold=bold,
+            Color=color_value,
+            Fill=Properties(Visible=-1, Type=1, Transparency=0.0, ForeColor=color_value),
+        ),
+    )
+
+
+def opaque_run(text, size, rgb, bold):
+    return TextRun(text, size, rgb, bold, rgb, 0.0, "solid", True)
 
 
 class TextRange(Properties):
@@ -73,7 +86,13 @@ class TextRange(Properties):
         if start is None:
             return Properties(Count=self.count)
         self.calls.append((start, length))
-        assert length == 1 and 1 <= start <= len(self.items)
+        assert length == 1 and start >= 1
+        if not self.items:
+            raise AttributeError("Runs unavailable")
+        start = min(start, len(self.items))
+        self.items[start - 1].Start = 1 + sum(
+            len(item.Text.encode("utf-16-le")) // 2 for item in self.items[: start - 1]
+        )
         return self.items[start - 1]
 
 
@@ -89,6 +108,7 @@ def shape(runs=None, *, shape_type=17, text=None, shape_id=7):
         Width=300.0,
         Height=200.0,
         TextFrame=Properties(Orientation=1, TextRange=text_range),
+        TextFrame2=Properties(Orientation=1, TextRange=text_range),
         Rotation=0.0,
         HorizontalFlip=0,
         VerticalFlip=0,
@@ -143,9 +163,9 @@ def test_mixed_runs_preserve_text_sizes_bold_and_resolved_colors():
     result = measure(item)
     assert result.text == "작은 큰\r한글😀"
     assert result.runs == (
-        TextRun("작은 ", 12.0, (255, 0, 0), False),
-        TextRun("큰\r", 32.0, (0, 255, 0), True),
-        TextRun("한글😀", 18.0, (0, 0, 255), False),
+        opaque_run("작은 ", 12.0, (255, 0, 0), False),
+        opaque_run("큰\r", 32.0, (0, 255, 0), True),
+        opaque_run("한글😀", 18.0, (0, 0, 255), False),
     )
     assert item.TextFrame.TextRange.calls == [(1, 1), (2, 1), (3, 1)]
     assert result.box == Box(0.0, 0.0, 300.0, 200.0)
@@ -161,13 +181,13 @@ def test_equal_measured_attributes_do_not_merge_com_runs():
 
 def test_inherited_theme_format_uses_the_values_resolved_by_com():
     result = measure(shape([run("상속", size=28.5, bold=-1, color_type=2, rgb=0xCC8844)]))
-    assert result.runs == (TextRun("상속", 28.5, (68, 136, 204), True),)
+    assert result.runs == (opaque_run("상속", 28.5, (68, 136, 204), True),)
 
 
 @pytest.mark.parametrize("size", [0, -2, -1, None, float("nan"), float("inf"), "24"])
 def test_unknown_font_size_keeps_color_bold_and_the_next_run(size):
     result = measure(shape([run("A", size=size, bold=-1), run("B", size=36)]))
-    assert result.runs[0] == TextRun("A", None, (17, 34, 51), True)
+    assert result.runs[0] == opaque_run("A", None, (17, 34, 51), True)
     assert result.runs[1].font_size_pt == 36.0
     assert any("font size" in note for note in result.notes)
     assert result.rendered_box is not None and result.background is not None
@@ -187,7 +207,7 @@ def test_unavailable_font_keeps_the_run_text_and_rendered_bounds():
     item = run("A")
     item.Font = AttributeError("Font unavailable")
     result = measure(shape([item]))
-    assert result.runs == (TextRun("A"),)
+    assert result.runs == (TextRun("A", fill_kind="unknown"),)
     assert result.rendered_box is not None
     assert result.supported
 
@@ -195,7 +215,7 @@ def test_unavailable_font_keeps_the_run_text_and_rendered_bounds():
 @pytest.mark.parametrize("bold", [-2, 1, 2, None, True])
 def test_mixed_or_unknown_bold_is_none_without_losing_other_values(bold):
     result = measure(shape([run("A", bold=bold)]))
-    assert result.runs[0] == TextRun("A", 24.0, (17, 34, 51), None)
+    assert result.runs[0] == opaque_run("A", 24.0, (17, 34, 51), None)
 
 
 @pytest.mark.parametrize("color_type", [-2, 0, 3, None])
@@ -239,7 +259,7 @@ def test_unverifiable_segmentation_does_not_create_misleading_offsets(mode):
     elif mode == "coverage":
         item.TextFrame.TextRange.Text = "ABC"
     else:
-        item.TextFrame.TextRange.count = -1
+        item.TextFrame.TextRange.runs_failure = AttributeError("Run segmentation unavailable")
     result = measure(item)
     assert result.runs == ()
     assert result.text in ("AB", "ABC")
@@ -492,6 +512,10 @@ def test_reader_session_integration_returns_plain_measurements_and_cleans_up(tmp
             "font_size_pt": 30.0,
             "color": (17, 34, 51),
             "bold": True,
+            "source_color": (17, 34, 51),
+            "transparency": 0.0,
+            "fill_kind": "solid",
+            "fill_visible": True,
         }
     assert source.read_bytes() == original
     assert events == ["initialize", "close", "uninitialize"]

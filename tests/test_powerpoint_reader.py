@@ -233,10 +233,6 @@ def test_primary_shape_types_include_empty_text_and_basic_shapes(
 @pytest.mark.parametrize(
     "shape_type,label",
     [
-        (6, "group"),
-        (19, "table"),
-        (3, "chart"),
-        (24, "SmartArt"),
         (21, "diagram"),
         (13, "picture"),
         (999, "999"),
@@ -260,7 +256,7 @@ def test_unsupported_shapes_keep_metadata_without_traversing_content(
     assert any(label in note for note in result.notes)
 
 
-@pytest.mark.parametrize("contained_type", [3, 19, 24, 13])
+@pytest.mark.parametrize("contained_type", [13, 21])
 def test_non_text_placeholder_content_is_not_marked_supported(reader, runtime, source, contained_type):
     shape = ShapeProxy(shape_type=14, failures={"TextFrame": AssertionError("Unsupported content")})
     shape.PlaceholderFormat.ContainedType = contained_type

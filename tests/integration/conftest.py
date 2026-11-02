@@ -46,6 +46,7 @@ def powerpoint_environment(request, record_testsuite_property):
 
 @pytest.fixture
 def editing_document(powerpoint_environment, tmp_path):
+    import pythoncom
     import win32com.client
 
     folder = tmp_path / "편집 중인 문서"
@@ -53,9 +54,11 @@ def editing_document(powerpoint_environment, tmp_path):
     path = folder / "사용자 문서 보존.pptx"
     data = make_deck("편집 전 저장").data
     path.write_bytes(data)
-    application = win32com.client.DispatchEx("PowerPoint.Application")
+    pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+    application = None
     document = None
     try:
+        application = win32com.client.DispatchEx("PowerPoint.Application")
         document = application.Presentations.Open(str(path), ReadOnly=0, Untitled=0, WithWindow=-1)
         document.Slides.Item(1).Shapes.Item(1).TextFrame.TextRange.Text = "미저장 사용자 편집 보존"
         assert document.Saved == 0
@@ -68,3 +71,4 @@ def editing_document(powerpoint_environment, tmp_path):
             document.Close()
         document = application = None
         gc.collect()
+        pythoncom.CoUninitialize()

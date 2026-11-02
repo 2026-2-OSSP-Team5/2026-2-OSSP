@@ -1,12 +1,14 @@
-"""Convert top-level PowerPoint COM objects to the existing plain snapshot models."""
+"""Convert PowerPoint objects and addressed container contents to plain snapshots."""
 
 import math
+from dataclasses import replace
 from typing import Any
 
-from slideguard.domain.models import Box, DeckSnapshot, Shape
+from slideguard.domain.models import Box, DeckSnapshot, ObjectLocator, Shape
 
 from .background import read_background
 from .copies import SavedPresentationCopy
+from .elements import chart_elements, smartart_nodes, table_cells
 from .properties import read_optional
 from .text import TextMeasurement, read_text
 
@@ -15,7 +17,8 @@ _AUTO_SHAPE, _PLACEHOLDER, _TEXT_BOX = 1, 14, 17
 _SUPPORTED_TYPES = {_AUTO_SHAPE, _PLACEHOLDER, _TEXT_BOX}
 _TYPE_NAMES = {3: "chart", 6: "group", 13: "picture", 19: "table", 21: "diagram", 24: "SmartArt"}
 _LIMITATIONS = (
-    "Only top-level text boxes, AutoShapes and text placeholders are supported; other contents are not traversed",
+    "Groups, table cells, chart titles/axis titles/data labels and SmartArt nodes are addressed within one saved revision",
+    "Chart tick-label glyphs/legend layout and composite backgrounds are not reconstructed",
     "COM measurements are not pixel rendering; unresolved properties remain unknown and are described in shape notes",
     "Rendered bounds require verified horizontal, unrotated, unflipped, 2D visible text",
     "Background RGB requires confirmed uniform opaque coverage; complex layers and inherited backgrounds are not composed",
@@ -36,7 +39,9 @@ def _point(value, label: str, *, minimum: float | None = None) -> float:
     return float(value)
 
 
-def _shape(shape: Any, slide_number: int, slide: Any, shape_count: int) -> Shape:
+def _shape(
+    shape: Any, slide_number: int, slide: Any, shape_count: int, *, locator=None, nested=False
+) -> Shape:
     shape_id = _integer(shape.Id, "Shape.Id")
     box = Box(
         _point(shape.Left, "Shape.Left"),
@@ -59,17 +64,27 @@ def _shape(shape: Any, slide_number: int, slide: Any, shape_count: int) -> Shape
         )
         supported = type(contained_type) is int and contained_type in _SUPPORTED_TYPES
         if not supported:
-            notes.append(f"Unsupported placeholder content type: {contained_type}; content was not traversed")
+            if contained_type in (3, 6, 19, 24):
+                notes.append(
+                    f"Placeholder container content type: {contained_type}; addressed contents are extracted separately"
+                )
+            else:
+                notes.append(
+                    f"Unsupported placeholder content type: {contained_type}; content was not traversed"
+                )
     elif not supported:
         label = _TYPE_NAMES.get(shape_type, str(shape_type))
-        notes.append(f"Unsupported top-level shape type: {label}; content was not traversed")
+        if shape_type in (3, 6, 19, 24):
+            notes.append(f"Container shape type: {label}; addressed contents are extracted separately")
+        else:
+            notes.append(f"Unsupported top-level shape type: {label}; content was not traversed")
     measurement = TextMeasurement()
     background = None
     if supported:
         has_text_frame = read_optional(lambda: shape.HasTextFrame, "Shape.HasTextFrame", notes)
         if type(has_text_frame) is int and has_text_frame == -1:
             measurement = read_text(shape, notes)
-            if measurement.text:
+            if measurement.text and not nested:
                 background = read_background(
                     shape,
                     slide,
@@ -79,6 +94,8 @@ def _shape(shape: Any, slide_number: int, slide: Any, shape_count: int) -> Shape
                     shape_count=shape_count,
                     notes=notes,
                 )
+            elif measurement.text:
+                notes.append("Nested object background composition is unverified")
         elif shape_type == _PLACEHOLDER and type(has_text_frame) is int and has_text_frame == 0:
             supported = False
             notes.append("The placeholder has no confirmed text frame")
@@ -95,7 +112,72 @@ def _shape(shape: Any, slide_number: int, slide: Any, shape_count: int) -> Shape
         rendered_box=measurement.rendered_box,
         supported=supported,
         notes=tuple(notes),
+        locator=locator,
     )
+
+
+def _layout_verified(item) -> bool:
+    notes = []
+    values = [
+        read_optional(lambda name=name: getattr(item, name), name, notes)
+        for name in ("Rotation", "HorizontalFlip", "VerticalFlip", "Visible")
+    ]
+    rotation, horizontal, vertical, visible = values
+    three_d = read_optional(lambda: item.ThreeD.Visible, "Ancestor 3D visibility", notes)
+    return (
+        type(rotation) in (int, float)
+        and math.isfinite(rotation)
+        and rotation % 360 == 0
+        and type(horizontal) is int
+        and horizontal == 0
+        and type(vertical) is int
+        and vertical == 0
+        and type(visible) is int
+        and visible == -1
+        and type(three_d) is int
+        and three_d == 0
+    )
+
+
+def _walk(collection, number, slide, path=(), *, ancestor_verified=True, depth=0):
+    if depth > 64:
+        raise ValueError("Group nesting exceeds the supported traversal depth")
+    count = _integer(collection.Count, "Shapes.Count")
+    seen_ids = set()
+    for index in range(1, count + 1):
+        item = collection.Item(index)
+        shape_id = _integer(item.Id, "Shape.Id")
+        if shape_id in seen_ids:
+            raise ValueError(f"Duplicate shape ID on slide {number}: {shape_id}")
+        seen_ids.add(shape_id)
+        address = (*path, shape_id)
+        parent = _shape(item, number, slide, count, locator=ObjectLocator(address), nested=bool(path))
+        if not ancestor_verified:
+            parent = replace(
+                parent,
+                box=None,
+                rendered_box=None,
+                background=None,
+                notes=(*parent.notes, "Ancestor transforms prevent verified slide-space geometry"),
+            )
+        yield parent
+        notes = []
+        kind = read_optional(lambda item=item: item.Type, "Shape type", notes)
+        if kind == _PLACEHOLDER:
+            kind = read_optional(
+                lambda item=item: item.PlaceholderFormat.ContainedType, "Placeholder content", notes
+            )
+        verified = ancestor_verified and _layout_verified(item)
+        if kind == 6:
+            yield from _walk(
+                item.GroupItems, number, slide, address, ancestor_verified=verified, depth=depth + 1
+            )
+        elif kind == 19:
+            yield from table_cells(item, parent, layout_verified=verified)
+        elif kind == 3:
+            yield from chart_elements(item, parent, layout_verified=verified)
+        elif kind == 24:
+            yield from smartart_nodes(item, parent, layout_verified=verified)
 
 
 def extract_snapshot(presentation: Any, saved: SavedPresentationCopy) -> DeckSnapshot:
@@ -109,15 +191,7 @@ def extract_snapshot(presentation: Any, saved: SavedPresentationCopy) -> DeckSna
     shapes = []
     for number in range(1, slide_count + 1):
         slide = slides.Item(number)
-        collection = slide.Shapes
-        shape_count = _integer(collection.Count, "Shapes.Count")
-        seen_ids = set()
-        for index in range(1, shape_count + 1):
-            shape = _shape(collection.Item(index), number, slide, shape_count)
-            if shape.shape_id in seen_ids:
-                raise ValueError(f"Duplicate shape ID on slide {number}: {shape.shape_id}")
-            seen_ids.add(shape.shape_id)
-            shapes.append(shape)
+        shapes.extend(_walk(slide.Shapes, number, slide))
     return DeckSnapshot(
         source_path=str(saved.source_path),
         source_sha256=saved.source_sha256,
