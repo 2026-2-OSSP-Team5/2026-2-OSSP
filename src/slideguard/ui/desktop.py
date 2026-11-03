@@ -18,7 +18,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from slideguard.bootstrap import build_analyzer, build_report_repository
+from slideguard.bootstrap import (
+    build_analyzer,
+    build_report_repository,
+    build_workspace_settings_repository,
+)
 from slideguard.domain.policy import AnalysisPolicy
 
 
@@ -71,7 +75,7 @@ class MainWindow(QMainWindow):
 
         options_row = QHBoxLayout()
         self.recursive = QCheckBox("하위 폴더 포함")
-        self.recursive.toggled.connect(self.refresh_files)
+        self.recursive.toggled.connect(self.change_recursive_option)
         options_row.addWidget(self.recursive)
         options_row.addStretch()
 
@@ -125,6 +129,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(container)
         self.statusBar().showMessage("작업 폴더 선택 대기")
+        self.restore_workspace_settings()
         self.refresh_history()
 
     def choose_folder(self):
@@ -140,6 +145,57 @@ class MainWindow(QMainWindow):
         self.folder_label.setText(str(self.workspace))
         self.result_table.setRowCount(0)
         self.result_label.setText("파일을 선택한 뒤 검사 버튼을 눌러주세요.")
+        self.save_workspace_settings()
+        self.refresh_files()
+
+    def change_recursive_option(self):
+        self.refresh_files()
+        if self.workspace is not None:
+            self.save_workspace_settings()
+
+    def save_workspace_settings(self):
+        if self.workspace is None:
+            return
+
+        try:
+            build_workspace_settings_repository().save(self.workspace, self.recursive.isChecked())
+        except Exception as error:
+            self.statusBar().showMessage("작업 폴더 설정 저장 실패")
+            QMessageBox.warning(self, "설정 저장 실패", f"{type(error).__name__}: {error}")
+
+    def restore_workspace_settings(self):
+        try:
+            settings = build_workspace_settings_repository().load()
+        except Exception as error:
+            self.statusBar().showMessage("작업 폴더 설정 읽기 실패")
+            QMessageBox.warning(self, "설정 읽기 실패", f"{type(error).__name__}: {error}")
+            return
+
+        if settings is None:
+            return
+
+        self.recursive.blockSignals(True)
+        self.recursive.setChecked(settings.recursive)
+        self.recursive.blockSignals(False)
+
+        try:
+            is_valid = settings.workspace.is_dir()
+        except OSError:
+            is_valid = False
+
+        if not is_valid:
+            self.folder_label.setText(f"저장된 작업 폴더를 사용할 수 없습니다: {settings.workspace}")
+            self.statusBar().showMessage("저장된 작업 폴더를 사용할 수 없음")
+            QMessageBox.warning(
+                self,
+                "작업 폴더 복원 실패",
+                "저장된 작업 폴더가 없거나 접근할 수 없습니다. 새 작업 폴더를 선택하세요.\n"
+                f"{settings.workspace}",
+            )
+            return
+
+        self.workspace = settings.workspace
+        self.folder_label.setText(str(self.workspace))
         self.refresh_files()
 
     def refresh_files(self):

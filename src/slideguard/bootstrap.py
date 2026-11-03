@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 from slideguard.adapters.ooxml.reader import OoxmlDeckReader
-from slideguard.adapters.storage.sqlite import SqliteReportRepository
+from slideguard.adapters.storage.sqlite import SqliteReportRepository, SqliteWorkspaceSettingsRepository
 from slideguard.application.analyze import AnalyzePresentation
 
 
@@ -12,7 +12,7 @@ def build_analyzer() -> AnalyzePresentation:
 
 
 def report_database_path() -> Path:
-    """Return a stable, per-user writable location for report history."""
+    """Return a stable, per-user writable location for application data."""
     app_data = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
     base = Path(app_data) if app_data else Path.home() / ".local" / "share"
     return base / "SlideGuard" / "reports.sqlite3"
@@ -20,3 +20,7 @@ def report_database_path() -> Path:
 
 def build_report_repository() -> SqliteReportRepository:
     return SqliteReportRepository(report_database_path())
+
+
+def build_workspace_settings_repository() -> SqliteWorkspaceSettingsRepository:
+    return SqliteWorkspaceSettingsRepository(report_database_path())

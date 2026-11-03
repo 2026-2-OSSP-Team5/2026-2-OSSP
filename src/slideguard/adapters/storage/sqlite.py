@@ -22,6 +22,12 @@ class StoredReport:
     report: AnalysisReport
 
 
+@dataclass(frozen=True)
+class WorkspaceSettings:
+    workspace: Path
+    recursive: bool
+
+
 class SqliteReportRepository:
     def __init__(self, database_path: Path):
         self.database_path = database_path
@@ -29,7 +35,7 @@ class SqliteReportRepository:
     def save(self, report: AnalysisReport) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.database_path) as connection:
-            self._create_schema(connection)
+            _create_schema(connection)
             connection.execute(
                 """
                 INSERT INTO analysis_reports (
@@ -52,7 +58,7 @@ class SqliteReportRepository:
             return []
 
         with sqlite3.connect(self.database_path) as connection:
-            self._create_schema(connection)
+            _create_schema(connection)
             rows = connection.execute(
                 """
                 SELECT id, created_at, report_json
@@ -65,20 +71,63 @@ class SqliteReportRepository:
 
         return [StoredReport(row[0], row[1], _report_from_json(row[2])) for row in rows]
 
-    @staticmethod
-    def _create_schema(connection: sqlite3.Connection) -> None:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS analysis_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                source_path TEXT NOT NULL,
-                source_sha256 TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (status IN ('not_configured', 'analyzed')),
-                report_json TEXT NOT NULL
+
+class SqliteWorkspaceSettingsRepository:
+    def __init__(self, database_path: Path):
+        self.database_path = database_path
+
+    def save(self, workspace: Path, recursive: bool) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.database_path) as connection:
+            _create_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO workspace_settings (id, workspace_path, recursive)
+                VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    workspace_path = excluded.workspace_path,
+                    recursive = excluded.recursive
+                """,
+                (str(workspace), int(recursive)),
             )
-            """
+
+    def load(self) -> WorkspaceSettings | None:
+        if not self.database_path.exists():
+            return None
+
+        with sqlite3.connect(self.database_path) as connection:
+            _create_schema(connection)
+            row = connection.execute(
+                "SELECT workspace_path, recursive FROM workspace_settings WHERE id = 1"
+            ).fetchone()
+
+        if row is None:
+            return None
+        return WorkspaceSettings(workspace=Path(row[0]), recursive=bool(row[1]))
+
+
+def _create_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analysis_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('not_configured', 'analyzed')),
+            report_json TEXT NOT NULL
         )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workspace_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            workspace_path TEXT NOT NULL,
+            recursive INTEGER NOT NULL CHECK (recursive IN (0, 1))
+        )
+        """
+    )
 
 
 def _box(data: dict | None) -> Box | None:
