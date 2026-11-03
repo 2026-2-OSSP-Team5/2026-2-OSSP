@@ -53,20 +53,12 @@ class MainWindow(QMainWindow):
 
         self.file_table = QTableWidget(0, 2)
         self.file_table.setHorizontalHeaderLabels(["파일명", "폴더"])
-        self.file_table.setEditTriggers(
-            QTableWidget.EditTrigger.NoEditTriggers
-        )
-        self.file_table.setSelectionBehavior(
-            QTableWidget.SelectionBehavior.SelectRows
-        )
-        self.file_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
+        self.file_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.file_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.file_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.file_table)
 
-        layout.addWidget(
-            QLabel("검사 기능과 이력 저장은 이후 단계에서 연결합니다.")
-        )
+        layout.addWidget(QLabel("검사 기능과 이력 저장은 이후 단계에서 연결합니다."))
         self.setCentralWidget(container)
         self.statusBar().showMessage("작업 폴더 선택 대기")
 
@@ -92,11 +84,7 @@ class MainWindow(QMainWindow):
             if not self.workspace.is_dir():
                 raise OSError("선택한 폴더가 없거나 접근할 수 없습니다.")
 
-            entries = (
-                self.workspace.rglob("*")
-                if self.recursive.isChecked()
-                else self.workspace.iterdir()
-            )
+            entries = self.workspace.rglob("*") if self.recursive.isChecked() else self.workspace.iterdir()
             files = sorted(
                 (
                     path
@@ -115,12 +103,8 @@ class MainWindow(QMainWindow):
         self.file_table.setRowCount(len(files))
         for row, path in enumerate(files):
             relative_folder = path.parent.relative_to(self.workspace)
-            self.file_table.setItem(
-                row, 0, QTableWidgetItem(path.name)
-            )
-            self.file_table.setItem(
-                row, 1, QTableWidgetItem(str(relative_folder))
-            )
+            self.file_table.setItem(row, 0, QTableWidgetItem(path.name))
+            self.file_table.setItem(row, 1, QTableWidgetItem(str(relative_folder)))
 
         self.statusBar().showMessage(f"PPTX 파일 {len(files)}개")
 
