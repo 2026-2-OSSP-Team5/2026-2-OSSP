@@ -18,13 +18,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from slideguard.bootstrap import build_analyzer
+from slideguard.bootstrap import build_analyzer, build_report_repository
 from slideguard.domain.policy import AnalysisPolicy
 
 
 class AnalysisWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
+    storage_failed = Signal(str)
 
     def __init__(self, path: Path, parent=None):
         super().__init__(parent)
@@ -36,8 +37,13 @@ class AnalysisWorker(QThread):
             report = analyzer.execute(self.path, AnalysisPolicy())
         except Exception as error:
             self.failed.emit(f"{type(error).__name__}: {error}")
-        else:
-            self.succeeded.emit(report)
+            return
+
+        self.succeeded.emit(report)
+        try:
+            build_report_repository().save(report)
+        except Exception as error:
+            self.storage_failed.emit(f"{type(error).__name__}: {error}")
 
 
 class MainWindow(QMainWindow):
@@ -97,8 +103,29 @@ class MainWindow(QMainWindow):
         self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.result_table)
 
+        history_row = QHBoxLayout()
+        history_row.addWidget(QLabel("검사 이력"))
+        history_row.addStretch()
+        history_refresh_button = QPushButton("이력 새로고침")
+        history_refresh_button.clicked.connect(self.refresh_history)
+        history_row.addWidget(history_refresh_button)
+        open_history_button = QPushButton("선택 이력 열기")
+        open_history_button.clicked.connect(self.open_selected_history)
+        history_row.addWidget(open_history_button)
+        layout.addLayout(history_row)
+
+        self.history_table = QTableWidget(0, 4)
+        self.history_table.setHorizontalHeaderLabels(["저장 시각", "파일명", "상태", "발견 항목"])
+        self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.history_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.history_table.cellDoubleClicked.connect(self.open_selected_history)
+        layout.addWidget(self.history_table)
+
         self.setCentralWidget(container)
         self.statusBar().showMessage("작업 폴더 선택 대기")
+        self.refresh_history()
 
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -169,10 +196,11 @@ class MainWindow(QMainWindow):
         self.worker = AnalysisWorker(path, self)
         self.worker.succeeded.connect(self.show_report)
         self.worker.failed.connect(self.show_analysis_error)
+        self.worker.storage_failed.connect(self.show_storage_error)
         self.worker.finished.connect(self.finish_analysis)
         self.worker.start()
 
-    def show_report(self, report):
+    def show_report(self, report, from_history=False):
         deck = report.deck
 
         if report.status == "not_configured":
@@ -221,14 +249,57 @@ class MainWindow(QMainWindow):
                 cell.setToolTip(details)
                 self.result_table.setItem(row, column, cell)
 
-        self.statusBar().showMessage(
-            "파일 읽기 완료 · 검사 규칙 미설정" if report.status == "not_configured" else "검사 완료"
-        )
+        if from_history:
+            prefix = "저장된 이력 · "
+        else:
+            prefix = ""
+        status = "파일 읽기 완료 · 검사 규칙 미설정" if report.status == "not_configured" else "검사 완료"
+        self.statusBar().showMessage(prefix + status)
 
     def show_analysis_error(self, message):
         self.result_label.setText("검사에 실패했습니다.")
         self.statusBar().showMessage("검사 실패")
         QMessageBox.warning(self, "검사 실패", message)
+
+    def show_storage_error(self, message):
+        self.statusBar().showMessage("검사 결과 저장 실패")
+        QMessageBox.warning(
+            self,
+            "이력 저장 실패",
+            "검사 결과는 화면에 표시했지만 이력에는 저장하지 못했습니다.\n" + message,
+        )
+
+    def refresh_history(self):
+        try:
+            stored_reports = build_report_repository().list_recent()
+        except Exception as error:
+            self.statusBar().showMessage("검사 이력 읽기 실패")
+            QMessageBox.warning(self, "이력 읽기 실패", f"{type(error).__name__}: {error}")
+            return
+
+        self.history_table.setRowCount(len(stored_reports))
+        status_names = {"not_configured": "규칙 미설정", "analyzed": "검사 완료"}
+        for row, stored in enumerate(stored_reports):
+            report = stored.report
+            created_item = QTableWidgetItem(stored.created_at)
+            created_item.setData(Qt.ItemDataRole.UserRole, report)
+            self.history_table.setItem(row, 0, created_item)
+            self.history_table.setItem(row, 1, QTableWidgetItem(Path(report.deck.source_path).name))
+            self.history_table.setItem(
+                row,
+                2,
+                QTableWidgetItem(status_names.get(report.status, report.status)),
+            )
+            self.history_table.setItem(row, 3, QTableWidgetItem(str(len(report.findings))))
+
+    def open_selected_history(self, *_args):
+        row = self.history_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "이력 선택", "열어볼 검사 이력을 먼저 선택하세요.")
+            return
+
+        report = self.history_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        self.show_report(report, from_history=True)
 
     def finish_analysis(self):
         worker = self.worker
@@ -237,6 +308,7 @@ class MainWindow(QMainWindow):
             worker.deleteLater()
 
         self.centralWidget().setEnabled(True)
+        self.refresh_history()
 
     def closeEvent(self, event):
         if self.worker is not None:
