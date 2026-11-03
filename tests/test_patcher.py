@@ -50,7 +50,9 @@ class DocParagraph:
 
 
 class DocShape:
-    def __init__(self, runs=(), geometry=(50, 50, 400, 100), overflow=False, fill=None, autofit="none", spacings=()):
+    def __init__(
+        self, runs=(), geometry=(50, 50, 400, 100), overflow=False, fill=None, autofit="none", spacings=()
+    ):
         self._runs = list(runs)
         self.geometry = list(geometry)
         self.overflow = overflow
@@ -191,7 +193,11 @@ def test_failure_while_editing_removes_partial_copy(original, tmp_path):
     out = tmp_path / "o.pptx"
     with pytest.raises(RuntimeError):
         PowerPointPatcher(broken).apply(
-            str(original), sha256_of(str(original)), [proposal(Property.Z_ORDER, "b", "front")], FakePolicy(), str(out)
+            str(original),
+            sha256_of(str(original)),
+            [proposal(Property.Z_ORDER, "b", "front")],
+            FakePolicy(),
+            str(out),
         )
     assert not out.exists()
 
@@ -255,7 +261,9 @@ def test_font_family_changes_only_matching_runs(original, tmp_path):
 
 def test_partially_applied_bundle_is_warned(original, tmp_path):
     height = ChangeProposal(1, 5, Property.SHAPE_HEIGHT, 60, 90, 0.1, "overflow", group="overflow:1:5")
-    push = ChangeProposal(1, 7, Property.SHAPE_POSITION, (50, 170), (50, 190), 0.1, "overflow", group="overflow:1:5")
+    push = ChangeProposal(
+        1, 7, Property.SHAPE_POSITION, (50, 170), (50, 190), 0.1, "overflow", group="overflow:1:5"
+    )
     shape = DocShape(geometry=(50, 100, 400, 60))  # 객체 7은 문서에 없음 → 내리기 실패
     result = run_apply(original, tmp_path, shape, [height, push])
     assert any("일부만 적용" in w for w in result.warnings)

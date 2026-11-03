@@ -108,7 +108,9 @@ DocumentOpener = Callable[[str], AbstractContextManager[Document]]
 
 
 class PowerPointPatcher:
-    def __init__(self, open_document: DocumentOpener | None = None, bindings: TeamBindings | None = None) -> None:
+    def __init__(
+        self, open_document: DocumentOpener | None = None, bindings: TeamBindings | None = None
+    ) -> None:
         self._open_document = open_document or ComDocumentSession
         self._bindings = bindings or TeamBindings()
 
@@ -121,7 +123,9 @@ class PowerPointPatcher:
         output_path: str,
     ) -> ApplyResult:
         # ---- 1. 저장 위치 확인 ----------------------------------------
-        same = os.path.normcase(os.path.abspath(original_path)) == os.path.normcase(os.path.abspath(output_path))
+        same = os.path.normcase(os.path.abspath(original_path)) == os.path.normcase(
+            os.path.abspath(output_path)
+        )
         if same:
             raise ApplyRejected("원본 파일에는 직접 적용하지 않습니다. 다른 저장 위치를 지정하세요.")
         if os.path.exists(output_path):

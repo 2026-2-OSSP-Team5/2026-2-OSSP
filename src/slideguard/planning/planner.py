@@ -76,7 +76,12 @@ PROPERTY_GROUP = {
 }
 
 _PASSIVE = frozenset({Property.FONT_SIZE, Property.FONT_COLOR})
-_BALANCED = _PASSIVE | {Property.FONT_FAMILY, Property.SHAPE_POSITION, Property.SHAPE_HEIGHT, Property.Z_ORDER}
+_BALANCED = _PASSIVE | {
+    Property.FONT_FAMILY,
+    Property.SHAPE_POSITION,
+    Property.SHAPE_HEIGHT,
+    Property.Z_ORDER,
+}
 _AGGRESSIVE = _BALANCED | {Property.SHAPE_FILL, Property.AUTOFIT, Property.LINE_SPACING}
 
 
@@ -90,8 +95,12 @@ class StrengthProfile:
 
 
 STRENGTH_PROFILES = {
-    "passive": StrengthProfile("최소 수정", _PASSIVE, fix_design=False, design_budget=0.0, resolve_collisions=False),
-    "balanced": StrengthProfile("중간 수정", _BALANCED, fix_design=True, design_budget=0.15, resolve_collisions=False),
+    "passive": StrengthProfile(
+        "최소 수정", _PASSIVE, fix_design=False, design_budget=0.0, resolve_collisions=False
+    ),
+    "balanced": StrengthProfile(
+        "중간 수정", _BALANCED, fix_design=True, design_budget=0.15, resolve_collisions=False
+    ),
     "aggressive": StrengthProfile(
         "최대 수정", _AGGRESSIVE, fix_design=True, design_budget=1.0, resolve_collisions=True
     ),
@@ -264,9 +273,7 @@ class RuleBasedPlanner:
             lines = info.values.get("line_count", "?")
             words = info.values.get("max_words", "?")
             limit = f"{standards.max_lines.value:g}줄 x 줄당 {standards.max_words_per_line.value:g}단어"
-            return (
-                f"정보 과다 ({lines}줄, 줄당 최대 {words}단어 / 기준 {limit}) → 문장 압축·슬라이드 분할은 사람이 판단"
-            )
+            return f"정보 과다 ({lines}줄, 줄당 최대 {words}단어 / 기준 {limit}) → 문장 압축·슬라이드 분할은 사람이 판단"
         return REVIEW_REASONS.get(info.rule, "사람이 판단할 항목")
 
     # ==================================================================
@@ -402,9 +409,7 @@ class RuleBasedPlanner:
         target = standards.large_bold_text_pt.value if all_bold else standards.large_text_pt.value
         if smallest >= target:
             return None
-        note = (
-            f"글자 크기 {smallest}pt → {target}pt (큰 글자가 되어 명암비 기준 {standards.contrast_large.value}:1 적용)"
-        )
+        note = f"글자 크기 {smallest}pt → {target}pt (큰 글자가 되어 명암비 기준 {standards.contrast_large.value}:1 적용)"
         cost = _ratio_cost(smallest, target)
         return self._proposal(info, shape, Property.FONT_SIZE, smallest, target, cost, category, note)
 
@@ -472,18 +477,25 @@ class RuleBasedPlanner:
         note = f"상자 높이 {shape.height:g}pt → {new_h:g}pt (넘친 글자를 상자 안에)"
         cost = (new_h - shape.height) / slide_h
         if not blocked:
-            return [self._proposal(info, shape, Property.SHAPE_HEIGHT, shape.height, new_h, cost, category, note)], ""
+            return [
+                self._proposal(info, shape, Property.SHAPE_HEIGHT, shape.height, new_h, cost, category, note)
+            ], ""
 
         ids = ", ".join(str(o.shape_id) for o in blocked)
         if not push:
-            return [], f"상자를 키울 공간에 다른 객체(ID {ids})가 있음 → 사람이 판단 (최대 수정에서는 그 객체를 내림)"
+            return (
+                [],
+                f"상자를 키울 공간에 다른 객체(ID {ids})가 있음 → 사람이 판단 (최대 수정에서는 그 객체를 내림)",
+            )
 
         # 최대 수정: 가로막는 객체를 넘친 만큼 내림 → 상자 키우기와 한 묶음으로 적용
         group = f"overflow:{shape.slide_index}:{shape.shape_id}"
         bottom = shape.top + new_h
         moving_ids = {shape.shape_id} | {o.shape_id for o in blocked}
         bundle = [
-            self._proposal(info, shape, Property.SHAPE_HEIGHT, shape.height, new_h, cost, category, note, group=group)
+            self._proposal(
+                info, shape, Property.SHAPE_HEIGHT, shape.height, new_h, cost, category, note, group=group
+            )
         ]
         for other in blocked:
             shift = bottom - other.top
@@ -558,7 +570,9 @@ class RuleBasedPlanner:
         after = (round(left, 2), round(top, 2))
         note = f"겹친 객체 {other_id}와 떨어지도록 {direction} {distance:.0f}pt 이동"
         return [
-            self._proposal(info, shape, Property.SHAPE_POSITION, before, after, distance / slide_h, category, note)
+            self._proposal(
+                info, shape, Property.SHAPE_POSITION, before, after, distance / slide_h, category, note
+            )
         ], ""
 
     # ---- 슬라이드 밖·가장자리 → 안전 영역 안으로 ---------------------------
@@ -573,7 +587,9 @@ class RuleBasedPlanner:
         ratio = ctx["standards"].safe_margin_ratio.value
         mx, my = slide_w * ratio, slide_h * ratio
 
-        fits_safe = shape.width <= slide_w - 2 * mx + TOLERANCE and shape.height <= slide_h - 2 * my + TOLERANCE
+        fits_safe = (
+            shape.width <= slide_w - 2 * mx + TOLERANCE and shape.height <= slide_h - 2 * my + TOLERANCE
+        )
         if fits_safe:
             area = (mx, my, slide_w - mx, slide_h - my)
             where = f"가장자리 여백 {ratio:.0%} 안쪽으로"
@@ -613,7 +629,9 @@ class RuleBasedPlanner:
         if cover is not None and cover.kind == "picture":
             note += " → 사진 위 글씨가 되므로 재검사에서 명암비 확인"
         before = f"behind:{cover_id}"
-        return [self._proposal(info, shape, Property.Z_ORDER, before, "front", Z_ORDER_COST, category, note)], ""
+        return [
+            self._proposal(info, shape, Property.Z_ORDER, before, "front", Z_ORDER_COST, category, note)
+        ], ""
 
     # ---- 자동 맞춤 축소 → 해제 -----------------------------------------
 
@@ -647,7 +665,9 @@ class RuleBasedPlanner:
             return [], f"줄 간격 {current}배가 이미 기준 {required}배 이상"
         note = f"줄 간격 {current}배 → {required}배 (윗줄·아랫줄 글자 겹침 방지)"
         cost = _ratio_cost(current, required)
-        return [self._proposal(info, shape, Property.LINE_SPACING, current, required, cost, category, note)], ""
+        return [
+            self._proposal(info, shape, Property.LINE_SPACING, current, required, cost, category, note)
+        ], ""
 
     # ---- 글씨체 (장식·손글씨 글꼴) ----------------------------------------
     # 회의록: 최소 수정은 글꼴을 건드리지 않고, 공격적 수정이면 고딕으로 통일
@@ -660,7 +680,9 @@ class RuleBasedPlanner:
             return [], "이미 권장 글씨체"
         note = f"글씨체 '{name}' → '{recommended}' (장식·손글씨 글꼴을 고딕 계열로)"
         return [
-            self._proposal(info, shape, Property.FONT_FAMILY, name, recommended, FONT_FAMILY_COST, category, note)
+            self._proposal(
+                info, shape, Property.FONT_FAMILY, name, recommended, FONT_FAMILY_COST, category, note
+            )
         ], ""
 
     # ---- 시각적 위계 (제목이 본문보다 충분히 크지 않음) ----------------------

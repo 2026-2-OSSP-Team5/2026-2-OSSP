@@ -229,14 +229,18 @@ class TeamBindings:
             if has_shapes and (slide_index, shape_id) in policy.locked_shapes:
                 return True
             return bool(has_props and prop in policy.locked_properties)
-        raise TypeError("정책에서 고정 항목을 읽을 수 없습니다. TeamBindings.is_locked를 실제 정책에 맞추세요.")
+        raise TypeError(
+            "정책에서 고정 항목을 읽을 수 없습니다. TeamBindings.is_locked를 실제 정책에 맞추세요."
+        )
 
     def user_locked_properties(self, policy: object) -> set[str]:
         result = set()
         for raw in getattr(policy, "user_locks", None) or ():
             name = _enum_text(raw)
             if name not in self.USER_LOCK_NAMES:
-                raise ValueError(f"알 수 없는 사용자 고정 항목: {name!r}. TeamBindings.USER_LOCK_NAMES에 추가하세요.")
+                raise ValueError(
+                    f"알 수 없는 사용자 고정 항목: {name!r}. TeamBindings.USER_LOCK_NAMES에 추가하세요."
+                )
             result.update(USER_LOCK_GROUPS[self.USER_LOCK_NAMES[name]])
         return result
 

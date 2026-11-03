@@ -180,7 +180,9 @@ def _round_up(value: float, step: float) -> float:
     return round(math.ceil(value / step - 1e-9) * step, 2)
 
 
-def min_font_for(viewing_ratio: float, char_arcmin: float, glyph_ratio: float, slide_height_pt: float) -> float:
+def min_font_for(
+    viewing_ratio: float, char_arcmin: float, glyph_ratio: float, slide_height_pt: float
+) -> float:
     """글자 높이가 char_arcmin 이상 보이게 하는 최소 글꼴 크기(pt).
 
     화면 위 글자 높이 / 거리 = (글꼴 × glyph_ratio / 슬라이드 높이) × (화면 높이 / 거리)
@@ -244,7 +246,9 @@ def build_standards(
     }
     for key, (value, basis) in defaults.items():
         if key in overrides:
-            params[key] = Criterion(_check_param(key, overrides[key]), f"사용자 지정 (프리셋: {value})", "사용자 지정")
+            params[key] = Criterion(
+                _check_param(key, overrides[key]), f"사용자 지정 (프리셋: {value})", "사용자 지정"
+            )
         else:
             kind = "가정" if basis.startswith("가정") else "표준"
             params[key] = Criterion(value, basis, kind)
@@ -307,7 +311,9 @@ def build_standards(
     for key in VALUE_KEYS:
         if key in overrides:
             new_value = _check_value(key, overrides[key])
-            values[key] = Criterion(new_value, f"사용자 지정 (근거 계산값: {computed[key].value})", "사용자 지정")
+            values[key] = Criterion(
+                new_value, f"사용자 지정 (근거 계산값: {computed[key].value})", "사용자 지정"
+            )
 
     result = Standards(purpose=purpose, label=preset["label"], parameters=params, **values)
     result.warnings = _warnings(result, computed)
@@ -378,5 +384,7 @@ def _warnings(s: Standards, computed: dict[str, Criterion]) -> list[str]:
     for key, name in (("contrast_normal", "일반 글자 명암비"), ("contrast_large", "큰 글자 명암비")):
         now = getattr(s, key)
         if now.kind == "사용자 지정" and now.value < computed[key].value:
-            result.append(f"{name} {now.value}:1은(는) 이 용도의 근거 계산값 {computed[key].value}:1보다 낮습니다.")
+            result.append(
+                f"{name} {now.value}:1은(는) 이 용도의 근거 계산값 {computed[key].value}:1보다 낮습니다."
+            )
     return result

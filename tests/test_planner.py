@@ -131,7 +131,9 @@ def test_unmeasurable_without_photo_info_is_not_guessed():
 
 def test_user_lock_font_size_blocks_size_and_autofit():
     size = FakeFinding("font_size", 1, 5, "warning", {"size_pt": 18.0})
-    autofit = FakeFinding("autofit_shrink", 1, 5, "warning", {"specified_size_pt": 24.0, "effective_size_pt": 14.0})
+    autofit = FakeFinding(
+        "autofit_shrink", 1, 5, "warning", {"specified_size_pt": 24.0, "effective_size_pt": 14.0}
+    )
     result = plan(deck(text_shape()), [size, autofit], strength="aggressive", user_locks=("font_size",))
     assert result.proposals == []
     assert all("고정" in s.reason for s in result.skipped)
@@ -139,7 +141,9 @@ def test_user_lock_font_size_blocks_size_and_autofit():
 
 def test_user_lock_layout_blocks_moves():
     shape = text_shape(left=800, top=100, width=300, height=60)
-    result = plan(deck(shape), [FakeFinding("off_slide", 1, 5)], strength="aggressive", user_locks=("layout",))
+    result = plan(
+        deck(shape), [FakeFinding("off_slide", 1, 5)], strength="aggressive", user_locks=("layout",)
+    )
     assert result.proposals == []
 
 
@@ -188,7 +192,9 @@ def test_text_overlap_is_review_only_below_aggressive():
     other = FakeShape(1, 6, [FakeRun("x", 24, "000000", False)], left=80, top=230, width=800, height=80)
     finding = FakeFinding("text_overlap", 1, 5, "warning", {"other_shape_id": 6})
     for strength in ("passive", "balanced"):
-        result = plan(deck(text_shape(left=80, top=200, width=800, height=80), other), [finding], strength=strength)
+        result = plan(
+            deck(text_shape(left=80, top=200, width=800, height=80), other), [finding], strength=strength
+        )
         assert result.proposals == []
         assert result.skipped[0].category == Category.REVIEW_ONLY
 
@@ -296,7 +302,9 @@ def test_hierarchy_title_enlarged_only_at_aggressive():
 
 
 def test_autofit_shrink_below_minimum_is_turned_off():
-    finding = FakeFinding("autofit_shrink", 1, 5, "warning", {"specified_size_pt": 24.0, "effective_size_pt": 14.0})
+    finding = FakeFinding(
+        "autofit_shrink", 1, 5, "warning", {"specified_size_pt": 24.0, "effective_size_pt": 14.0}
+    )
     p = plan(deck(text_shape()), [finding], strength="aggressive").proposals[0]
     assert (p.prop, p.before, p.after) == (Property.AUTOFIT, "shrink", "none")
 
