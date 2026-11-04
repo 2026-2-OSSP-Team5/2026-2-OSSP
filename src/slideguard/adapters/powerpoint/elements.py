@@ -5,8 +5,11 @@ from types import SimpleNamespace
 
 from slideguard.domain.models import Box, ObjectLocator, Shape
 
+from .chart_text import legend_label, tick_labels
+from .measurements import measure_shape, optional, paint
 from .properties import indexed_property, number, read_optional
 from .text import TextMeasurement, read_range, read_run, read_text
+from .text_layout import text_spans
 
 
 def optional_box(item, notes: list[str]) -> Box | None:
@@ -27,6 +30,7 @@ def _element(parent: Shape, kind: str, indices: tuple[int, ...], box, measuremen
         runs=measurement.runs,
         rendered_box=measurement.rendered_box,
         supported=True,
+        effective_visible=parent.effective_visible,
         notes=tuple(notes),
         locator=ObjectLocator(parent.locator.shape_path, kind, indices),
     )
@@ -58,7 +62,15 @@ def table_cells(item, parent: Shape, *, layout_verified: bool):
                 measurement = replace(measurement, rendered_box=None)
                 notes.append("Ancestor transforms prevent verified slide-space cell geometry")
             notes.append("Cell background/table-style/border composition is not confirmed")
-            yield _element(parent, "table_cell", (row, column), box, measurement, notes)
+            result = measure_shape(
+                _element(parent, "table_cell", (row, column), box, measurement, notes),
+                cell,
+                ancestor_visible=parent.effective_visible,
+            )
+            color, transparency = paint(cell, notes)
+            yield replace(
+                result, fill_color=color, fill_transparency=transparency, spans=text_spans(cell, result)
+            )
 
 
 def _chart_element(element, parent, kind, indices, sx, sy):
@@ -106,7 +118,11 @@ def chart_elements(item, parent: Shape, *, layout_verified: bool):
             sx, sy = parent.box.width / width, parent.box.height / height
     if has_title:
         yield _chart_element(chart.ChartTitle, parent, "chart_title", (), sx, sy)
-    for axis_type in (1, 2, 3):
+    chart_type = optional(lambda: chart.ChartType, "Chart type", [])
+    # Pie and doughnut charts have no axes. The late-bound HasAxis getter
+    # can expose default axes when layout is initialized by an earlier getter.
+    axis_types = () if chart_type in {5, -4102, 68, 69, 70, 71, 80, -4120} else (1, 2, 3)
+    for axis_type in axis_types:
         for axis_group in (1, 2):
             notes = []
             present = read_optional(
@@ -130,8 +146,14 @@ def chart_elements(item, parent: Shape, *, layout_verified: bool):
                 notes,
                 unavailable=(0x80004003, 0x800A03EC, 0x80004005),
             )
+            labels = tick_labels(parent, axis, axis_type, axis_group)
+            if labels is not None:
+                yield labels
             if has_title:
                 yield _chart_element(axis.AxisTitle, parent, "axis_title", (axis_type, axis_group), sx, sy)
+    legend = legend_label(parent, chart, sx, sy, optional_box)
+    if legend is not None:
+        yield legend
     series = chart.SeriesCollection()
     for series_index in range(1, series.Count + 1):
         current = series.Item(series_index)

@@ -4,13 +4,16 @@ import math
 from dataclasses import replace
 from typing import Any
 
-from slideguard.domain.models import Box, DeckSnapshot, ObjectLocator, Shape
+from slideguard.domain.models import Box, DeckSnapshot, ObjectLocator, Shape, SlideDetails
 
 from .background import read_background
 from .copies import SavedPresentationCopy
 from .elements import chart_elements, smartart_nodes, table_cells
-from .properties import read_optional
+from .layers import resolve_backgrounds
+from .measurements import measure_shape, optional, paint
+from .properties import read_optional, tristate
 from .text import TextMeasurement, read_text
+from .text_layout import text_spans
 
 # Office MsoShapeType values; no COM library is needed to import this module.
 _AUTO_SHAPE, _PLACEHOLDER, _TEXT_BOX = 1, 14, 17
@@ -18,7 +21,7 @@ _SUPPORTED_TYPES = {_AUTO_SHAPE, _PLACEHOLDER, _TEXT_BOX}
 _TYPE_NAMES = {3: "chart", 6: "group", 13: "picture", 19: "table", 21: "diagram", 24: "SmartArt"}
 _LIMITATIONS = (
     "Groups, table cells, chart titles/axis titles/data labels and SmartArt nodes are addressed within one saved revision",
-    "Chart tick-label glyphs/legend layout and composite backgrounds are not reconstructed",
+    "Individual chart tick and legend entry glyph bounds are unavailable; complex background samples are approximate",
     "COM measurements are not pixel rendering; unresolved properties remain unknown and are described in shape notes",
     "Rendered bounds require verified horizontal, unrotated, unflipped, 2D visible text",
     "Background RGB requires confirmed uniform opaque coverage; complex layers and inherited backgrounds are not composed",
@@ -139,7 +142,7 @@ def _layout_verified(item) -> bool:
     )
 
 
-def _walk(collection, number, slide, path=(), *, ancestor_verified=True, depth=0):
+def _walk(collection, number, slide, path=(), *, ancestor_verified=True, ancestor_visible=True, depth=0):
     if depth > 64:
         raise ValueError("Group nesting exceeds the supported traversal depth")
     count = _integer(collection.Count, "Shapes.Count")
@@ -152,14 +155,20 @@ def _walk(collection, number, slide, path=(), *, ancestor_verified=True, depth=0
         seen_ids.add(shape_id)
         address = (*path, shape_id)
         parent = _shape(item, number, slide, count, locator=ObjectLocator(address), nested=bool(path))
+        parent = measure_shape(parent, item, ancestor_visible=ancestor_visible)
+        if parent.z_order is not None and parent.shape_type in _SUPPORTED_TYPES and parent.supported:
+            color, transparency = paint(item, [])
+            parent = replace(parent, fill_color=color, fill_transparency=transparency)
         if not ancestor_verified:
             parent = replace(
                 parent,
                 box=None,
                 rendered_box=None,
+                content_box=None,
                 background=None,
                 notes=(*parent.notes, "Ancestor transforms prevent verified slide-space geometry"),
             )
+        parent = replace(parent, spans=text_spans(item, parent))
         yield parent
         notes = []
         kind = read_optional(lambda item=item: item.Type, "Shape type", notes)
@@ -170,7 +179,13 @@ def _walk(collection, number, slide, path=(), *, ancestor_verified=True, depth=0
         verified = ancestor_verified and _layout_verified(item)
         if kind == 6:
             yield from _walk(
-                item.GroupItems, number, slide, address, ancestor_verified=verified, depth=depth + 1
+                item.GroupItems,
+                number,
+                slide,
+                address,
+                ancestor_verified=verified,
+                ancestor_visible=parent.effective_visible,
+                depth=depth + 1,
             )
         elif kind == 19:
             yield from table_cells(item, parent, layout_verified=verified)
@@ -189,9 +204,23 @@ def extract_snapshot(presentation: Any, saved: SavedPresentationCopy) -> DeckSna
     slides = presentation.Slides
     slide_count = _integer(slides.Count, "Slides.Count")
     shapes = []
+    details = []
     for number in range(1, slide_count + 1):
         slide = slides.Item(number)
-        shapes.extend(_walk(slide.Shapes, number, slide))
+        hidden = tristate(
+            optional(lambda slide=slide: slide.SlideShowTransition.Hidden, "Hidden slide", []), "Hidden", []
+        )
+        details.append(SlideDetails(number, hidden=hidden))
+        shapes.extend(
+            resolve_backgrounds(
+                list(
+                    _walk(
+                        slide.Shapes, number, slide, ancestor_visible=None if hidden is None else not hidden
+                    )
+                ),
+                slide,
+            )
+        )
     return DeckSnapshot(
         source_path=str(saved.source_path),
         source_sha256=saved.source_sha256,
@@ -200,4 +229,5 @@ def extract_snapshot(presentation: Any, saved: SavedPresentationCopy) -> DeckSna
         height_pt=height,
         shapes=tuple(shapes),
         limitations=_LIMITATIONS,
+        slides=tuple(details),
     )

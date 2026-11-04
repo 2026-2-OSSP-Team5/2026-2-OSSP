@@ -1,5 +1,6 @@
 """Short-lived, thread-local COM reads of caller-owned temporary PPTX copies."""
 
+import gc
 import math
 import sys
 import time
@@ -9,7 +10,17 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
-from slideguard.domain.models import Box, DeckSnapshot, ObjectLocator, Shape, TextRun
+from slideguard.domain.models import (
+    Box,
+    DeckSnapshot,
+    Measurement,
+    ObjectEvidence,
+    ObjectLocator,
+    Shape,
+    SlideDetails,
+    TextRun,
+    TextSpan,
+)
 
 from .errors import (
     PowerPointBusyError,
@@ -55,6 +66,9 @@ class _WindowsComRuntime:
         self.pythoncom.PumpWaitingMessages()
 
     def uninitialize(self):
+        # Late-bound wrappers can retain a self-referencing generated method.
+        # Collect unreachable wrappers before releasing their apartment.
+        gc.collect()
         self.pythoncom.CoUninitialize()
 
 
@@ -75,9 +89,19 @@ def _plain_snapshot(snapshot: DeckSnapshot) -> DeckSnapshot:
             return value
         if type(value) is tuple:
             return tuple(copy(item) for item in value)
-        if type(value) in (DeckSnapshot, Shape, TextRun, Box, ObjectLocator):
+        if type(value) in (
+            DeckSnapshot,
+            Shape,
+            TextRun,
+            Box,
+            ObjectLocator,
+            ObjectEvidence,
+            Measurement,
+            SlideDetails,
+            TextSpan,
+        ):
             return type(value)(**{field.name: copy(getattr(value, field.name)) for field in fields(value)})
-        raise TypeError("Snapshot fields must contain only domain models, tuples and plain Python scalars")
+        raise TypeError(f"Unexpected snapshot field type: {type(value).__name__}")
 
     if type(snapshot) is not DeckSnapshot:
         raise TypeError("The extractor must return a DeckSnapshot")
@@ -95,11 +119,18 @@ class PowerPointReadSession:
         if not math.isfinite(self.retry_delay_seconds) or self.retry_delay_seconds < 0:
             raise ValueError("retry_delay_seconds must be finite and nonnegative")
 
-    def read_copy(self, temporary_copy: Path, extract: Callable[[Any], DeckSnapshot]) -> DeckSnapshot:
+    def read_copy(
+        self,
+        temporary_copy: Path,
+        extract: Callable[[Any], DeckSnapshot],
+        *,
+        discard_probe_edits: bool = False,
+    ) -> DeckSnapshot:
         """Run a read-only extractor synchronously on this calling worker thread.
 
         The caller supplies a private saved .pptx copy and handles its bytes/hash/lifetime.
-        The extractor must not mutate or retain COM objects, including in closures. Only
+        The optional render probe may edit the in-memory private document without saving.
+        The extractor must not retain COM objects, including in closures. Only
         a detached DeckSnapshot leaves this method. No persistent STA or queue is kept.
         """
         path = Path(temporary_copy).resolve()
@@ -129,7 +160,15 @@ class PowerPointReadSession:
             try:
                 if presentation is not None:
                     try:
-                        self._call(runtime, "close", lambda: presentation.Close(), pump=False)
+
+                        def close():
+                            try:
+                                if discard_probe_edits:
+                                    presentation.Saved = -1
+                            finally:
+                                presentation.Close()
+
+                        self._call(runtime, "close", close, pump=False)
                     except PowerPointSessionError as error:
                         cleanup_errors.append(error)
             finally:
