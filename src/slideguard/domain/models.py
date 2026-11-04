@@ -21,6 +21,63 @@ class TextRun:
     font_size_pt: float | None = None
     color: Color | None = None
     bold: bool | None = None
+    # color remains safe for legacy opaque-color checks. Other fills keep their
+    # measured source RGB separately, without pretending it is the visible RGB.
+    source_color: Color | None = None
+    transparency: float | None = None
+    fill_kind: str | None = None
+    fill_visible: bool | None = None
+
+
+@dataclass(frozen=True)
+class ObjectLocator:
+    """Address inside one saved revision; indices are one-based COM positions.
+
+    shape_path contains the top-level shape ID and any enclosing group child IDs.
+    kind identifies shape/table_cell/chart_title/axis_title/data_label/smartart_node.
+    indices contain row+column, axis type+group, series+point, or node+shape position.
+    """
+
+    shape_path: tuple[int, ...]
+    kind: str = "shape"
+    indices: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class Measurement:
+    field: str
+    state: Literal["measured", "approximate", "absent", "hidden", "unsupported", "unavailable"]
+    evidence: str
+
+
+@dataclass(frozen=True)
+class ObjectEvidence:
+    kind: str
+    origin: str
+    state: Literal["saved", "partial", "external", "unavailable"]
+    text: str = ""
+    box: Box | None = None
+    properties: tuple[tuple[str, str | int | float | bool], ...] = ()
+    children: tuple["ObjectEvidence", ...] = ()
+    corners: tuple[tuple[float, float], ...] = ()
+
+
+@dataclass(frozen=True)
+class SlideDetails:
+    number: int
+    hidden: bool | None = None
+    title: str | None = None
+    properties: tuple[tuple[str, str | int | float | bool], ...] = ()
+
+    objects: tuple[ObjectEvidence, ...] = ()
+
+
+@dataclass(frozen=True)
+class TextSpan:
+    kind: Literal["line", "paragraph"]
+    index: int
+    text: str
+    box: Box | None = None
 
 
 @dataclass(frozen=True)
@@ -28,16 +85,38 @@ class Shape:
     slide_number: int
     shape_id: int
     name: str
-    box: Box
+    box: Box | None
     text: str = ""
     runs: tuple[TextRun, ...] = ()
     background: Color | None = None
     rendered_box: Box | None = None
     supported: bool = False
     notes: tuple[str, ...] = ()
+    locator: ObjectLocator | None = None
+    visible: bool | None = None
+    effective_visible: bool | None = None
+    shape_type: int | None = None
+    placeholder_type: int | None = None
+    z_order: int | None = None
+    content_box: Box | None = None
+    fill_color: Color | None = None
+    fill_transparency: float | None = None
+    properties: tuple[tuple[str, str | int | float | bool], ...] = ()
+    measurements: tuple[Measurement, ...] = ()
+    spans: tuple[TextSpan, ...] = ()
+    evidence: tuple[ObjectEvidence, ...] = ()
+    visible_object_box: Box | None = None
+    visible_text_box: Box | None = None
+    background_samples: tuple[tuple[float, float, int, int, int], ...] = ()
 
     @property
     def key(self) -> str:
+        if self.locator is not None:
+            address = self.locator
+            if address.kind != "shape" or len(address.shape_path) > 1:
+                path = "/".join(str(value) for value in address.shape_path)
+                indices = ",".join(str(value) for value in address.indices)
+                return f"{self.slide_number}:{path}:{address.kind}:{indices}"
         return f"{self.slide_number}:{self.shape_id}"
 
 
@@ -50,6 +129,7 @@ class DeckSnapshot:
     height_pt: float
     shapes: tuple[Shape, ...] = ()
     limitations: tuple[str, ...] = ()
+    slides: tuple[SlideDetails, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,4 +163,4 @@ class AnalysisReport:
     proposals: list[ChangeProposal] = field(default_factory=list)
     executed_rules: tuple[str, ...] = ()
     status: Literal["not_configured", "analyzed"] = "not_configured"
-    schema_version: str = "0.1"
+    schema_version: str = "0.3"
