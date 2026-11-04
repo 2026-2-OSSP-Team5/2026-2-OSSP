@@ -704,3 +704,33 @@ def test_watch_cli_keeps_save_logs_and_restores_logging_state(tmp_path, monkeypa
     assert "CLI 발표.pptx" in content
     assert instances and not instances[0].is_running
     assert (watching.LOGGER.level, watching.LOGGER.propagate, watching.LOGGER.handlers) == before
+
+
+def test_watch_extract_emits_snapshot_json_and_keeps_logs_separate(tmp_path, monkeypatch, capsys):
+    import json
+
+    from slideguard import bootstrap, watch_cli
+    from slideguard.domain.models import Box, DeckSnapshot, Shape
+
+    box = Box(5, 6, 7, 8)
+    deck = DeckSnapshot("deck.pptx", "sha", 1, 960, 540, (Shape(1, 1, "text", box, visible_object_box=box),))
+    stopped = []
+
+    def collection(directory, callback, **options):
+        assert directory == tmp_path and options["recursive"]
+        return SimpleNamespace(
+            start=lambda: callback(deck), stop=lambda: stopped.append(True), is_running=True
+        )
+
+    def interrupt(_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(bootstrap, "build_snapshot_collection", collection)
+    monkeypatch.setattr(watch_cli, "time", SimpleNamespace(sleep=interrupt))
+    assert (
+        watch_cli.watch_directory(tmp_path, recursive=True, settle_seconds=0.1, log_file=None, extract=True)
+        == 0
+    )
+    stdout, stderr = capsys.readouterr()
+    assert json.loads(stdout)["shapes"][0]["visible_object_box"] == {"x": 5, "y": 6, "width": 7, "height": 8}
+    assert "Ctrl+C" in stderr and stopped == [True]

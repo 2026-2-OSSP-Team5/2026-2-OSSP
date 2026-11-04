@@ -50,4 +50,15 @@ def create_expanded_deck(path):
         font.size, font.bold, font.color.rgb = Pt(24), False, RGBColor(0, 0, 0)
     slide = deck.slides.add_slide(deck.slide_layouts[6])
     slide.shapes.add_chart(XL_CHART_TYPE.PIE, Pt(50), Pt(50), Pt(500), Pt(400), data).name = "pie-chart"
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    group = slide.shapes.add_group_shape()
+    item = group.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Pt(100), Pt(120), Pt(300), Pt(90))
+    item.name = "rotated-probe-text"
+    item.text_frame.auto_size = MSO_AUTO_SIZE.NONE
+    item.fill.solid()
+    item.fill.fore_color.rgb = RGBColor(250, 235, 180)
+    item.text = "Rotated text"
+    font = item.text_frame.paragraphs[0].runs[0].font
+    font.size, font.color.rgb = Pt(30), RGBColor(0, 0, 0)
+    group.rotation = 35
     deck.save(path)

@@ -29,6 +29,7 @@ def expanded_source(powerpoint_environment, tmp_path_factory):
         document = app.Presentations.Open(str(path), ReadOnly=0, Untitled=0, WithWindow=-1)
         slide = document.Slides.Item(1)
         chart = slide.Shapes.Item(3).Chart
+        chart.HasLegend = True
         chart.HasTitle = True
         chart.ChartTitle.Text = "차트 제목"
         chart.Axes(1, 1).HasTitle = True
@@ -41,12 +42,19 @@ def expanded_source(powerpoint_environment, tmp_path_factory):
             smart.SmartArt.AllNodes.Item(index).TextFrame2.TextRange.Text = f"노드 {index}"
         slide = document.Slides.Item(2)
         slide.Shapes.Item(1).TextFrame2.TextRange.Font.Fill.Transparency = 0.9
+        hidden = slide.Shapes.AddTextbox(1, 10, 300, 200, 30)
+        hidden.Name = "hidden-text"
+        hidden.TextFrame.TextRange.Text = "Hidden"
+        hidden.Visible = 0
         text_range = slide.Shapes.Item(2).TextFrame2.TextRange
         indexed_property(text_range, "Characters", 3, 2).Font.Fill.Transparency = 0.5
         pie = document.Slides.Item(3).Shapes.Item(1).Chart
         pie.HasTitle = False
         pie.SeriesCollection(1).ApplyDataLabels()
         pie.SeriesCollection(1).Points(2).HasDataLabel = False
+        probe = document.Slides.Item(4).Shapes.Item(1).GroupItems.Item(1)
+        probe.Shadow.Visible = -1
+        probe.Shadow.OffsetX = 25
         document.Save()
     finally:
         if document is not None:
@@ -155,6 +163,49 @@ def test_full_pipeline_delivers_expanded_contents(expanded_source):
         assert pipeline.collector.wait_idle(30)
         assert result.source_sha256 == sha256(expanded_source.read_bytes()).hexdigest()
         assert {"table_cell", "chart_title", "smartart_node"} <= {item.locator.kind for item in result.shapes}
+        probe = next(item for item in result.shapes if item.name == "rotated-probe-text")
+        assert probe.visible_object_box and probe.visible_text_box
+        legend = next(item for item in result.shapes if item.locator.kind == "chart_legend")
+        entry = next(item for item in legend.evidence if item.kind == "chart_legend_entry")
+        assert dict(entry.properties)["font_size_pt"] > 0
+        key = next(item for item in entry.children if item.kind == "chart_legend_key")
+        assert key.properties
+        assert any(
+            item.kind == "chart_legend_saved_label" and item.text == "계열" for item in legend.evidence
+        )
         assert failures.empty() and pipeline.is_running
     finally:
         pipeline.stop()
+
+
+def test_actual_measurements_capture_hidden_text_interior_and_chart_groups(expanded_deck):
+    hidden = next(item for item in expanded_deck.shapes if item.name == "hidden-text")
+    assert hidden.visible is False and hidden.effective_visible is False
+    assert any(m.field == "visibility" and m.state == "hidden" for m in hidden.measurements)
+    text = next(item for item in expanded_deck.shapes if item.name == "mixed-alpha")
+    assert text.content_box is not None and text.content_box.width < text.box.width
+    groups = [item for item in expanded_deck.shapes if item.locator.kind.startswith("chart_")]
+    assert any(item.locator.kind == "chart_tick_labels" and item.runs for item in groups)
+    assert any(item.locator.kind == "chart_legend" and item.box for item in groups)
+
+
+def test_actual_rendered_evidence_is_approximate(expanded_source):
+    before = expanded_source.read_bytes()
+    deck = PowerPointDeckReader(PowerPointReadSession(), render=True).read(expanded_source)
+    assert expanded_source.read_bytes() == before
+    probe = next(item for item in deck.shapes if item.name == "rotated-probe-text")
+    assert probe.rendered_box is None
+    assert probe.visible_object_box is not None
+    assert probe.visible_text_box is not None
+    assert probe.visible_text_box.width < probe.visible_object_box.width
+    assert probe.visible_text_box.height < probe.visible_object_box.height
+    hidden = next(item for item in deck.shapes if item.name == "hidden-text")
+    assert hidden.visible_object_box is None and hidden.visible_text_box is None
+    estimated = [
+        item
+        for item in deck.shapes
+        if any(m.field == "background_samples" and m.state == "approximate" for m in item.measurements)
+    ]
+    assert estimated
+    assert all(item.background is None for item in estimated)
+    assert all(len(item.background_samples) >= 4 for item in estimated)

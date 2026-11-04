@@ -82,8 +82,38 @@ New-Item -ItemType Directory -Path .\input -Force | Out-Null
 - 읽기 실패나 불완전한 PPTX는 잠시 재시도하고, 계속 읽을 수 없으면 `SAVE_UNREADABLE`을 출력합니다. 이후 파일이 변경되면 다시 확인합니다.
 - `Ctrl+C`로 종료합니다. 감시 대상 폴더는 실행 전에 존재해야 합니다.
 
-`watch` 명령은 **PPTX 저장 감지와 콘솔·로그 출력**을 제공합니다. `.ppt`·`.pptm`과 가독성 자동 검사는 지원하지 않습니다.
+`--extract` 없이 실행한 `watch`는 **PPTX 저장 감지와 콘솔·로그 출력**을 제공합니다. `.ppt`·`.pptm`과 가독성 자동 검사는 지원하지 않습니다.
 파일 비교 기준은 감시를 종료하면 초기화됩니다.
+
+## 저장 후 자동 스냅샷 수집
+
+PowerPoint가 설치된 Windows에서 폴더 감시와 스냅샷 수집을 시작합니다.
+
+```powershell
+.\.venv\Scripts\python.exe -m slideguard watch ".\input" --recursive --extract
+```
+
+시작 시 기존 PPTX와 이후 안정화된 새 저장 버전마다 전체 스냅샷을 JSON 한 줄로
+표준 출력에 전달합니다. 로그는 표준 오류로 분리됩니다. 스냅샷에는 저장된 객체 정보와
+렌더링에서 확인할 수 있는 측정값이 포함됩니다.
+범례는 위치와 서식, 범례 키 및 저장된 문구 후보를 별도 근거로 전달합니다.
+
+## 저장된 PPTX 객체 추출
+
+Windows 데스크톱 PowerPoint를 사용할 수 있는 환경에서 실행합니다.
+
+```powershell
+.\.venv\Scripts\python.exe -m slideguard extract ".\input\example.pptx" --render
+```
+
+결과는 검사 전 스냅샷 JSON입니다. `--render`를 사용하면 슬라이드에서 보이는 객체와 텍스트의
+경계, 텍스트 주변의 RGB 표본을 수집합니다. `visible_object_box`는 그림자 등 효과를 포함한
+객체의 표시 범위입니다. `visible_text_box`는 크기가 고정된 텍스트 프레임의 텍스트 표시
+범위입니다. 두 필드 모두 슬라이드 좌표(pt)를 사용하며, 가려지거나 슬라이드 밖에 있는
+픽셀은 포함하지 않습니다.
+`measurements`는 측정 상태를, `evidence`와 `slides[].objects`는 저장된 객체별 근거를 제공합니다.
+저장된 차트 값과 좌표는 PowerPoint에서 렌더링된 개별 글자 위치와 별도로 전달합니다.
+외부 연결 개체, 디코딩이 필요한 미디어, 재생 전용 상태는 해당 근거의 상태로 구분합니다.
 
 ## 🛠️ 기술 스택
 

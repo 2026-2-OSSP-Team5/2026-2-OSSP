@@ -320,6 +320,7 @@ def test_powerpoint_save_emits_the_office_saved_revision(editing_document):
         assert after.source_path == str(editor.path)
         assert after.source_sha256 == digest
         assert after.shapes[0].text == "미저장 사용자 편집 보존"
+        assert after.shapes[0].visible_object_box is not None
         assert editor.document.Saved == -1 and editor.document.Windows.Count > 0
         assert pipeline.collector.wait_idle(TIMEOUT)
         no_delivery(output)

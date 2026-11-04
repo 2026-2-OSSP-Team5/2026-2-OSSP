@@ -21,6 +21,13 @@ def build_analyzer() -> AnalyzePresentation:
     return AnalyzePresentation(reader=OoxmlDeckReader(), rules=())
 
 
+def build_powerpoint_reader(*, render: bool = False):
+    from slideguard.adapters.powerpoint.reader import PowerPointDeckReader
+    from slideguard.adapters.powerpoint.session import PowerPointReadSession
+
+    return PowerPointDeckReader(PowerPointReadSession(), render=render)
+
+
 class SnapshotCollection:
     """Lifecycle of the separately assembled watcher and snapshot worker."""
 
@@ -65,15 +72,14 @@ def build_snapshot_collection(
     settle_seconds: float = 0.8,
     max_attempts: int = 3,
     retry_delay_seconds: float = 0.2,
+    render: bool = True,
 ) -> SnapshotCollection:
-    """Opt-in saved-file COM collection; the inspect/OOXML analyzer is unchanged."""
-    from slideguard.adapters.powerpoint.reader import PowerPointDeckReader
-    from slideguard.adapters.powerpoint.session import PowerPointReadSession
+    """Collect complete saved-file snapshots for the analysis consumer."""
     from slideguard.adapters.watching.catalog import SavedFileCatalog
     from slideguard.adapters.watching.monitor import SavedFileMonitor
 
     collector = SnapshotCollector(
-        reader=PowerPointDeckReader(PowerPointReadSession()),
+        reader=build_powerpoint_reader(render=render),
         source=SavedFileCatalog(folder, recursive=recursive),
         on_snapshot=on_snapshot,
         successful_hashes=successful_hashes,
