@@ -23,7 +23,7 @@ CONTRAST_LARGE = 3.0  # 대형 텍스트
 LARGE_TEXT_PT = 18.0  # 이 크기 이상이면 대형 텍스트
 LARGE_BOLD_TEXT_PT = 14.0  # 굵은 글씨는 이 크기 이상이면 대형 텍스트
 
-# 안전 여백: 슬라이드 각 방향 길이의 비율 (ITU 권고 기반)
+# 안전 여백: 슬라이드 각 방향 길이의 비율 (팀 평가 기준표)
 SAFE_MARGIN_RATIO = 0.05
 
 
