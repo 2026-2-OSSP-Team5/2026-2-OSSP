@@ -9,6 +9,8 @@ from slideguard.domain.policy import (
     AnalysisPolicy,
 )
 
+from .scope import target_shapes
+
 # (severity, message, measured, expected, evidence)
 _Result = tuple[Severity, str, float | str | None, float | str | None, str]
 
@@ -51,9 +53,7 @@ class ContrastRule:
 
     def evaluate(self, deck: DeckSnapshot, policy: AnalysisPolicy) -> list[Finding]:
         findings: list[Finding] = []
-        for shape in deck.shapes:
-            if policy.slides and shape.slide_number not in policy.slides:
-                continue
+        for shape in target_shapes(deck, policy):
             if not _has_text(shape):
                 continue
             for number, result in enumerate(_evaluate_shape(shape), start=1):

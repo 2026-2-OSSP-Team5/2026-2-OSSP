@@ -12,6 +12,8 @@ from slideguard.domain.policy import (
     density_threshold,
 )
 
+from .scope import target_shapes
+
 TOL = GEOMETRY_TOLERANCE_PT
 
 
@@ -25,7 +27,7 @@ class LayoutRule:
     id = "layout"
 
     def evaluate(self, deck: DeckSnapshot, policy: AnalysisPolicy) -> list[Finding]:
-        shapes = [s for s in deck.shapes if not policy.slides or s.slide_number in policy.slides]
+        shapes = target_shapes(deck, policy)
         findings: list[Finding] = []
         for shape in shapes:
             findings.extend(_check_margin(deck, shape))

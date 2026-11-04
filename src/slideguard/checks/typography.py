@@ -3,6 +3,8 @@
 from slideguard.domain.models import DeckSnapshot, Finding, Severity, Shape
 from slideguard.domain.policy import AnalysisPolicy, Purpose, font_size_threshold
 
+from .scope import target_shapes
+
 # (severity, message, measured, expected, evidence)
 _Result = tuple[Severity, str, float | str | None, float | str | None, str]
 
@@ -22,9 +24,7 @@ class TypographyRule:
 
     def evaluate(self, deck: DeckSnapshot, policy: AnalysisPolicy) -> list[Finding]:
         findings: list[Finding] = []
-        for shape in deck.shapes:
-            if policy.slides and shape.slide_number not in policy.slides:
-                continue
+        for shape in target_shapes(deck, policy):
             if not _has_text(shape):
                 continue
             for number, result in enumerate(_evaluate_shape(shape, policy.purpose), start=1):
