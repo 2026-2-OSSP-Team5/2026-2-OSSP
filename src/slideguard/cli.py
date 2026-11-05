@@ -44,9 +44,17 @@ def main(argv=None) -> int:
     commands.add_parser("gui", help="Open the desktop window")
     inspect = commands.add_parser("inspect", help="Extract saved PPTX object metadata; rules not enabled")
     inspect.add_argument("file", type=Path)
+    extract = commands.add_parser("extract", help="Extract a saved PPTX snapshot with desktop PowerPoint")
+    extract.add_argument("file", type=Path)
+    extract.add_argument(
+        "--render", action="store_true", help="Collect visible pixel bounds and nearby RGB samples"
+    )
     watch = commands.add_parser("watch", help="Log saved PPTX changes in a directory")
     watch.add_argument(
         "directory", type=Path, nargs="?", default=Path.cwd(), help="Watch folder (default: cwd)"
+    )
+    watch.add_argument(
+        "--extract", action="store_true", help="Automatically emit full snapshot JSON after saves"
     )
     watch.add_argument("--recursive", action="store_true", help="Include subfolders")
     watch.add_argument("--settle-seconds", type=float, default=0.8, help="Quiet time before checking a save")
@@ -72,9 +80,21 @@ def main(argv=None) -> int:
                 recursive=args.recursive,
                 settle_seconds=args.settle_seconds,
                 log_file=args.log_file,
+                extract=args.extract,
             )
         except (OSError, ValueError) as error:
             parser.exit(2, f"Watch error: {error}\n")
+    if args.command == "extract":
+        from .adapters.powerpoint.errors import PowerPointSessionError
+        from .bootstrap import build_powerpoint_reader
+
+        try:
+            snapshot = build_powerpoint_reader(render=args.render).read(args.file)
+        except (OSError, ValueError, PowerPointSessionError) as error:
+            parser.exit(2, f"Input error: {error}\n")
+        print(json.dumps(asdict(snapshot), ensure_ascii=True, indent=2))
+        return 0
+
     from .bootstrap import build_analyzer
     from .domain.policy import AnalysisPolicy
 
