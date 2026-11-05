@@ -5,9 +5,9 @@ from enum import Enum
 from typing import ClassVar
 
 import pytest
-from fakes import FakeFinding, FakeRun, FakeShape, FakeSnapshot
 
 from slideguard.planning import Property, RuleBasedPlanner, TeamBindings
+from tests.fakes import FakeFinding, FakeRun, FakeShape, FakeSnapshot
 
 
 class Verdict(Enum):  # B가 상태를 한글 Enum으로 만든 경우

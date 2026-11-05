@@ -1,7 +1,5 @@
 """수정 후보 생성 동작 테스트."""
 
-from fakes import FakeFinding, FakePolicy, FakeRun, FakeShape, FakeSnapshot
-
 from slideguard.planning import Category, Property, RuleBasedPlanner
 from slideguard.planning.color import (
     blend,
@@ -10,6 +8,7 @@ from slideguard.planning.color import (
     nearest_passing_color,
     worst_contrast_over_unknown,
 )
+from tests.fakes import FakeFinding, FakePolicy, FakeRun, FakeShape, FakeSnapshot
 
 
 def deck(*shapes):

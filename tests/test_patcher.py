@@ -5,10 +5,10 @@
 from contextlib import contextmanager
 
 import pytest
-from fakes import FakePolicy
 
 from slideguard.adapters.powerpoint.patcher import ApplyRejected, PowerPointPatcher, sha256_of
 from slideguard.planning import ChangeProposal, Property
+from tests.fakes import FakePolicy
 
 # ---------------------------------------------------------------- 가짜 문서
 
