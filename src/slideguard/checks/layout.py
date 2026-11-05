@@ -109,15 +109,18 @@ def _check_margin(deck: DeckSnapshot, shape: Shape) -> list[Finding]:
     if not violations:
         return []
 
-    off_slide = any(dist < -TOL for _, dist, _ in violations)
-    worst_name, worst_dist, worst_need = min(violations, key=lambda v: v[1] - v[2])
+    outside = [side for side in violations if side[1] < -TOL]
     detail = ", ".join(f"{name} {dist:.1f}pt(필요 {need:.1f}pt)" for name, dist, need in violations)
-    if off_slide:
+    if outside:
+        # 슬라이드를 벗어난 변 중 가장 많이 나간 쪽을 보고한다.
+        # 여백만 침범한 변을 고르면 방향과 수치가 실제 이탈과 어긋난다.
         severity: Severity = "warning"
         message = "텍스트가 슬라이드 밖으로 나갑니다"
+        worst_name, worst_dist, worst_need = min(outside, key=lambda v: v[1])
     else:
         severity = "review"
         message = "텍스트가 안전 여백(5%) 안쪽에 있지 않습니다"
+        worst_name, worst_dist, worst_need = min(violations, key=lambda v: v[1] - v[2])
     return [
         _finding(
             "layout.margin",
@@ -134,11 +137,14 @@ def _check_margin(deck: DeckSnapshot, shape: Shape) -> list[Finding]:
 
 # --- 텍스트 넘침 ---------------------------------------------------------------
 def _check_overflow(shape: Shape) -> list[Finding]:
-    """렌더링 좌표와 도형 상자가 모두 있을 때만 판정한다."""
+    """렌더링 좌표와 도형 상자가 모두 있어야 판정한다. 없으면 판정 불가로 남긴다."""
+    if not _has_text(shape):
+        return []
     rendered = shape.rendered_box
     box = shape.box
-    if rendered is None or box is None or not _has_text(shape):
-        return []
+    if rendered is None or box is None:
+        missing = "렌더링된 글자 영역" if rendered is None else "도형 상자"
+        return [_geometry_unknown("layout.overflow", shape, f"{missing}을 알 수 없어 텍스트 넘침")]
     over = {
         "왼쪽": box.x - rendered.x,
         "위": box.y - rendered.y,
@@ -185,34 +191,66 @@ def _contains(outer: Box, inner: Box) -> bool:
     )
 
 
+def _behind(back: Shape, front: Shape) -> bool | None:
+    """back이 front보다 뒤에 있으면 True. 순서를 알 수 없으면 None.
+
+    PowerPoint의 z_order는 1이 가장 뒤이고 숫자가 클수록 앞이다.
+    """
+    if back.z_order is None or front.z_order is None:
+        return None
+    return back.z_order < front.z_order
+
+
 def _check_overlap(shapes: list[Shape]) -> list[Finding]:
     findings: list[Finding] = []
+    for shape in shapes:
+        if _has_text(shape) and _effective_box(shape) is None:
+            findings.append(_geometry_unknown("layout.overlap", shape, "좌표를 확인할 수 없어 겹침"))
     for a, b in combinations(shapes, 2):
         a_text, b_text = _has_text(a), _has_text(b)
         if not (a_text or b_text):
             continue  # 장식 도형끼리의 겹침은 보지 않는다
         box_a, box_b = _effective_box(a), _effective_box(b)
         if box_a is None or box_b is None:
-            continue  # 좌표를 확인할 수 없는 객체는 겹침을 판정하지 않는다
+            continue  # 위에서 판정 불가로 이미 보고했다
         overlap = _intersection(box_a, box_b)
         if overlap is None:
             continue
-        # 글자 없는 도형이 다른 도형을 완전히 감싸면 배경 패널로 보고 제외한다.
-        if (not a_text and _contains(box_a, box_b)) or (not b_text and _contains(box_b, box_a)):
-            continue
         anchor, other = (a, b) if a_text else (b, a)
+        anchor_box, other_box = (box_a, box_b) if a_text else (box_b, box_a)
+
+        severity: Severity = "review"
+        message = "텍스트가 다른 객체와 겹칩니다 (의도한 배치인지 확인)"
         area = overlap.width * overlap.height
+        measured: float | None = round(area, 1)
+        expected: float | None = 0.0
+        evidence = (
+            f"{anchor.name}({anchor.key}) ↔ {other.name}({other.key}): "
+            f"겹친 영역 {overlap.width:.1f}×{overlap.height:.1f}pt"
+        )
+        if not _has_text(other) and _contains(other_box, anchor_box):
+            # 글자 없는 도형이 텍스트를 완전히 덮고 있다. 뒤면 배경 패널, 앞이면 텍스트를 가린다.
+            behind = _behind(other, anchor)
+            if behind is True:
+                continue
+            if behind is False:
+                message = "앞쪽 도형이 텍스트를 가립니다"
+            else:
+                # 앞뒤를 모르면 배경인지 가림인지 정할 수 없으므로 판정 불가로 남긴다.
+                severity = "unknown"
+                message = "앞뒤 순서를 알 수 없어 배경인지 가림인지 판정할 수 없습니다"
+                measured = expected = None
+                evidence = f"{evidence}; 두 도형의 z_order를 확인하지 못함"
         findings.append(
             _finding(
                 "layout.overlap",
                 f"{a.key}:{b.key}",
                 anchor,
-                "review",
-                "텍스트가 다른 객체와 겹칩니다 (의도한 배치인지 확인)",
-                round(area, 1),
-                0.0,
-                f"{anchor.name}({anchor.key}) ↔ {other.name}({other.key}): "
-                f"겹친 영역 {overlap.width:.1f}×{overlap.height:.1f}pt",
+                severity,
+                message,
+                measured,
+                expected,
+                evidence,
                 box=overlap,
             )
         )
@@ -220,6 +258,20 @@ def _check_overlap(shapes: list[Shape]) -> list[Finding]:
 
 
 # --- 정보 밀도 -----------------------------------------------------------------
+def _line_count(shape: Shape) -> tuple[int, bool]:
+    """(줄 수, 렌더링 줄을 반영했는지).
+
+    원문 개행만 세면 긴 문단 하나가 화면에서 여러 줄로 접혀도 1줄로 잡힌다.
+    reader가 실제 줄(``TextSpan.kind == "line"``)을 주면 둘 중 큰 값을 쓴다.
+    reader는 줄을 일정 개수까지만 읽으므로, 아주 긴 텍스트에서는 원문 개행이 더 많을 수 있다.
+    """
+    source = sum(1 for line in _text_of(shape).splitlines() if line.strip())
+    rendered = sum(1 for span in shape.spans if span.kind == "line" and span.text.strip())
+    if rendered:
+        return max(source, rendered), True
+    return source, False
+
+
 def _check_density(slide_number: int, shapes: list[Shape], purpose: Purpose) -> list[Finding]:
     text_shapes = [s for s in shapes if _has_text(s)]
     if not text_shapes:
@@ -227,7 +279,9 @@ def _check_density(slide_number: int, shapes: list[Shape], purpose: Purpose) -> 
     limits = density_threshold(purpose)
     chars_by_shape = {s.key: len("".join(_text_of(s).split())) for s in text_shapes}
     total_chars = sum(chars_by_shape.values())
-    total_lines = sum(1 for s in text_shapes for line in _text_of(s).splitlines() if line.strip())
+    counts = [_line_count(s) for s in text_shapes]
+    total_lines = sum(count for count, _ in counts)
+    rendered_used = any(rendered for _, rendered in counts)
     heaviest = max(text_shapes, key=lambda s: chars_by_shape[s.key])  # 화면에서 가리킬 대표 도형
 
     findings: list[Finding] = []
@@ -256,7 +310,8 @@ def _check_density(slide_number: int, shapes: list[Shape], purpose: Purpose) -> 
                 total_lines,
                 limits.max_lines,
                 f"슬라이드 {slide_number}: {total_lines}줄 > 기준 {limits.max_lines}줄 "
-                f"(도형 {len(text_shapes)}개 합계)",
+                f"(도형 {len(text_shapes)}개 합계, "
+                f"{'자동 줄바꿈 반영' if rendered_used else '원문 개행 기준'})",
             )
         )
     return findings

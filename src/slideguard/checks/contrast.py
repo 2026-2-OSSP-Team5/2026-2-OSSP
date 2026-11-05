@@ -131,6 +131,18 @@ def _judge_run(run: TextRun, background: Color) -> _Result | None:
     if ratio >= CONTRAST_LARGE and large:
         return None  # 대형 텍스트 기준 통과
 
+    if large is None:
+        # 글자 유형을 모르지만 두 기준 모두 미달이라 위반은 확정이다.
+        # 어느 쪽으로 밝혀지든 통과하려면 일반 텍스트 기준을 넘겨야 한다.
+        return (
+            "warning",
+            f"글자와 배경의 명암비가 부족합니다 ({ratio:.2f}:1)",
+            round(ratio, 2),
+            CONTRAST_NORMAL,
+            f"{colors} → {ratio:.2f}:1 (글자 유형 미확정: 크기·굵기를 알 수 없음) "
+            f"< 일반 {CONTRAST_NORMAL}:1, 대형 {CONTRAST_LARGE}:1 — 두 기준 모두 미달 (WCAG 2.2 AA)",
+        )
+
     expected = CONTRAST_NORMAL if large is False else CONTRAST_LARGE
     kind = "일반" if large is False else "대형"
     return (

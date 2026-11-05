@@ -1,7 +1,7 @@
 import pytest
 
 from slideguard.checks.layout import LayoutRule
-from slideguard.domain.models import Box, DeckSnapshot, Shape, TextRun
+from slideguard.domain.models import Box, DeckSnapshot, Shape, TextRun, TextSpan
 from slideguard.domain.policy import AnalysisPolicy, Purpose
 
 # 슬라이드 960x540pt → 안전 여백: 좌우 48pt, 상하 27pt
@@ -19,8 +19,11 @@ def make_shape(
     name=None,
     box=True,
     notes=(),
+    z_order=None,
+    lines=(),
 ):
     runs = (TextRun(text, 20),) if text else ()
+    spans = tuple(TextSpan("line", i, t) for i, t in enumerate(lines, start=1))
     return Shape(
         slide_number=slide_number,
         shape_id=shape_id,
@@ -31,6 +34,8 @@ def make_shape(
         rendered_box=Box(*rendered) if rendered else None,
         supported=True,
         notes=tuple(notes),
+        z_order=z_order,
+        spans=spans,
     )
 
 
@@ -51,8 +56,8 @@ def only(findings, rule_id):
 
 
 # --- 안전 여백 ---------------------------------------------------------------
-def test_shape_inside_safe_area_has_no_findings():
-    assert run_rule(make_shape()) == []
+def test_shape_inside_safe_area_has_no_margin_finding():
+    assert only(run_rule(make_shape()), "layout.margin") == []
 
 
 def test_inside_margin_is_review():
@@ -99,12 +104,14 @@ def test_missing_geometry_is_unknown_not_crash():
     assert "Ancestor" in findings[0].evidence
 
 
-def test_missing_geometry_skips_overflow_and_overlap():
-    a = make_shape(box=False, shape_id=1)
-    b = make_shape(x=100, y=100, shape_id=2)
-    findings = run_rule(a, b)
-    assert only(findings, "layout.overflow") == []
-    assert only(findings, "layout.overlap") == []
+def test_missing_geometry_is_unknown_for_overflow_and_overlap():
+    """좌표를 몰라 검사하지 못한 것도 판정 불가로 남긴다."""
+    findings = run_rule(make_shape(box=False, shape_id=1))
+    for rule_id in ("layout.overflow", "layout.overlap"):
+        reported = only(findings, rule_id)
+        assert [f.severity for f in reported] == ["unknown"], rule_id
+        assert reported[0].measured is None
+        assert reported[0].evidence
 
 
 def test_missing_geometry_without_text_is_skipped():
@@ -126,8 +133,10 @@ def test_overflow_is_warning_with_measured_amount():
     assert "아래" in findings[0].message
 
 
-def test_no_overflow_check_without_rendered_box():
-    assert only(run_rule(make_shape()), "layout.overflow") == []
+def test_missing_rendered_box_is_unknown_for_overflow():
+    findings = only(run_rule(make_shape()), "layout.overflow")
+    assert [f.severity for f in findings] == ["unknown"]
+    assert "렌더링된 글자 영역" in findings[0].message
 
 
 def test_rendered_box_inside_shape_is_not_overflow():
@@ -164,10 +173,39 @@ def test_touching_edges_do_not_count_as_overlap():
     assert only(run_rule(a, b), "layout.overlap") == []
 
 
-def test_text_on_background_panel_is_not_overlap():
+def test_panel_behind_text_is_not_overlap():
+    """뒤에 있는 배경 패널만 제외한다."""
+    panel = make_shape(x=80, y=80, w=300, h=150, text="", shape_id=1, z_order=1)
+    label = make_shape(x=100, y=100, w=200, h=50, shape_id=2, z_order=2)
+    assert only(run_rule(panel, label), "layout.overlap") == []
+
+
+def test_shape_in_front_of_text_is_reported():
+    """앞에서 텍스트를 가리는 도형은 검토 대상이다."""
+    cover = make_shape(x=80, y=80, w=300, h=150, text="", shape_id=1, z_order=5, name="가림막")
+    label = make_shape(x=100, y=100, w=200, h=50, shape_id=2, z_order=2)
+    findings = only(run_rule(cover, label), "layout.overlap")
+    assert len(findings) == 1
+    assert findings[0].severity == "review"
+    assert "가립니다" in findings[0].message
+    assert findings[0].shape_key == "1:2"
+
+
+def test_unknown_z_order_is_unknown_not_review():
+    """앞뒤를 모르면 배경인지 가림인지 판정할 수 없으므로 판정 불가로 남긴다."""
     panel = make_shape(x=80, y=80, w=300, h=150, text="", shape_id=1)
     label = make_shape(x=100, y=100, w=200, h=50, shape_id=2)
-    assert only(run_rule(panel, label), "layout.overlap") == []
+    findings = only(run_rule(panel, label), "layout.overlap")
+    assert [f.severity for f in findings] == ["unknown"]
+    assert findings[0].measured is None
+    assert "z_order" in findings[0].evidence
+
+
+def test_partial_overlap_without_z_order_is_still_review():
+    """감싸지 않은 평범한 겹침은 앞뒤를 몰라도 검토 대상이다."""
+    a = make_shape(x=100, y=100, w=200, h=50, shape_id=1)
+    b = make_shape(x=250, y=120, w=200, h=50, shape_id=2)
+    assert [f.severity for f in only(run_rule(a, b), "layout.overlap")] == ["review"]
 
 
 def test_text_partially_over_non_text_shape_is_review_anchored_on_text():
@@ -274,3 +312,52 @@ def test_finding_ids_are_unique():
     findings = run_rule(*shapes)
     assert len({f.id for f in findings}) == len(findings)
     assert all(f.rule_id.startswith("layout.") for f in findings)
+
+
+# --- 확인 요청 반영분 --------------------------------------------------------
+def test_off_slide_message_points_at_the_side_that_left_the_slide():
+    """여백만 침범한 변이 아니라 실제로 벗어난 변을 보고한다.
+
+    왼쪽은 여백(48pt)을 크게 침범했지만 슬라이드 안에 있고, 아래만 3pt 벗어났다.
+    여백 부족분으로 고르면 "왼쪽 2.0pt"가 나와, 밖으로 나갔다면서 양수를 적게 된다.
+    """
+    shape = make_shape(x=2, y=493, w=200, h=50)
+    findings = only(run_rule(shape), "layout.margin")
+    assert [f.severity for f in findings] == ["warning"]
+    assert "아래" in findings[0].message
+    assert findings[0].measured == -3.0
+    assert findings[0].measured < 0  # 밖으로 나갔으니 음수여야 한다
+
+
+def test_off_slide_evidence_still_lists_every_violated_side():
+    """보고하는 방향은 하나지만, 근거에는 위반한 변을 모두 남긴다."""
+    findings = only(run_rule(make_shape(x=2, y=493, w=200, h=50)), "layout.margin")
+    assert "왼쪽" in findings[0].evidence and "아래" in findings[0].evidence
+
+
+def test_rendered_lines_catch_wrapped_text():
+    """원문은 2줄이지만 자동 줄바꿈으로 7줄이 된 경우를 잡는다."""
+    shape = make_shape(text="긴 문단\n또 다른 문단", lines=[f"줄{i}" for i in range(1, 8)])
+    findings = only(run_rule(shape), "layout.density")
+    assert len(findings) == 1
+    assert findings[0].measured == 7
+    assert findings[0].expected == 6
+    assert "자동 줄바꿈 반영" in findings[0].evidence
+
+
+def test_rendered_lines_within_limit_pass():
+    shape = make_shape(text="한 줄", lines=[f"줄{i}" for i in range(1, 7)])
+    assert only(run_rule(shape), "layout.density") == []
+
+
+def test_falls_back_to_source_newlines_without_spans():
+    findings = only(run_rule(make_shape(text="\n".join(["줄"] * 7))), "layout.density")
+    assert findings[0].measured == 7
+    assert "원문 개행 기준" in findings[0].evidence
+
+
+def test_line_count_uses_the_larger_of_source_and_rendered():
+    """reader가 줄을 일부만 주는 경우에도 원문 개행만큼은 센다."""
+    shape = make_shape(text="\n".join(["줄"] * 7), lines=["a", "b"])
+    findings = only(run_rule(shape), "layout.density")
+    assert findings[0].measured == 7

@@ -167,3 +167,14 @@ def test_slide_filter_limits_scope():
     shapes = (make_shape(bad, slide_number=1), make_shape(bad, slide_number=2))
     findings = run_rule(*shapes, policy=AnalysisPolicy(slides=(2,)))
     assert [f.shape_key for f in findings] == ["2:1"]
+
+
+def test_unknown_text_kind_below_three_is_warning_citing_both_targets():
+    """글자 유형을 모르면 '대형'이라고 단정하지 않고, 두 기준 미달을 근거로 남긴다."""
+    findings = run_rule(make_shape([TextRun("본문", None, (210, 210, 210), None)]))
+    assert [f.severity for f in findings] == ["warning"]
+    finding = findings[0]
+    assert finding.expected == 4.5
+    assert "대형 텍스트" not in finding.evidence
+    assert "유형 미확정" in finding.evidence
+    assert "4.5:1" in finding.evidence and "3.0:1" in finding.evidence
