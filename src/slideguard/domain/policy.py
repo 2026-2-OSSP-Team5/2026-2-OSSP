@@ -60,10 +60,10 @@ class DensityThreshold:
     max_lines: int  # 슬라이드 전체 줄(문단) 수
 
 
-# TODO: 정보 밀도는 기준으로 삼을 수치가 없어 임시값으로 둔다.
-# 실제 슬라이드로 오탐 비율을 확인한 뒤 확정한다.
+# 발표용 줄 수는 평가 기준표의 6x6 법칙(한 슬라이드 6줄 이내)을 따른다.
+# TODO: 글자 수와 강의·보고용 줄 수는 근거 자료가 없어 임시값으로 둔다. 팀 합의 후 확정한다.
 DENSITY_THRESHOLDS: dict[Purpose, DensityThreshold] = {
-    Purpose.PRESENTATION: DensityThreshold(max_chars=300, max_lines=12),
+    Purpose.PRESENTATION: DensityThreshold(max_chars=300, max_lines=6),
     Purpose.LECTURE: DensityThreshold(max_chars=400, max_lines=15),
     Purpose.REPORT: DensityThreshold(max_chars=800, max_lines=30),
 }

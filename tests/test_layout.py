@@ -210,15 +210,20 @@ def test_character_count_at_limit_is_ok_and_whitespace_ignored():
 
 
 def test_too_many_lines_is_review():
-    findings = only(run_rule(make_shape(text="\n".join(["줄"] * 13))), "layout.density")
+    findings = only(run_rule(make_shape(text="\n".join(["줄"] * 7))), "layout.density")
     assert len(findings) == 1
-    assert findings[0].measured == 13
-    assert findings[0].expected == 12
+    assert findings[0].measured == 7
+    assert findings[0].expected == 6
     assert findings[0].id.endswith(":lines")
 
 
+def test_six_lines_is_allowed():
+    """6x6 법칙의 상한 자체는 통과한다."""
+    assert only(run_rule(make_shape(text="\n".join(["줄"] * 6))), "layout.density") == []
+
+
 def test_blank_lines_are_not_counted():
-    assert only(run_rule(make_shape(text="\n\n".join(["줄"] * 12))), "layout.density") == []
+    assert only(run_rule(make_shape(text="\n\n".join(["줄"] * 6))), "layout.density") == []
 
 
 def test_density_sums_all_shapes_on_the_slide():
