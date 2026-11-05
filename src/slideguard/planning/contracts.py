@@ -114,6 +114,7 @@ class FindingInfo:
     shape_id: int
     status: str
     values: dict = field(default_factory=dict)
+    finding_id: str = ""  # 팀 Finding.id (수정 후보가 어느 문제에서 나왔는지)
 
 
 # ======================================================================
@@ -137,6 +138,7 @@ class ChangeProposal:
     harmony: float | None = None  # 글자색 후보일 때 배경과의 색 조화 점수 (0 초과 = 조화)
     contrast: float | None = None  # 글자색 후보일 때 바꾼 뒤 명암비
     group: str | None = None  # 함께 적용해야 하는 변경 묶음 이름 (예: 상자 키우기 + 아래 그림 내리기)
+    finding_id: str = ""  # 이 후보를 만든 팀 Finding.id
 
 
 @dataclass(frozen=True)

@@ -162,7 +162,7 @@ class RuleBasedPlanner:
         result = PlanResult(standards=standards, strength=level)
 
         for raw in findings:
-            info = self.bindings.read_finding(raw)
+            info = self.bindings.read_finding(raw, snapshot)
             category = self._classify(info, profile)
 
             def skip(reason, raw=raw, category=category):
@@ -185,6 +185,9 @@ class RuleBasedPlanner:
                 skip("알 수 없는 판정 상태")
                 continue
 
+            if not self.bindings.can_patch(info):
+                skip("그룹 안 객체·표 칸·차트 글자는 아직 자동 수정하지 않음")
+                continue
             shape = self.bindings.find_shape(snapshot, info.slide_index, info.shape_id)
             if shape is None:
                 skip("스냅샷에 대상 객체가 없음")
@@ -322,6 +325,7 @@ class RuleBasedPlanner:
             note=note,
             harmony=None if harmony is None else round(harmony, 3),
             contrast=None if contrast is None else round(contrast, 2),
+            finding_id=info.finding_id,
         )
 
     # ---- 글자 크기 --------------------------------------------------
@@ -788,3 +792,26 @@ def _merge_same_target(proposals: list[ChangeProposal], result: PlanResult) -> l
         elif p.after != old.after or p.before != old.before:
             result.alternatives.append(p)
     return [merged[k] for k in order]
+
+
+# ======================================================================
+# 팀 인터페이스 (application/ports.py의 ProposalPlanner)
+# ======================================================================
+
+
+class MinimumChangePlanner:
+    """AnalyzePresentation에 끼워 쓰는 수정 후보 생성기.
+
+    RuleBasedPlanner의 채택 후보(proposals)를 팀 ChangeProposal로 바꿔 돌려줍니다.
+    대안·고치지 않은 이유·사용한 기준값은 last_result(PlanResult)에서 볼 수 있습니다.
+    """
+
+    def __init__(self, planner: RuleBasedPlanner | None = None) -> None:
+        self.planner = planner or RuleBasedPlanner()
+        self.last_result: PlanResult | None = None
+
+    def propose(self, report: object, policy: object) -> list:
+        result = self.planner.plan(report.deck, list(report.findings), policy)
+        self.last_result = result
+        bindings = self.planner.bindings
+        return [bindings.to_team_proposal(p) for p in result.proposals]

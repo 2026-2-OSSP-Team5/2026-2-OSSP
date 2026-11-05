@@ -12,6 +12,10 @@
 재검사는 여기서 하지 않습니다. 호출하는 쪽이 ApplyResult.output_path를
 다시 검사에 넣어 주세요.
 
+입구는 두 가지입니다.
+  - apply_to_copy(report, proposal_ids, output, policy): 팀 인터페이스 (application/ports.py)
+  - apply(original_path, expected_sha256, proposals, policy, output_path): C 내부 후보로 직접 적용
+
 속성별 적용 의미:
   font.size              글자 크기가 after보다 작은 런만 after로 올림
   font.color             색이 before와 같은 런만 after로 바꿈
@@ -34,9 +38,10 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 from slideguard.planning.bindings import TeamBindings
@@ -113,6 +118,36 @@ class PowerPointPatcher:
     ) -> None:
         self._open_document = open_document or ComDocumentSession
         self._bindings = bindings or TeamBindings()
+        self.last_result: ApplyResult | None = None  # apply_to_copy의 상세 결과 (거절 이유·경고)
+
+    def apply_to_copy(
+        self,
+        report: object,
+        proposal_ids: Iterable[str],
+        output: Path | str,
+        policy: object,
+    ) -> Path:
+        """팀 인터페이스: 보고서의 후보 중 고른 것만 복사본에 적용하고 복사본 경로를 돌려줌.
+
+        하나도 적용하지 못하면 ApplyRejected. 거절 이유·경고는 self.last_result에 남습니다.
+        """
+        wanted = list(dict.fromkeys(proposal_ids))  # 순서 유지, 중복 제거
+        by_id = {p.id: p for p in report.proposals}
+        missing = [pid for pid in wanted if pid not in by_id]
+        if missing:
+            raise ApplyRejected(f"보고서에 없는 수정 후보입니다: {', '.join(missing)}")
+        try:
+            proposals = [self._bindings.from_team_proposal(by_id[pid]) for pid in wanted]
+        except ValueError as error:
+            raise ApplyRejected(str(error)) from error
+
+        deck = report.deck
+        result = self.apply(deck.source_path, deck.source_sha256, proposals, policy, str(output))
+        self.last_result = result
+        if result.output_path is None:
+            reasons = "; ".join(reason for _p, reason in result.rejected) or "알 수 없는 이유"
+            raise ApplyRejected(f"적용된 수정 후보가 없습니다: {reasons}")
+        return Path(result.output_path)
 
     def apply(
         self,
