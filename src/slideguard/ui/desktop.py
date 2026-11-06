@@ -2,7 +2,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QThread, Signal
+from PySide6.QtCore import QLockFile, QSize, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,6 +30,7 @@ from slideguard.bootstrap import (
     build_analyzer,
     build_report_repository,
     build_workspace_settings_repository,
+    report_database_path,
 )
 from slideguard.domain.policy import AnalysisPolicy
 
@@ -999,10 +1000,24 @@ def _display_time(value: str | None) -> str:
         return value
 
 
+def _acquire_instance_lock(lock_path: Path) -> QLockFile | None:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = QLockFile(str(lock_path))
+    lock.setStaleLockTime(5000)
+    return lock if lock.tryLock(0) else None
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
+    instance_lock = _acquire_instance_lock(
+        report_database_path().with_name("slideguard-instance.lock")
+    )
+    if instance_lock is None:
+        return 0
+    app._slideguard_instance_lock = instance_lock
+    from slideguard.ui.overlay import start_overlay
+
+    start_overlay(app)
     return app.exec()
 
 

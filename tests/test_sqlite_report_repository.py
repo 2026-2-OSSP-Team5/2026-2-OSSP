@@ -9,6 +9,7 @@ from slideguard.bootstrap import report_database_path
 from slideguard.domain.models import (
     AnalysisReport,
     Box,
+    ChangeProposal,
     DeckSnapshot,
     Finding,
     Measurement,
@@ -147,6 +148,17 @@ def test_model_0_3_report_round_trips_through_new_repository_instance(tmp_path):
             ),
         ),
         findings=[],
+        proposals=[
+            ChangeProposal(
+                id="font.size@1:7",
+                finding_id="typography:1:7:1",
+                shape_key="1:7",
+                property="font.size",
+                before=10.0,
+                after=14.0,
+                cost=0.1,
+            )
+        ],
         executed_rules=("contrast", "typography", "layout"),
         status="analyzed",
     )

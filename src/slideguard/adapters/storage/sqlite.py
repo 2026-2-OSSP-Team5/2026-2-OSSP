@@ -31,6 +31,7 @@ class StoredReport:
 class WorkspaceSettings:
     workspace: Path
     recursive: bool
+    purpose: str = "presentation"
 
 
 class SqliteReportRepository:
@@ -89,19 +90,25 @@ class SqliteWorkspaceSettingsRepository:
     def __init__(self, database_path: Path):
         self.database_path = database_path
 
-    def save(self, workspace: Path, recursive: bool) -> None:
+    def save(self, workspace: Path, recursive: bool, purpose: str | None = None) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.database_path) as connection:
             _create_schema(connection)
+            if purpose is None:
+                current = connection.execute(
+                    "SELECT purpose FROM workspace_settings WHERE id = 1"
+                ).fetchone()
+                purpose = current[0] if current is not None else "presentation"
             connection.execute(
                 """
-                INSERT INTO workspace_settings (id, workspace_path, recursive)
-                VALUES (1, ?, ?)
+                INSERT INTO workspace_settings (id, workspace_path, recursive, purpose)
+                VALUES (1, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     workspace_path = excluded.workspace_path,
-                    recursive = excluded.recursive
+                    recursive = excluded.recursive,
+                    purpose = excluded.purpose
                 """,
-                (str(workspace), int(recursive)),
+                (str(workspace), int(recursive), purpose),
             )
 
     def load(self) -> WorkspaceSettings | None:
@@ -111,12 +118,12 @@ class SqliteWorkspaceSettingsRepository:
         with sqlite3.connect(self.database_path) as connection:
             _create_schema(connection)
             row = connection.execute(
-                "SELECT workspace_path, recursive FROM workspace_settings WHERE id = 1"
+                "SELECT workspace_path, recursive, purpose FROM workspace_settings WHERE id = 1"
             ).fetchone()
 
         if row is None:
             return None
-        return WorkspaceSettings(workspace=Path(row[0]), recursive=bool(row[1]))
+        return WorkspaceSettings(workspace=Path(row[0]), recursive=bool(row[1]), purpose=row[2])
 
 
 def _create_schema(connection: sqlite3.Connection) -> None:
@@ -137,10 +144,16 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS workspace_settings (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             workspace_path TEXT NOT NULL,
-            recursive INTEGER NOT NULL CHECK (recursive IN (0, 1))
+            recursive INTEGER NOT NULL CHECK (recursive IN (0, 1)),
+            purpose TEXT NOT NULL DEFAULT 'presentation'
         )
         """
     )
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(workspace_settings)")}
+    if "purpose" not in columns:
+        connection.execute(
+            "ALTER TABLE workspace_settings ADD COLUMN purpose TEXT NOT NULL DEFAULT 'presentation'"
+        )
 
 
 def _box(data: dict | None) -> Box | None:

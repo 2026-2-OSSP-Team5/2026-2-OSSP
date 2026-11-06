@@ -1,12 +1,16 @@
+import sqlite3
+
 import pytest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from slideguard import bootstrap
 from slideguard.adapters.storage.sqlite import (
     SqliteWorkspaceSettingsRepository,
     StoredReport,
     WorkspaceSettings,
 )
 from slideguard.domain.models import AnalysisReport, DeckSnapshot, Finding
+from slideguard.domain.policy import Purpose
 from slideguard.ui import desktop
 
 
@@ -60,6 +64,19 @@ def test_option_change_overwrites_previous_value(tmp_path):
     repository.save(workspace, recursive=True)
 
     assert SqliteWorkspaceSettingsRepository(database_path).load().recursive is True
+
+
+def test_analysis_purpose_is_saved_and_preserved_by_workspace_only_updates(tmp_path):
+    database_path = tmp_path / "settings.sqlite3"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    repository = SqliteWorkspaceSettingsRepository(database_path)
+    repository.save(first, recursive=False, purpose="report")
+
+    repository.save(second, recursive=True)
+
+    restored = SqliteWorkspaceSettingsRepository(database_path).load()
+    assert restored == WorkspaceSettings(second, True, "report")
 
 
 def test_window_restores_workspace_and_lists_files_without_analysis(tmp_path, monkeypatch, application):
@@ -442,3 +459,33 @@ def test_unknown_empty_not_configured_and_failure_states_are_distinct(
         assert warnings
     finally:
         window.close()
+
+
+def test_legacy_workspace_settings_gain_default_analysis_purpose(tmp_path):
+    database_path = tmp_path / "legacy-settings.sqlite3"
+    workspace = tmp_path / "legacy-workspace"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE workspace_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                workspace_path TEXT NOT NULL,
+                recursive INTEGER NOT NULL CHECK (recursive IN (0, 1))
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO workspace_settings (id, workspace_path, recursive) VALUES (1, ?, 1)",
+            (str(workspace),),
+        )
+
+    restored = SqliteWorkspaceSettingsRepository(database_path).load()
+
+    assert restored == WorkspaceSettings(workspace, True, "presentation")
+
+
+def test_saved_analysis_purpose_builds_the_next_analysis_policy(tmp_path, monkeypatch):
+    settings = FakeSettingsRepository(WorkspaceSettings(tmp_path, False, "lecture"))
+    monkeypatch.setattr(bootstrap, "build_workspace_settings_repository", lambda: settings)
+
+    assert bootstrap.build_analysis_policy().purpose is Purpose.LECTURE
