@@ -21,9 +21,7 @@ def render_slide_previews(path: Path, slide_numbers: tuple[int, ...]) -> dict[in
     try:
         application = win32com.client.DispatchEx("PowerPoint.Application")
         open_count_before = application.Presentations.Count
-        presentation = application.Presentations.Open(
-            str(source), ReadOnly=-1, Untitled=-1, WithWindow=0
-        )
+        presentation = application.Presentations.Open(str(source), ReadOnly=-1, Untitled=-1, WithWindow=0)
         with TemporaryDirectory(prefix="slideguard-preview-") as temporary:
             directory = Path(temporary)
             for number in slide_numbers:
@@ -38,11 +36,7 @@ def render_slide_previews(path: Path, slide_numbers: tuple[int, ...]) -> dict[in
         try:
             if presentation is not None:
                 presentation.Close()
-            if (
-                application is not None
-                and open_count_before == 0
-                and application.Presentations.Count == 0
-            ):
+            if application is not None and open_count_before == 0 and application.Presentations.Count == 0:
                 application.Quit()
         finally:
             presentation = application = None

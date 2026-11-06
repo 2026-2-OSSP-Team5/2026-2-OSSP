@@ -14,19 +14,14 @@ from slideguard.ui.preview import render_slide_previews
 def _text_sizes(snapshot):
     return {
         shape.text.strip(): min(
-            run.font_size_pt
-            for run in shape.runs
-            if run.text.strip() and run.font_size_pt is not None
+            run.font_size_pt for run in shape.runs if run.text.strip() and run.font_size_pt is not None
         )
         for shape in snapshot.shapes
-        if shape.text.strip()
-        and any(run.text.strip() and run.font_size_pt is not None for run in shape.runs)
+        if shape.text.strip() and any(run.text.strip() and run.font_size_pt is not None for run in shape.runs)
     }
 
 
-def test_real_powerpoint_applies_selected_proposal_to_one_copy_and_renders_result(
-    request, tmp_path
-):
+def test_real_powerpoint_applies_selected_proposal_to_one_copy_and_renders_result(request, tmp_path):
     if sys.platform != "win32":
         pytest.skip("Desktop PowerPoint COM integration requires Windows")
     if not request.config.getoption("--run-powerpoint"):
@@ -55,11 +50,7 @@ def test_real_powerpoint_applies_selected_proposal_to_one_copy_and_renders_resul
     report.executed_rules = tuple(rule.id for rule in analyzer.rules)
     report.status = "analyzed"
     report.proposals = analyzer.planner.propose(report, policy)
-    selected = next(
-        item
-        for item in report.proposals
-        if item.property == "font.size" and item.before == 10
-    )
+    selected = next(item for item in report.proposals if item.property == "font.size" and item.before == 10)
     assert len([item for item in report.proposals if item.property == "font.size"]) == 2
 
     patcher = build_presentation_patcher()

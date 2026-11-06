@@ -273,12 +273,8 @@ class CopyApplyWorker(QObject):
 
             bindings = TeamBindings()
             applied_ids = tuple(bindings.to_team_proposal(item).id for item in result.applied)
-            rejected = tuple(
-                (bindings.to_team_proposal(item).id, reason) for item, reason in result.rejected
-            )
-            applied = [
-                proposal for proposal in self.report.proposals if proposal.id in set(applied_ids)
-            ]
+            rejected = tuple((bindings.to_team_proposal(item).id, reason) for item, reason in result.rejected)
+            applied = [proposal for proposal in self.report.proposals if proposal.id in set(applied_ids)]
             slide_changes: dict[int, list[ChangeProposal]] = {}
             for proposal in applied:
                 slide = _slide_number(proposal.shape_key)
@@ -301,9 +297,7 @@ class CopyApplyWorker(QObject):
                     applied_ids=applied_ids,
                     rejected=rejected,
                     warnings=tuple(result.warnings),
-                    slide_changes={
-                        slide: tuple(proposals) for slide, proposals in slide_changes.items()
-                    },
+                    slide_changes={slide: tuple(proposals) for slide, proposals in slide_changes.items()},
                     original_previews=original_previews,
                     copy_previews=copy_previews,
                     preview_error=preview_error,
@@ -436,9 +430,7 @@ class OverlayWidget(QWidget):
         super().__init__()
         self.setWindowTitle("SlideGuard Overlay")
         self.setWindowFlags(
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setStyleSheet(OVERLAY_STYLE)
         self.collapsed = True
@@ -651,7 +643,11 @@ class OverlayWidget(QWidget):
         self.count_badge.setVisible(self.collapsed and count > 0)
         self.findings_table.setRowCount(count)
         for row, finding in enumerate(report.findings):
-            values = [finding.shape_key.partition(":")[0], _rule_name(finding.rule_id), _severity(finding.severity)]
+            values = [
+                finding.shape_key.partition(":")[0],
+                _rule_name(finding.rule_id),
+                _severity(finding.severity),
+            ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column == 0:
@@ -726,15 +722,13 @@ class OverlayWidget(QWidget):
             self.proposals_list.blockSignals(False)
         self.select_warning_button.setEnabled(
             any(
-                findings.get(item.finding_id) is not None
-                and findings[item.finding_id].severity == "warning"
+                findings.get(item.finding_id) is not None and findings[item.finding_id].severity == "warning"
                 for item in report.proposals
             )
         )
         self.select_review_button.setEnabled(
             any(
-                findings.get(item.finding_id) is not None
-                and findings[item.finding_id].severity == "review"
+                findings.get(item.finding_id) is not None and findings[item.finding_id].severity == "review"
                 for item in report.proposals
             )
         )
@@ -781,10 +775,7 @@ class OverlayWidget(QWidget):
                 if (
                     findings.get(proposal.finding_id) is not None
                     and findings[proposal.finding_id].severity == severity
-                ) or (
-                    _proposal_group(proposal) is not None
-                    and _proposal_group(proposal) in selected_groups
-                ):
+                ) or (_proposal_group(proposal) is not None and _proposal_group(proposal) in selected_groups):
                     self.proposal_items[proposal.id].setCheckState(Qt.CheckState.Checked)
         finally:
             self._syncing_proposals = False
@@ -824,10 +815,7 @@ class OverlayWidget(QWidget):
         count = len(self.selected_proposal_ids())
         self.apply_button.setText(f"선택한 제안을 사본에 적용 ({count})")
         self.apply_button.setEnabled(
-            count > 0
-            and not self._analysis_busy
-            and not self._apply_busy
-            and not self._report_stale
+            count > 0 and not self._analysis_busy and not self._apply_busy and not self._report_stale
         )
 
 
@@ -1093,8 +1081,7 @@ class OverlayController(QObject):
             QMessageBox.warning(
                 self.overlay,
                 "수정 제안 충돌",
-                "함께 적용할 수 없는 제안이 있습니다. 선택을 정리해 주세요.\n\n"
-                + "\n".join(conflicts),
+                "함께 적용할 수 없는 제안이 있습니다. 선택을 정리해 주세요.\n\n" + "\n".join(conflicts),
             )
             return
 
@@ -1311,9 +1298,7 @@ def _normalized_value(value):
     return value
 
 
-def _selection_conflicts(
-    report: AnalysisReport, selected: list[ChangeProposal]
-) -> list[str]:
+def _selection_conflicts(report: AnalysisReport, selected: list[ChangeProposal]) -> list[str]:
     messages = []
     selected_ids = {item.id for item in selected}
     groups: dict[str, set[str]] = {}

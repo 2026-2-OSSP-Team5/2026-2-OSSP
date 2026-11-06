@@ -128,6 +128,7 @@ def build_snapshot_collection(
         max_attempts=max_attempts,
         retry_delay_seconds=retry_delay_seconds,
     )
+
     def handle_event(event):
         if on_detected is not None and not isinstance(event, FileRemoved):
             on_detected(event.source_path)
