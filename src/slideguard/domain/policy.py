@@ -26,6 +26,15 @@ LARGE_BOLD_TEXT_PT = 14.0  # 굵은 글씨는 이 크기 이상이면 대형 텍
 # 안전 여백: 슬라이드 각 방향 길이의 비율 (팀 평가 기준표)
 SAFE_MARGIN_RATIO = 0.05
 
+# 시각적 위계: 제목은 본문 글자 크기의 이 배수 이상이어야 한다 (팀 합의 2026-11-06).
+# 제목이 본문보다 작거나 같으면 경고, 배수에 못 미치면 검토로 본다.
+TITLE_BODY_RATIO = 1.25
+
+# 제목·본문 자리 표시자 구분값은 PowerPoint PpPlaceholderType을 따른다.
+# 1 제목 / 3 가운데 제목 / 5 세로 제목, 2 본문 / 6 세로 본문.
+TITLE_PLACEHOLDERS = frozenset({1, 3, 5})
+BODY_PLACEHOLDERS = frozenset({2, 6})
+
 
 @dataclass(frozen=True)
 class FontSizeThreshold:
