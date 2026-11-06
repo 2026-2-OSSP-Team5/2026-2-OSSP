@@ -1,7 +1,10 @@
 import json
 import sqlite3
 
-from slideguard.adapters.storage.sqlite import SqliteReportRepository
+from slideguard.adapters.storage.sqlite import (
+    SqliteReportRepository,
+    SqliteWorkspaceSettingsRepository,
+)
 from slideguard.bootstrap import report_database_path
 from slideguard.domain.models import (
     AnalysisReport,
@@ -205,6 +208,23 @@ def test_not_configured_and_analyzed_statuses_remain_distinct(tmp_path):
     statuses = [item.report.status for item in repository.list_recent()]
 
     assert statuses == ["analyzed", "not_configured"]
+
+
+def test_clear_removes_reports_but_preserves_workspace_settings(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    workspace = tmp_path / "presentations"
+    report_repository = SqliteReportRepository(database_path)
+    settings_repository = SqliteWorkspaceSettingsRepository(database_path)
+    report_repository.save(make_report())
+    settings_repository.save(workspace, recursive=True)
+
+    report_repository.clear()
+
+    assert SqliteReportRepository(database_path).list_recent() == []
+    restored = SqliteWorkspaceSettingsRepository(database_path).load()
+    assert restored is not None
+    assert restored.workspace == workspace
+    assert restored.recursive is True
 
 
 def test_report_database_path_does_not_depend_on_working_directory(tmp_path, monkeypatch):

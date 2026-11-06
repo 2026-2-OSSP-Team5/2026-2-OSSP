@@ -76,6 +76,14 @@ class SqliteReportRepository:
 
         return [StoredReport(row[0], row[1], _report_from_json(row[2])) for row in rows]
 
+    def clear(self) -> None:
+        """Delete saved analysis reports while preserving workspace settings."""
+        if not self.database_path.exists():
+            return
+        with sqlite3.connect(self.database_path) as connection:
+            _create_schema(connection)
+            connection.execute("DELETE FROM analysis_reports")
+
 
 class SqliteWorkspaceSettingsRepository:
     def __init__(self, database_path: Path):
