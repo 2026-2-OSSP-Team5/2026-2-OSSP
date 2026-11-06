@@ -5,7 +5,15 @@ from slideguard.domain.models import Box, DeckSnapshot, Shape, TextRun
 from slideguard.domain.policy import AnalysisPolicy, Purpose
 
 
-def make_shape(runs, supported=True, slide_number=1, shape_id=1, text=None, notes=()):
+def make_shape(
+    runs,
+    supported=True,
+    slide_number=1,
+    shape_id=1,
+    text=None,
+    notes=(),
+    placeholder_type=None,
+):
     run_tuple = tuple(runs)
     return Shape(
         slide_number=slide_number,
@@ -16,7 +24,22 @@ def make_shape(runs, supported=True, slide_number=1, shape_id=1, text=None, note
         runs=run_tuple,
         supported=supported,
         notes=tuple(notes),
+        placeholder_type=placeholder_type,
     )
+
+
+def title(size_pt, *, slide_number=1, shape_id=1, kind=1):
+    runs = [TextRun("제목", size_pt)] if size_pt is not None else [TextRun("제목", None)]
+    return make_shape(runs, slide_number=slide_number, shape_id=shape_id, placeholder_type=kind)
+
+
+def body(size_pt, *, slide_number=1, shape_id=2, kind=2):
+    runs = [TextRun("본문", size_pt)] if size_pt is not None else [TextRun("본문", None)]
+    return make_shape(runs, slide_number=slide_number, shape_id=shape_id, placeholder_type=kind)
+
+
+def hierarchy_findings(findings):
+    return [f for f in findings if f.id.endswith(":hierarchy")]
 
 
 def run_rule(*shapes, policy=None):
@@ -125,3 +148,125 @@ def test_slide_filter_limits_scope():
         policy=AnalysisPolicy(slides=(3,)),
     )
     assert [f.shape_key for f in findings] == ["3:1"]
+
+
+# --- 시각적 위계 (제목은 본문의 1.25배 이상) ---------------------------------
+
+
+def test_title_well_above_body_has_no_hierarchy_finding():
+    # 본문 20pt → 제목은 25pt 이상이면 된다. 32pt는 넉넉하다.
+    assert hierarchy_findings(run_rule(title(32), body(20))) == []
+
+
+def test_title_exactly_at_ratio_passes():
+    # 20 * 1.25 = 25.0. 경계값은 통과여야 한다.
+    assert hierarchy_findings(run_rule(title(25), body(20))) == []
+
+
+def test_title_smaller_than_body_is_warning():
+    findings = hierarchy_findings(run_rule(title(16), body(20)))
+    assert [f.severity for f in findings] == ["warning"]
+    finding = findings[0]
+    assert finding.rule_id == "typography"
+    assert finding.id == "typography:1:hierarchy"
+    assert finding.shape_key == "1:1"  # 수정 대상은 제목 도형
+    assert finding.measured == 16
+    assert finding.expected == 25.0
+    assert "제목 16pt / 본문 20pt" in finding.evidence
+
+
+def test_title_equal_to_body_is_warning():
+    findings = hierarchy_findings(run_rule(title(20), body(20)))
+    assert [f.severity for f in findings] == ["warning"]
+
+
+def test_title_larger_but_below_ratio_is_review():
+    # 20 < 22 < 25 — 위계는 있지만 기준에 못 미친다.
+    findings = hierarchy_findings(run_rule(title(22), body(20)))
+    assert [f.severity for f in findings] == ["review"]
+    assert findings[0].expected == 25.0
+
+
+def test_required_size_rounds_up_to_half_point():
+    # 18 * 1.25 = 22.5 — 0.5pt 단위라 그대로 쓴다.
+    findings = hierarchy_findings(run_rule(title(20), body(18)))
+    assert findings[0].expected == 22.5
+    # 19 * 1.25 = 23.75 → 24.0으로 올린다.
+    findings = hierarchy_findings(run_rule(title(20), body(19)))
+    assert findings[0].expected == 24.0
+
+
+def test_center_title_placeholder_counts_as_title():
+    findings = hierarchy_findings(run_rule(title(16, kind=3), body(20)))
+    assert [f.severity for f in findings] == ["warning"]
+
+
+def test_vertical_placeholders_count():
+    findings = hierarchy_findings(run_rule(title(16, kind=5), body(20, kind=6)))
+    assert [f.severity for f in findings] == ["warning"]
+
+
+def test_slide_without_body_is_not_checked():
+    assert hierarchy_findings(run_rule(title(16))) == []
+
+
+def test_slide_without_title_is_not_checked():
+    assert hierarchy_findings(run_rule(body(20))) == []
+
+
+def test_shapes_without_placeholder_type_are_not_checked():
+    # OOXML 경로는 자리 표시자 종류를 주지 않는다. 억지로 짐작하지 않는다.
+    plain_title = make_shape([TextRun("제목", 16)], shape_id=1)
+    plain_body = make_shape([TextRun("본문", 20)], shape_id=2)
+    assert hierarchy_findings(run_rule(plain_title, plain_body)) == []
+
+
+def test_unsupported_shapes_are_not_checked():
+    # 지원하지 않는 객체는 크기 검사에서 이미 unknown으로 보고된다.
+    rough_title = make_shape([TextRun("제목", 16)], supported=False, placeholder_type=1)
+    assert hierarchy_findings(run_rule(rough_title, body(20))) == []
+
+
+def test_unknown_title_size_is_unknown():
+    findings = hierarchy_findings(run_rule(title(None), body(20)))
+    assert [f.severity for f in findings] == ["unknown"]
+    finding = findings[0]
+    assert finding.measured is None
+    assert finding.expected is None
+    assert "제목" in finding.evidence
+
+
+def test_unknown_body_size_is_unknown():
+    findings = hierarchy_findings(run_rule(title(16), body(None)))
+    assert [f.severity for f in findings] == ["unknown"]
+    assert "본문" in findings[0].evidence
+
+
+def test_largest_body_run_is_the_comparison():
+    # 본문이 여러 개면 제목과 겨루는 건 가장 큰 글자다.
+    small = body(14, shape_id=2)
+    large = body(24, shape_id=3)
+    findings = hierarchy_findings(run_rule(title(26), small, large))
+    assert [f.severity for f in findings] == ["review"]
+    assert findings[0].expected == 30.0  # 24 * 1.25
+
+
+def test_each_slide_is_checked_separately():
+    findings = hierarchy_findings(
+        run_rule(
+            title(32, slide_number=1, shape_id=1),
+            body(20, slide_number=1, shape_id=2),
+            title(16, slide_number=2, shape_id=3),
+            body(20, slide_number=2, shape_id=4),
+        )
+    )
+    assert [f.id for f in findings] == ["typography:2:hierarchy"]
+    assert findings[0].shape_key == "2:3"
+
+
+def test_hidden_slides_are_skipped_for_hierarchy():
+    policy = AnalysisPolicy(slides=(2,))
+    findings = hierarchy_findings(
+        run_rule(title(16, slide_number=1), body(20, slide_number=1), policy=policy)
+    )
+    assert findings == []
