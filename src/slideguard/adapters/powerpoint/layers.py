@@ -1,6 +1,9 @@
 """Resolve uniform color only for covered, verified rectangular layers."""
 
+import math
 from dataclasses import replace
+
+from slideguard.domain.models import Box
 
 from .background import effective_slide_background
 from .measurements import optional
@@ -27,21 +30,48 @@ def _safe_rectangle(item):
     )
 
 
+def _reach(shape, item):
+    """이 도형이 그려질 수 있는 범위. 회전하면 돌아간 범위, 번지는 효과가 있거나 모르면 None."""
+    for name, read in (
+        ("Shadow visibility", lambda: item.Shadow.Visible),
+        ("Glow radius", lambda: item.Glow.Radius),
+        ("Soft edge radius", lambda: item.SoftEdge.Radius),
+    ):
+        if optional(read, name, []) != 0:
+            return None  # 효과는 상자 밖까지 번질 수 있음 (얼마나 번지는지는 추측하지 않음)
+    rotation = optional(lambda: item.Rotation, "Rotation", [])
+    if type(rotation) not in (int, float):
+        return None
+    box = shape.box
+    if rotation % 180 == 0:
+        return box
+    angle = math.radians(rotation % 180)
+    cos, sin = abs(math.cos(angle)), abs(math.sin(angle))
+    width = box.width * cos + box.height * sin
+    height = box.width * sin + box.height * cos
+    cx, cy = box.x + box.width / 2, box.y + box.height / 2
+    return Box(cx - width / 2, cy - height / 2, width, height)
+
+
 def _uniform(target, layers, slide):
     bounds = target.rendered_box
     if bounds is None or target.box is None or target.z_order is None or target.effective_visible is not True:
         return None
-    # Even a nonintersecting bounding box may have an effect outside it.
-    # Limit this extension to the case where every contributing shape is a
-    # verified plain rectangle.
     for shape, item in layers:
         if shape.effective_visible is False:
             continue
-        if shape.box is None or shape.z_order is None or not _safe_rectangle(item):
+        if shape.box is None or shape.z_order is None:
             return None
-        if not _intersects(shape.box, bounds):
+        # 글자 영역에 닿지 않는 도형(구석의 사진·아이콘 등)은 배경에 영향을 주지 않음.
+        # 회전·효과 때문에 닿는지 확인할 수 없는 도형만 보수적으로 '모름'.
+        reach = _reach(shape, item)
+        if reach is None:
+            return None
+        if not _intersects(reach, bounds):
             continue
         if shape.z_order > target.z_order:
+            return None
+        if not _safe_rectangle(item):
             return None
         fill = optional(lambda item=item: item.Fill, "Fill", [])
         visible = optional(lambda fill=fill: fill.Visible, "Fill visibility", [])
