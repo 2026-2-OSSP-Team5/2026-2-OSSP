@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from .background import _opaque_fill
+from .background import effective_slide_background
 from .measurements import optional
 
 
@@ -50,18 +50,8 @@ def _uniform(target, layers, slide):
         if not _contains(shape.box, bounds):
             return None
         return shape.fill_color if shape.fill_transparency == 0 else None
-    if (
-        optional(lambda: slide.DisplayMasterShapes, "Master visibility", []) != 0
-        or optional(lambda: slide.CustomLayout.Shapes.Count, "Layout count", []) != 0
-    ):
-        return None
-    if any(
-        optional(lambda name=name: getattr(slide.HeadersFooters, name).Visible, name, []) != 0
-        for name in ("DateAndTime", "Footer", "SlideNumber")
-    ):
-        return None
-    fill = optional(lambda: slide.Background.Fill, "Effective slide fill", [])
-    return _opaque_fill(fill, "Effective slide fill", []) if fill is not None else None
+    # 덮는 슬라이드 도형이 없으면 슬라이드 배경 (레이아웃·마스터에서 상속한 배경 포함)
+    return effective_slide_background(slide, bounds, [])
 
 
 def resolve_backgrounds(shapes, slide):
