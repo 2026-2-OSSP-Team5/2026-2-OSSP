@@ -53,35 +53,72 @@ def _reach(shape, item):
     return Box(cx - width / 2, cy - height / 2, width, height)
 
 
-def _uniform(target, layers, slide):
+_TRANSPARENT_KINDS = (1, 17)  # msoAutoShape, msoTextBox
+_PLACEHOLDER = 14
+
+
+def _transparent(item):
+    """채우기·선·3D가 없는 도형/글상자: 자기 글자 말고는 아무것도 그리지 않아 뒤 배경을 가리지 않음."""
+    kind = optional(lambda: item.Type, "Object kind", [])
+    if kind == _PLACEHOLDER:
+        kind = optional(lambda: item.PlaceholderFormat.ContainedType, "Placeholder content", [])
+    if kind not in _TRANSPARENT_KINDS:
+        return False  # 그림·차트·표·그룹 등은 무엇을 그리는지 확인하지 않음
+    return (
+        optional(lambda: item.Fill.Visible, "Fill visibility", []) == 0
+        and optional(lambda: item.Line.Visible, "Line visibility", []) == 0
+        and optional(lambda: item.ThreeD.Visible, "3D visibility", []) == 0
+    )
+
+
+def _uniform(target, layers, slide, notes):
+    """글자 영역 뒤에 보이는 단색 배경. 정할 수 없으면 None과 함께 notes에 이유를 남김."""
     bounds = target.rendered_box
     if bounds is None or target.box is None or target.z_order is None or target.effective_visible is not True:
+        notes.append("Background is unknown: text bounds, drawing order or visibility is unverified")
         return None
     for shape, item in layers:
         if shape.effective_visible is False:
             continue
         if shape.box is None or shape.z_order is None:
+            notes.append(f"Background is unknown: object {shape.shape_id} has no verified geometry or order")
             return None
         # 글자 영역에 닿지 않는 도형(구석의 사진·아이콘 등)은 배경에 영향을 주지 않음.
         # 회전·효과 때문에 닿는지 확인할 수 없는 도형만 보수적으로 '모름'.
         reach = _reach(shape, item)
         if reach is None:
+            notes.append(
+                f"Background is unknown: object {shape.shape_id} has a shadow/glow/soft edge or unknown rotation"
+            )
             return None
         if not _intersects(reach, bounds):
             continue
         if shape.z_order > target.z_order:
+            # 글자 위에 그려지는 도형: 투명하면(채우기·선 없음) 배경을 바꾸지 않음
+            if shape.shape_id != target.shape_id and _transparent(item):
+                continue
+            notes.append(f"Background is unknown: object {shape.shape_id} is drawn over the text")
             return None
         if not _safe_rectangle(item):
+            if shape.shape_id != target.shape_id and _transparent(item):
+                continue  # 글자 뒤의 투명한 글상자: 배경을 바꾸지 않음
+            notes.append(
+                f"Background is unknown: object {shape.shape_id} under the text is not a plain rectangle"
+            )
             return None
         fill = optional(lambda item=item: item.Fill, "Fill", [])
         visible = optional(lambda fill=fill: fill.Visible, "Fill visibility", [])
         if visible == 0:
             continue
         if not _contains(shape.box, bounds):
+            notes.append(f"Background is unknown: filled object {shape.shape_id} only partly covers the text")
             return None
-        return shape.fill_color if shape.fill_transparency == 0 else None
+        if shape.fill_transparency != 0:
+            notes.append(f"Background is unknown: object {shape.shape_id} under the text is semi-transparent")
+            return None
+        return shape.fill_color
     # 덮는 슬라이드 도형이 없으면 슬라이드 배경 (레이아웃·마스터에서 상속한 배경 포함)
-    return effective_slide_background(slide, bounds, [])
+    return effective_slide_background(slide, bounds, notes)
 
 
 def resolve_backgrounds(shapes, slide):
@@ -98,7 +135,12 @@ def resolve_backgrounds(shapes, slide):
     resolved = {}
     for shape in top:
         if shape.text and shape.background is None:
-            color = _uniform(shape, layers, slide)
+            notes: list[str] = []
+            color = _uniform(shape, layers, slide, notes)
             if color is not None:
-                resolved[shape.key] = replace(shape, background=color)
+                resolved[shape.key] = replace(
+                    shape, background=color, notes=(*shape.notes, "Background resolved from the slide layers")
+                )
+            elif notes:
+                resolved[shape.key] = replace(shape, notes=(*shape.notes, notes[-1]))
     return [resolved.get(shape.key, shape) for shape in shapes]

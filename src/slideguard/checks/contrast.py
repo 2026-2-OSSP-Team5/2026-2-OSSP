@@ -100,10 +100,12 @@ def _evaluate_shape(shape: Shape) -> list[_Result]:
         samples = _sample_colors(shape)
         if samples:
             return _evaluate_with_samples(runs, samples)
+        reason = _background_reason(shape)
         return [
             _unknown(
                 "배경색을 알 수 없어 명암비를 판정할 수 없습니다",
-                "배경이 이미지·그라데이션·투명이거나 색을 확인하지 못함",
+                "배경이 이미지·그라데이션·투명이거나 색을 확인하지 못함"
+                + (f" (추출 근거: {reason})" if reason else ""),
             )
         ]
 
@@ -118,6 +120,14 @@ def _evaluate_shape(shape: Shape) -> list[_Result]:
         if result is not None:
             results.append(result)
     return results
+
+
+def _background_reason(shape: Shape) -> str:
+    """A(스냅샷)가 배경을 정하지 못한 이유 중 가장 마지막 기록."""
+    for note in reversed(shape.notes):
+        if "ackground" in note or "fill" in note.lower():
+            return note
+    return ""
 
 
 # 렌더링 픽셀 근거로 판정하려면 최소 이만큼의 픽셀이 필요 (A의 렌더링 코드와 같은 값)

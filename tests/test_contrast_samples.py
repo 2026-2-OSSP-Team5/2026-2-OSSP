@@ -55,3 +55,21 @@ def test_without_enough_samples_stays_unknown():
 def test_unknown_text_color_stays_unknown_with_samples():
     findings = evaluate([TextRun("본문", 20, None, False)], samples(WHITE, WHITE, WHITE, WHITE))
     assert [f.severity for f in findings] == ["unknown"]
+
+
+def test_unknown_background_shows_extraction_reason():
+    shape = Shape(
+        1,
+        1,
+        "s",
+        Box(0, 0, 200, 50),
+        text="본문",
+        runs=(TextRun("본문", 20, BLACK, False),),
+        background=None,
+        supported=True,
+        notes=("Background is unknown: object 50 is drawn over the text",),
+    )
+    deck = DeckSnapshot("test.pptx", "0" * 64, 1, 960, 540, shapes=(shape,))
+    findings = ContrastRule().evaluate(deck, AnalysisPolicy())
+    assert [f.severity for f in findings] == ["unknown"]
+    assert "object 50 is drawn over the text" in findings[0].evidence

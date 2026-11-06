@@ -69,3 +69,30 @@ def test_picture_behind_text_keeps_background_unknown_for_pixel_judgment():
     picture = far_picture()
     picture.Left, picture.Top = 0.0, 0.0  # 글자 바로 뒤의 사진 → 단색 배경이 아님
     assert background_of_target(picture) is None
+
+
+def overlapping_text_box(*, filled=False, kind=17):
+    """대상 글자 영역에 닿는, 더 앞에 그려지는 글상자 (샘플 1번 슬라이드의 3번·4번 글상자 상황)."""
+    item = no_effects(shape(shape_id=50))
+    item.Type = kind
+    item.Left, item.Top, item.Width, item.Height = 0.0, 40.0, 300.0, 60.0
+    item.Fill.Visible = -1 if filled else 0
+    return item
+
+
+def target_then(*front):
+    slide = make_slide([unfilled_target(), *front])
+    slide.SlideShowTransition = Properties(Hidden=0)
+    return extract(slide).shapes[0]
+
+
+def test_transparent_text_box_drawn_over_overflowing_text_keeps_background():
+    target = target_then(overlapping_text_box())
+    assert target.background == SLIDE_BACKGROUND
+
+
+def test_filled_or_picture_object_over_text_is_unknown_with_reason():
+    for front in (overlapping_text_box(filled=True), overlapping_text_box(kind=13)):
+        target = target_then(front)
+        assert target.background is None
+        assert "object 50 is drawn over the text" in target.notes[-1]

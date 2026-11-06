@@ -74,3 +74,32 @@ def test_text_over_picture_is_judged_from_rendered_pixels(request, tmp_path):
 
     assert shape.background is None and len(shape.background_samples) >= 4
     assert [item.severity for item in findings] == ["review"]  # 흰 배경 부분에서 명암비 부족
+
+
+def test_overflowing_text_touching_a_transparent_text_box_keeps_white_background(request, tmp_path):
+    if sys.platform != "win32":
+        pytest.skip("Desktop PowerPoint COM integration requires Windows")
+    if not request.config.getoption("--run-powerpoint"):
+        pytest.skip("Desktop PowerPoint integration is opt-in: pass --run-powerpoint")
+    pytest.importorskip("pythoncom", reason="pywin32 is not installed")
+    pytest.importorskip("win32com.client", reason="pywin32 is not installed")
+    from pptx.enum.text import MSO_AUTO_SIZE
+
+    # 샘플 1번 슬라이드 상황: 28pt 글씨가 상자 아래로 넘쳐 다음 글상자(투명)에 닿음
+    path = tmp_path / "넘친 글씨.pptx"
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    upper = slide.shapes.add_textbox(Pt(40), Pt(160), Pt(420), Pt(50))
+    upper.text_frame.word_wrap = True
+    upper.text_frame.auto_size = MSO_AUTO_SIZE.NONE
+    upper_run = upper.text_frame.paragraphs[0].add_run()
+    upper_run.text = "Overflowing light yellow text that wraps onto a second line"
+    upper_run.font.size = Pt(28)
+    upper_run.font.color.rgb = RGBColor(0xFF, 0xE6, 0x78)
+    lower = slide.shapes.add_textbox(Pt(40), Pt(215), Pt(300), Pt(60))
+    lower.text_frame.paragraphs[0].add_run().text = "Next box"
+    presentation.save(path)
+
+    deck = build_powerpoint_reader(render=False).read(path)
+    shape = next(item for item in deck.shapes if item.text.startswith("Overflowing"))
+    assert shape.background == (255, 255, 255), shape.notes
