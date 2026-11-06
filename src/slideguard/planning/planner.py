@@ -26,7 +26,8 @@
 3) 지켜야 할 계약
    - 고정 항목은 후보를 만들지 않음
    - 측정 불가를 '정상'으로 가정하지 않음
-     (사진 위 글씨는 배경을 모르는 채로도 '최악의 배경'에서 기준을 넘는 배경판만 제안)
+     (사진·그라데이션 위 글씨는 배경을 모르는 채로도 '최악의 배경'에서 기준을 넘는 배경판만 제안.
+      B가 렌더링 픽셀로 근사 판정해 '검토 필요'로 보낸 경우도 같음)
    - 의도적 겹침은 자동 수정·이동하지 않음
    - 파일·COM·UI에 접근하지 않음 (순수 계산)
 """
@@ -173,7 +174,7 @@ class RuleBasedPlanner:
             if category == Category.REVIEW_ONLY:
                 skip(self._review_reason(info, standards))
                 continue
-            if info.status == Status.REVIEW:
+            if info.status == Status.REVIEW and not _is_photo_text(info):
                 skip("사람의 검토가 필요한 항목")
                 continue
             if info.status == Status.UNMEASURABLE and not _is_photo_text(info):

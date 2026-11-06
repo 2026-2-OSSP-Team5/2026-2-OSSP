@@ -332,7 +332,9 @@ class TeamBindings:
     def _contrast_colors(self, shape: object, ratio: float | None) -> dict:
         """B가 판정한 명암비와 같은 값이 나오는 글자색을 찾음. 못 찾으면 비워 둠 (추측 금지)."""
         background = _normalize_color(getattr(shape, "background", None))
-        if background is None or ratio is None:
+        if background is None:
+            return self._unknown_background_colors(shape, ratio)
+        if ratio is None:
             return {}
         for run in getattr(shape, "runs", ()) or ():
             if not str(getattr(run, "text", "")).strip():
@@ -343,6 +345,37 @@ class TeamBindings:
             if abs(contrast_ratio(color, background) - ratio) <= _RATIO_TOLERANCE:
                 return {"foreground": color, "background": background, "background_kind": "solid"}
         return {}
+
+    def _unknown_background_colors(self, shape: object, ratio: float | None) -> dict:
+        """배경이 한 가지 색이 아닌 글씨(사진·그라데이션·반투명 등).
+
+        배경색은 비워 두고 background_kind="image"로 표시합니다 → planner가 '어떤 배경에서도
+        기준을 넘는 배경판'만 제안합니다. 렌더링 픽셀 근거(B의 근사 판정)가 있으면 그 판정에
+        쓰인 글자색을, 없으면 색이 정해진 첫 글자색을 씁니다. 글자색을 모르면 비워 둠.
+        """
+        runs = [
+            color
+            for run in getattr(shape, "runs", ()) or ()
+            if str(getattr(run, "text", "")).strip()
+            for color in [_normalize_color(getattr(run, "color", None))]
+            if color is not None
+        ]
+        if not runs:
+            return {}
+        foreground = runs[0]
+        samples = [
+            _normalize_color(sample[2:5])
+            for sample in getattr(shape, "background_samples", ()) or ()
+            if len(sample) == 5
+        ]
+        samples = [color for color in samples if color is not None]
+        if samples and ratio is not None:
+            for color in runs:
+                worst = min(contrast_ratio(color, sample) for sample in samples)
+                if abs(worst - ratio) <= _RATIO_TOLERANCE:
+                    foreground = color
+                    break
+        return {"foreground": foreground, "background_kind": "image"}
 
     # ------------------------------------------------------------------
     # 스냅샷(A) 읽기

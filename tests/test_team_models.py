@@ -268,3 +268,38 @@ def test_apply_to_copy_rejects_unknown_id(tmp_path):
         PowerPointPatcher(opener_for(Doc(DocShape()))).apply_to_copy(
             report, ["없는 후보"], tmp_path / "out.pptx", AnalysisPolicy()
         )
+
+
+# ---------------------------------------------------------------- 배경이 한 가지 색이 아닌 글씨
+
+
+def photo_text_shape(samples=()):
+    return Shape(
+        slide_number=1,
+        shape_id=4,
+        name="사진 위 글자",
+        box=Box(60, 60, 400, 100),
+        text="글자",
+        runs=(TextRun("글자", font_size_pt=24.0, color=(255, 255, 255), bold=False),),
+        background=None,
+        supported=True,
+        background_samples=samples,
+    )
+
+
+def test_unknown_background_text_is_marked_for_a_scrim():
+    info = TeamBindings().read_finding(finding("contrast", "1:4", "unknown"), deck_of(photo_text_shape()))
+    assert info.values == {"foreground": "FFFFFF", "background_kind": "image"}
+
+
+def test_b_sample_review_gets_scrim_only_at_strong():
+    samples = tuple((float(i), 0.0, 200, 200, 200) for i in range(4))
+    deck = deck_of(photo_text_shape(samples))
+    review = finding("contrast", "1:4", "review", measured=1.67, expected=3.0)
+
+    strong = RuleBasedPlanner().plan(deck, [review], AnalysisPolicy(strength=Strength.STRONG))
+    standard = RuleBasedPlanner().plan(deck, [review], AnalysisPolicy())
+
+    assert [p.prop for p in strong.proposals] == [Property.SHAPE_FILL]
+    assert strong.proposals[0].after["color"] == "000000"
+    assert standard.proposals == []
