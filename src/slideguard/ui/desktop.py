@@ -274,8 +274,13 @@ class MainWindow(QMainWindow):
                 f"발견 항목 {len(report.findings)}개"
             )
 
-        if deck.limitations:
-            summary += "\n측정 한계: " + " / ".join(deck.limitations)
+        limitations = tuple(
+            limitation
+            for limitation in deck.limitations
+            if not (report.status == "analyzed" and limitation == "No rules registered")
+        )
+        if limitations:
+            summary += "\n측정 한계: " + " / ".join(limitations)
 
         self.result_label.setText(summary)
         self.result_table.setRowCount(len(report.findings))

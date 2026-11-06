@@ -3,8 +3,10 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from slideguard.adapters.storage.sqlite import (
     SqliteWorkspaceSettingsRepository,
+    StoredReport,
     WorkspaceSettings,
 )
+from slideguard.domain.models import AnalysisReport, DeckSnapshot, Finding
 from slideguard.ui import desktop
 
 
@@ -14,8 +16,11 @@ def application():
 
 
 class FakeReportRepository:
+    def __init__(self, reports=None):
+        self.reports = reports or []
+
     def list_recent(self):
-        return []
+        return self.reports
 
 
 class FakeSettingsRepository:
@@ -128,5 +133,54 @@ def test_invalid_saved_workspace_is_reported_without_closing(tmp_path, monkeypat
 
         assert window.workspace == replacement_workspace
         assert settings_repository.saved == [(replacement_workspace, False)]
+    finally:
+        window.close()
+
+
+def test_saved_analysis_opens_without_reading_original_pptx(tmp_path, monkeypatch, application):
+    missing_source = tmp_path / "deleted.pptx"
+    report = AnalysisReport(
+        deck=DeckSnapshot(
+            source_path=str(missing_source),
+            source_sha256="stored-sha",
+            slide_count=1,
+            width_pt=960.0,
+            height_pt=540.0,
+        ),
+        findings=[
+            Finding(
+                id="contrast:1:1",
+                rule_id="contrast",
+                shape_key="1:1",
+                severity="unknown",
+                message="측정할 수 없습니다",
+                measured=None,
+                expected=None,
+                evidence="렌더링 정보 없음",
+            )
+        ],
+        executed_rules=("contrast", "typography", "layout"),
+        status="analyzed",
+    )
+    history = FakeReportRepository([StoredReport(1, "2026-11-06T00:00:00+00:00", report)])
+    monkeypatch.setattr(desktop, "build_workspace_settings_repository", FakeSettingsRepository)
+    monkeypatch.setattr(desktop, "build_report_repository", lambda: history)
+    monkeypatch.setattr(
+        desktop,
+        "build_analyzer",
+        lambda: pytest.fail("opening history must not rebuild or execute the analyzer"),
+    )
+
+    window = desktop.MainWindow()
+    try:
+        assert not missing_source.exists()
+        assert window.history_table.rowCount() == 1
+
+        window.history_table.selectRow(0)
+        window.open_selected_history()
+
+        assert window.result_table.rowCount() == 1
+        assert window.result_table.item(0, 0).text() == "1:1"
+        assert "deleted.pptx" in window.result_label.text()
     finally:
         window.close()

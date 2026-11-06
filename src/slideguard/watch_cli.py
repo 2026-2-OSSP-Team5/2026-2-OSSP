@@ -1,14 +1,23 @@
+import json
 import logging
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from .adapters.watching.monitor import LOGGER, SavedFileMonitor
 
 
-def watch_directory(directory: Path, *, recursive: bool, settle_seconds: float, log_file: Path | None) -> int:
+def watch_directory(
+    directory: Path,
+    *,
+    recursive: bool,
+    settle_seconds: float,
+    log_file: Path | None,
+    extract: bool = False,
+) -> int:
     """Watch a directory in the foreground and log saved PPTX changes."""
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr if extract else sys.stdout)]
     monitor = None
     old_level, old_propagate = LOGGER.level, LOGGER.propagate
     try:
@@ -24,7 +33,24 @@ def watch_directory(directory: Path, *, recursive: bool, settle_seconds: float, 
             LOGGER.addHandler(handler)
         LOGGER.setLevel(logging.INFO)
         LOGGER.propagate = False
-        monitor = SavedFileMonitor(directory, recursive=recursive, settle_seconds=settle_seconds)
+        if extract:
+            from .bootstrap import build_snapshot_collection
+
+            def publish(snapshot):
+                print(json.dumps(asdict(snapshot), ensure_ascii=True), flush=True)
+
+            def report_failure(info):
+                LOGGER.error("SNAPSHOT_FAILED | %s", info)
+
+            monitor = build_snapshot_collection(
+                directory,
+                publish,
+                recursive=recursive,
+                settle_seconds=settle_seconds,
+                on_failure=report_failure,
+            )
+        else:
+            monitor = SavedFileMonitor(directory, recursive=recursive, settle_seconds=settle_seconds)
         monitor.start()
         LOGGER.info("Ctrl+C로 감시를 종료합니다.")
         if log_file is not None:

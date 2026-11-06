@@ -1,6 +1,21 @@
+import json
+import sqlite3
+
 from slideguard.adapters.storage.sqlite import SqliteReportRepository
 from slideguard.bootstrap import report_database_path
-from slideguard.domain.models import AnalysisReport, Box, DeckSnapshot, Finding
+from slideguard.domain.models import (
+    AnalysisReport,
+    Box,
+    DeckSnapshot,
+    Finding,
+    Measurement,
+    ObjectEvidence,
+    ObjectLocator,
+    Shape,
+    SlideDetails,
+    TextRun,
+    TextSpan,
+)
 
 
 def make_report(status="analyzed"):
@@ -49,6 +64,137 @@ def test_new_repository_instance_reads_previous_report(tmp_path):
     stored = SqliteReportRepository(database_path).list_recent()
 
     assert stored[0].report.deck.source_sha256 == "abc123"
+
+
+def test_model_0_3_report_round_trips_through_new_repository_instance(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    evidence = ObjectEvidence(
+        kind="group",
+        origin="powerpoint",
+        state="partial",
+        properties=(("visible", True),),
+        children=(
+            ObjectEvidence(
+                kind="shape",
+                origin="ooxml",
+                state="saved",
+                text="본문",
+                box=Box(10.0, 20.0, 30.0, 40.0),
+                corners=((10.0, 20.0), (40.0, 60.0)),
+            ),
+        ),
+    )
+    expected = AnalysisReport(
+        deck=DeckSnapshot(
+            source_path=r"C:\presentations\expanded.pptx",
+            source_sha256="expanded-sha",
+            slide_count=1,
+            width_pt=960.0,
+            height_pt=540.0,
+            shapes=(
+                Shape(
+                    slide_number=1,
+                    shape_id=7,
+                    name="Title",
+                    box=Box(1.0, 2.0, 3.0, 4.0),
+                    text="제목",
+                    runs=(
+                        TextRun(
+                            text="제목",
+                            font_size_pt=20.0,
+                            color=(1, 2, 3),
+                            bold=True,
+                            source_color=(4, 5, 6),
+                            transparency=0.25,
+                            fill_kind="solid",
+                            fill_visible=True,
+                        ),
+                    ),
+                    background=(250, 250, 250),
+                    rendered_box=Box(2.0, 3.0, 4.0, 5.0),
+                    supported=True,
+                    notes=("measured",),
+                    locator=ObjectLocator((7, 8), "table_cell", (1, 2)),
+                    visible=True,
+                    effective_visible=True,
+                    shape_type=19,
+                    placeholder_type=1,
+                    z_order=3,
+                    content_box=Box(3.0, 4.0, 5.0, 6.0),
+                    fill_color=(10, 20, 30),
+                    fill_transparency=0.1,
+                    properties=(("rotation", 0.0),),
+                    measurements=(Measurement("text_box", "measured", "PowerPoint"),),
+                    spans=(TextSpan("line", 1, "제목", Box(4.0, 5.0, 6.0, 7.0)),),
+                    evidence=(evidence,),
+                    visible_object_box=Box(5.0, 6.0, 7.0, 8.0),
+                    visible_text_box=Box(6.0, 7.0, 8.0, 9.0),
+                    background_samples=((0.5, 0.5, 240, 241, 242),),
+                ),
+            ),
+            limitations=("rendering unavailable",),
+            slides=(
+                SlideDetails(
+                    number=1,
+                    hidden=False,
+                    title="제목",
+                    properties=(("layout", "Title Slide"),),
+                    objects=(evidence,),
+                ),
+            ),
+        ),
+        findings=[],
+        executed_rules=("contrast", "typography", "layout"),
+        status="analyzed",
+    )
+
+    SqliteReportRepository(database_path).save(expected)
+    restored = SqliteReportRepository(database_path).list_recent()[0].report
+
+    assert restored == expected
+    assert restored.schema_version == "0.3"
+
+
+def test_legacy_model_0_1_history_remains_readable(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    repository = SqliteReportRepository(database_path)
+    repository.save(make_report("not_configured"))
+    legacy_payload = {
+        "deck": {
+            "source_path": r"C:\presentations\legacy.pptx",
+            "source_sha256": "legacy-sha",
+            "slide_count": 1,
+            "width_pt": 960.0,
+            "height_pt": 540.0,
+            "shapes": [
+                {
+                    "slide_number": 1,
+                    "shape_id": 2,
+                    "name": "Legacy",
+                    "box": {"x": 1.0, "y": 2.0, "width": 3.0, "height": 4.0},
+                    "runs": [{"text": "old", "color": [1, 2, 3]}],
+                }
+            ],
+        },
+        "findings": [],
+        "proposals": [],
+        "executed_rules": [],
+        "status": "not_configured",
+        "schema_version": "0.1",
+    }
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE analysis_reports SET report_json = ? WHERE id = 1",
+            (json.dumps(legacy_payload),),
+        )
+
+    restored = SqliteReportRepository(database_path).list_recent()[0].report
+
+    assert restored.schema_version == "0.1"
+    assert restored.deck.source_sha256 == "legacy-sha"
+    assert restored.deck.slides == ()
+    assert restored.deck.shapes[0].locator is None
+    assert restored.deck.shapes[0].runs[0].source_color is None
 
 
 def test_not_configured_and_analyzed_statuses_remain_distinct(tmp_path):
