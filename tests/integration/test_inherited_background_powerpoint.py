@@ -37,3 +37,40 @@ def test_unfilled_text_on_default_theme_slide_gets_white_background(request, tmp
     assert shape.background == (255, 255, 255), shape.notes
     findings = ContrastRule().evaluate(deck, AnalysisPolicy())
     assert [item.severity for item in findings if item.shape_key == shape.key] == ["warning"]
+
+
+def test_text_over_picture_is_judged_from_rendered_pixels(request, tmp_path):
+    if sys.platform != "win32":
+        pytest.skip("Desktop PowerPoint COM integration requires Windows")
+    if not request.config.getoption("--run-powerpoint"):
+        pytest.skip("Desktop PowerPoint integration is opt-in: pass --run-powerpoint")
+    pytest.importorskip("pythoncom", reason="pywin32 is not installed")
+    pytest.importorskip("win32com.client", reason="pywin32 is not installed")
+    from PIL import Image
+
+    # 왼쪽은 흰색, 오른쪽은 검정인 그림 위에 흰 글씨 → 배경색을 하나로 정할 수 없음
+    picture = tmp_path / "half.png"
+    image = Image.new("RGB", (400, 100), (255, 255, 255))
+    for x in range(200, 400):
+        for y in range(100):
+            image.putpixel((x, y), (0, 0, 0))
+    image.save(picture)
+    path = tmp_path / "사진 위 글씨.pptx"
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    slide.shapes.add_picture(str(picture), Inches(1), Inches(1), Inches(6), Inches(1.5))
+    box = slide.shapes.add_textbox(Inches(1.5), Inches(1.3), Inches(5), Inches(0.8))
+    run = box.text_frame.paragraphs[0].add_run()
+    run.text = "White text over picture"
+    run.font.size = Pt(24)
+    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+    presentation.save(path)
+
+    deck = build_powerpoint_reader(render=True).read(path)
+    shape = next(item for item in deck.shapes if item.text.strip() == "White text over picture")
+    findings = [
+        item for item in ContrastRule().evaluate(deck, AnalysisPolicy()) if item.shape_key == shape.key
+    ]
+
+    assert shape.background is None and len(shape.background_samples) >= 4
+    assert [item.severity for item in findings] == ["review"]  # 흰 배경 부분에서 명암비 부족
