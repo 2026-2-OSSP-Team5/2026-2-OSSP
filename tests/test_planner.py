@@ -62,7 +62,7 @@ def test_harmony_score_separates_clashing_pair():
 
 
 def test_gray_body_text_is_fixed_even_at_passive():
-    result = plan(deck(text_shape("999999")), [contrast("999999")], strength="passive", purpose="online")
+    result = plan(deck(text_shape("999999")), [contrast("999999")], strength="passive", purpose="report")
     p = result.proposals[0]
     assert p.category == Category.READABILITY
     assert contrast_ratio(p.after, "FFFFFF") >= 4.5
@@ -76,7 +76,7 @@ def test_brand_color_text_left_at_passive_fixed_from_balanced():
 
     balanced = plan(deck(text_shape("2E86DE")), [finding], strength="balanced")
     assert balanced.proposals[0].category == Category.DESIGN
-    assert contrast_ratio(balanced.proposals[0].after, "FFFFFF") >= 6.0
+    assert contrast_ratio(balanced.proposals[0].after, "FFFFFF") >= 4.5  # B 기준 (일반 글자)
 
 
 def test_position_changes_need_balanced_level():
@@ -93,7 +93,7 @@ def test_position_changes_need_balanced_level():
 
 
 def test_format_changes_need_aggressive_level():
-    finding = FakeFinding("line_spacing", 1, 5, "warning", {"line_spacing": 0.8})
+    finding = FakeFinding("line_spacing", 1, 5, "warning", {"line_spacing": 0.8, "required_spacing": 1.0})
     balanced = plan(deck(text_shape()), [finding], strength="balanced")
     assert "서식" in balanced.skipped[0].reason
     p = plan(deck(text_shape()), [finding], strength="aggressive").proposals[0]
@@ -109,7 +109,7 @@ def test_photo_text_gets_scrim_only_at_aggressive():
     p = plan(deck(shape), [finding], strength="aggressive").proposals[0]
     assert p.prop == Property.SHAPE_FILL
     alpha = 1 - p.after["transparency"]
-    assert worst_contrast_over_unknown("FFFFFF", p.after["color"], alpha) >= 3.9
+    assert worst_contrast_over_unknown("FFFFFF", p.after["color"], alpha) >= 3.0  # B 기준 (큰 글자)
 
 
 def test_small_design_budget_does_not_lower_the_standard():
@@ -129,9 +129,9 @@ def test_unmeasurable_without_photo_info_is_not_guessed():
 
 
 def test_user_lock_font_size_blocks_size_and_autofit():
-    size = FakeFinding("font_size", 1, 5, "warning", {"size_pt": 18.0})
+    size = FakeFinding("font_size", 1, 5, "warning", {"size_pt": 10.0})
     autofit = FakeFinding(
-        "autofit_shrink", 1, 5, "warning", {"specified_size_pt": 24.0, "effective_size_pt": 14.0}
+        "autofit_shrink", 1, 5, "warning", {"specified_size_pt": 24.0, "effective_size_pt": 12.0}
     )
     result = plan(deck(text_shape()), [size, autofit], strength="aggressive", user_locks=("font_size",))
     assert result.proposals == []
@@ -151,25 +151,36 @@ def test_excluded_rule_is_skipped():
     assert "제외" in result.skipped[0].reason
 
 
-# ---------------------------------------------------------------- 용도별 기준값
+# ---------------------------------------------------------------- 기준값 (모두 B에서)
 
 
-def test_font_size_target_follows_purpose():
-    finding = FakeFinding("font_size", 1, 5, "warning", {"size_pt": 18.0})
-    assert plan(deck(text_shape()), [finding], purpose="presentation").proposals[0].after == 22.0
-    assert plan(deck(text_shape()), [finding], purpose="lecture").proposals[0].after == 27.0
+def test_font_size_target_comes_from_b_policy_by_purpose():
+    from slideguard.domain.policy import Purpose, font_size_threshold
+
+    finding = FakeFinding("font_size", 1, 5, "warning", {"size_pt": 9.0})
+    for purpose in Purpose:
+        result = plan(deck(text_shape()), [finding], purpose=purpose.value)
+        assert result.proposals[0].after == font_size_threshold(purpose).minimum_pt
 
 
-def test_user_override_changes_target_and_result_carries_standards():
-    finding = FakeFinding("font_size", 1, 5, "warning", {"size_pt": 18.0})
-    result = plan(deck(text_shape()), [finding], standard_overrides={"min_font_pt": 30})
-    assert result.proposals[0].after == 30
-    assert result.standards.min_font_pt.kind == "사용자 지정"
+def test_finding_expected_value_takes_priority_and_result_carries_b_standards():
+    finding = FakeFinding("font_size", 1, 5, "warning", {"size_pt": 9.0, "required_pt": 16.0})
+    result = plan(deck(text_shape()), [finding])
+    assert result.proposals[0].after == 16.0
+    assert result.standards.min_font_pt.basis.startswith("B 기준")
+
+
+def test_rules_without_b_criterion_get_no_proposal():
+    spacing = FakeFinding("line_spacing", 1, 5, "warning", {"line_spacing": 0.8})
+    hierarchy = FakeFinding("hierarchy", 1, 5, "warning", {"title_size_pt": 20.0, "body_size_pt": 20.0})
+    result = plan(deck(text_shape()), [spacing, hierarchy], strength="aggressive")
+    assert result.proposals == []
+    assert all("B에" in item.reason for item in result.skipped)
 
 
 def test_text_already_meeting_standard_is_never_shrunk():
     finding = FakeFinding("font_size", 1, 5, "warning", {"size_pt": 18.0})
-    result = plan(deck(text_shape()), [finding], purpose="document")
+    result = plan(deck(text_shape()), [finding], purpose="report")
     assert result.proposals == []
     assert "줄이는 후보는 만들지 않음" in result.skipped[0].reason
 
@@ -291,7 +302,9 @@ def test_density_is_reported_not_auto_fixed():
 
 
 def test_hierarchy_title_enlarged_only_at_aggressive():
-    finding = FakeFinding("hierarchy", 1, 5, "warning", {"title_size_pt": 24.0, "body_size_pt": 24.0})
+    finding = FakeFinding(
+        "hierarchy", 1, 5, "warning", {"title_size_pt": 24.0, "body_size_pt": 24.0, "required_ratio": 1.25}
+    )
     assert plan(deck(text_shape()), [finding], strength="balanced").proposals == []
     p = plan(deck(text_shape()), [finding], strength="aggressive").proposals[0]
     assert (p.prop, p.after) == (Property.FONT_SIZE, 30.0)
@@ -302,7 +315,7 @@ def test_hierarchy_title_enlarged_only_at_aggressive():
 
 def test_autofit_shrink_below_minimum_is_turned_off():
     finding = FakeFinding(
-        "autofit_shrink", 1, 5, "warning", {"specified_size_pt": 24.0, "effective_size_pt": 14.0}
+        "autofit_shrink", 1, 5, "warning", {"specified_size_pt": 24.0, "effective_size_pt": 12.0}
     )
     p = plan(deck(text_shape()), [finding], strength="aggressive").proposals[0]
     assert (p.prop, p.before, p.after) == (Property.AUTOFIT, "shrink", "none")
@@ -320,4 +333,4 @@ def test_aggressive_still_keeps_color_close_to_original():
     for strength in ("balanced", "aggressive"):
         p = plan(deck(text_shape("999999")), [contrast("999999")], strength=strength).proposals[0]
         assert p.after not in ("000000", "333333")
-        assert contrast_ratio(p.after, "FFFFFF") >= 6.0
+        assert contrast_ratio(p.after, "FFFFFF") >= 4.5  # B 기준 (일반 글자)

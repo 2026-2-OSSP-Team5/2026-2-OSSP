@@ -171,7 +171,11 @@ def test_strength_names(strength, level):
 
 @pytest.mark.parametrize(
     ("purpose", "name"),
-    [(Purpose.PRESENTATION, "presentation"), (Purpose.LECTURE, "lecture"), (Purpose.REPORT, "document")],
+    [
+        (Purpose.PRESENTATION, Purpose.PRESENTATION),
+        (Purpose.LECTURE, Purpose.LECTURE),
+        (Purpose.REPORT, Purpose.REPORT),
+    ],
 )
 def test_purpose_names(purpose, name):
     assert TeamBindings().purpose(AnalysisPolicy(purpose=purpose)) == name
