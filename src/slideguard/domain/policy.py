@@ -16,6 +16,62 @@ class Strength(StrEnum):
 
 PROPERTIES = frozenset({"font_size", "font_color", "font_family", "position", "size"})
 
+# --- 검사 기준값 -------------------------------------------------------------
+# 명암비: WCAG 2.2 AA (1.4.3 Contrast Minimum)
+CONTRAST_NORMAL = 4.5  # 일반 텍스트
+CONTRAST_LARGE = 3.0  # 대형 텍스트
+LARGE_TEXT_PT = 18.0  # 이 크기 이상이면 대형 텍스트
+LARGE_BOLD_TEXT_PT = 14.0  # 굵은 글씨는 이 크기 이상이면 대형 텍스트
+
+# 안전 여백: 슬라이드 각 방향 길이의 비율 (팀 평가 기준표)
+SAFE_MARGIN_RATIO = 0.05
+
+
+@dataclass(frozen=True)
+class FontSizeThreshold:
+    """Purpose-based size recommendation; point values are not WCAG requirements."""
+
+    recommended_pt: float  # 이 값 미만이면 검토(review)
+    minimum_pt: float  # 이 값 미만이면 경고(warning)
+
+
+# 발표용 기준은 가독성 평가 기준표를 따른다(본문 18~24pt 권장, 14pt 미만 경고).
+# TODO: 강의용·보고용은 근거 자료가 없어 임시값으로 둔다. 팀 합의 후 확정한다.
+FONT_SIZE_THRESHOLDS: dict[Purpose, FontSizeThreshold] = {
+    Purpose.PRESENTATION: FontSizeThreshold(recommended_pt=18.0, minimum_pt=14.0),
+    Purpose.LECTURE: FontSizeThreshold(recommended_pt=18.0, minimum_pt=14.0),
+    Purpose.REPORT: FontSizeThreshold(recommended_pt=12.0, minimum_pt=10.0),
+}
+
+
+def font_size_threshold(purpose: Purpose) -> FontSizeThreshold:
+    return FONT_SIZE_THRESHOLDS[purpose]
+
+
+# 도형 좌표를 비교할 때 허용하는 오차(pt). 반올림·렌더링 오차로 인한 오탐을 줄인다.
+GEOMETRY_TOLERANCE_PT = 1.0
+
+
+@dataclass(frozen=True)
+class DensityThreshold:
+    """Heuristic text-density limits per slide; exceeding them requires review."""
+
+    max_chars: int  # 슬라이드 전체 글자 수(공백 제외)
+    max_lines: int  # 슬라이드 전체 줄(문단) 수
+
+
+# 발표용 줄 수는 평가 기준표의 6x6 법칙(한 슬라이드 6줄 이내)을 따른다.
+# TODO: 글자 수와 강의·보고용 줄 수는 근거 자료가 없어 임시값으로 둔다. 팀 합의 후 확정한다.
+DENSITY_THRESHOLDS: dict[Purpose, DensityThreshold] = {
+    Purpose.PRESENTATION: DensityThreshold(max_chars=300, max_lines=6),
+    Purpose.LECTURE: DensityThreshold(max_chars=400, max_lines=15),
+    Purpose.REPORT: DensityThreshold(max_chars=800, max_lines=30),
+}
+
+
+def density_threshold(purpose: Purpose) -> DensityThreshold:
+    return DENSITY_THRESHOLDS[purpose]
+
 
 @dataclass(frozen=True)
 class AnalysisPolicy:
