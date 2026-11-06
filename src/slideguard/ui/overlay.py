@@ -273,12 +273,8 @@ class CopyApplyWorker(QObject):
 
             bindings = TeamBindings()
             applied_ids = tuple(bindings.to_team_proposal(item).id for item in result.applied)
-            rejected = tuple(
-                (bindings.to_team_proposal(item).id, reason) for item, reason in result.rejected
-            )
-            applied = [
-                proposal for proposal in self.report.proposals if proposal.id in set(applied_ids)
-            ]
+            rejected = tuple((bindings.to_team_proposal(item).id, reason) for item, reason in result.rejected)
+            applied = [proposal for proposal in self.report.proposals if proposal.id in set(applied_ids)]
             slide_changes: dict[int, list[ChangeProposal]] = {}
             for proposal in applied:
                 slide = _slide_number(proposal.shape_key)
@@ -301,12 +297,67 @@ class CopyApplyWorker(QObject):
                     applied_ids=applied_ids,
                     rejected=rejected,
                     warnings=tuple(result.warnings),
-                    slide_changes={
-                        slide: tuple(proposals) for slide, proposals in slide_changes.items()
-                    },
+                    slide_changes={slide: tuple(proposals) for slide, proposals in slide_changes.items()},
                     original_previews=original_previews,
                     copy_previews=copy_previews,
                     preview_error=preview_error,
+                )
+            )
+        except Exception as error:
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
+@dataclass(frozen=True)
+class OriginalApplyOutcome:
+    original_path: Path
+    backup_path: Path
+    applied_ids: tuple[str, ...]
+    rejected: tuple[tuple[str, str], ...]
+    warnings: tuple[str, ...]
+    was_open: bool
+
+
+class OriginalApplyWorker(QObject):
+    """선택한 제안을 원본에 적용 (C의 apply_to_original: 백업 → 원본에 적용 후 저장)."""
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        report: AnalysisReport,
+        proposal_ids: tuple[str, ...],
+        backup_dir: Path,
+        policy,
+        *,
+        patcher_builder=build_presentation_patcher,
+    ):
+        super().__init__()
+        self.report = report
+        self.proposal_ids = proposal_ids
+        self.backup_dir = backup_dir
+        self.policy = policy
+        self.patcher_builder = patcher_builder
+
+    @Slot()
+    def run(self):
+        try:
+            patcher = self.patcher_builder()
+            backup = patcher.apply_to_original(
+                self.report, list(self.proposal_ids), self.backup_dir, self.policy
+            )
+            result = patcher.last_result
+            bindings = TeamBindings()
+            self.succeeded.emit(
+                OriginalApplyOutcome(
+                    original_path=Path(self.report.deck.source_path),
+                    backup_path=Path(backup),
+                    applied_ids=tuple(bindings.to_team_proposal(item).id for item in result.applied),
+                    rejected=tuple(
+                        (bindings.to_team_proposal(item).id, reason) for item, reason in result.rejected
+                    ),
+                    warnings=tuple(result.warnings),
+                    was_open=bool(result.was_open),
                 )
             )
         except Exception as error:
@@ -430,15 +481,14 @@ class OverlayWidget(QWidget):
     manual_requested = Signal()
     settings_requested = Signal()
     apply_requested = Signal()
+    apply_original_requested = Signal()
     exit_requested = Signal()
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SlideGuard Overlay")
         self.setWindowFlags(
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setStyleSheet(OVERLAY_STYLE)
         self.collapsed = True
@@ -559,6 +609,10 @@ class OverlayWidget(QWidget):
         self.apply_button.setEnabled(False)
         self.apply_button.clicked.connect(self.apply_requested)
         proposal_layout.addWidget(self.apply_button)
+        self.apply_original_button = QPushButton("원본에 적용 (백업 후 저장) (0)")
+        self.apply_original_button.setEnabled(False)
+        self.apply_original_button.clicked.connect(self.apply_original_requested)
+        proposal_layout.addWidget(self.apply_original_button)
         body.addWidget(proposal, 4)
         layout.addLayout(body, 1)
         return panel
@@ -651,7 +705,11 @@ class OverlayWidget(QWidget):
         self.count_badge.setVisible(self.collapsed and count > 0)
         self.findings_table.setRowCount(count)
         for row, finding in enumerate(report.findings):
-            values = [finding.shape_key.partition(":")[0], _rule_name(finding.rule_id), _severity(finding.severity)]
+            values = [
+                finding.shape_key.partition(":")[0],
+                _rule_name(finding.rule_id),
+                _severity(finding.severity),
+            ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column == 0:
@@ -726,15 +784,13 @@ class OverlayWidget(QWidget):
             self.proposals_list.blockSignals(False)
         self.select_warning_button.setEnabled(
             any(
-                findings.get(item.finding_id) is not None
-                and findings[item.finding_id].severity == "warning"
+                findings.get(item.finding_id) is not None and findings[item.finding_id].severity == "warning"
                 for item in report.proposals
             )
         )
         self.select_review_button.setEnabled(
             any(
-                findings.get(item.finding_id) is not None
-                and findings[item.finding_id].severity == "review"
+                findings.get(item.finding_id) is not None and findings[item.finding_id].severity == "review"
                 for item in report.proposals
             )
         )
@@ -781,10 +837,7 @@ class OverlayWidget(QWidget):
                 if (
                     findings.get(proposal.finding_id) is not None
                     and findings[proposal.finding_id].severity == severity
-                ) or (
-                    _proposal_group(proposal) is not None
-                    and _proposal_group(proposal) in selected_groups
-                ):
+                ) or (_proposal_group(proposal) is not None and _proposal_group(proposal) in selected_groups):
                     self.proposal_items[proposal.id].setCheckState(Qt.CheckState.Checked)
         finally:
             self._syncing_proposals = False
@@ -810,8 +863,9 @@ class OverlayWidget(QWidget):
         self._apply_busy = busy
         self.manual_button.setEnabled(not busy and not self._analysis_busy)
         if busy:
-            self.apply_button.setText("사본 적용 중…")
+            self.apply_button.setText("적용 중…")
             self.apply_button.setEnabled(False)
+            self.apply_original_button.setEnabled(False)
         else:
             self._update_apply_button()
 
@@ -823,12 +877,10 @@ class OverlayWidget(QWidget):
     def _update_apply_button(self):
         count = len(self.selected_proposal_ids())
         self.apply_button.setText(f"선택한 제안을 사본에 적용 ({count})")
-        self.apply_button.setEnabled(
-            count > 0
-            and not self._analysis_busy
-            and not self._apply_busy
-            and not self._report_stale
-        )
+        enabled = count > 0 and not self._analysis_busy and not self._apply_busy and not self._report_stale
+        self.apply_button.setEnabled(enabled)
+        self.apply_original_button.setText(f"원본에 적용 (백업 후 저장) ({count})")
+        self.apply_original_button.setEnabled(enabled)
 
 
 class SettingsDialog(QDialog):
@@ -958,12 +1010,13 @@ class OverlayController(QObject):
         self.active_path: Path | None = None
         self._last_powerpoint_title = ""
         self._apply_thread: QThread | None = None
-        self._apply_worker: CopyApplyWorker | None = None
+        self._apply_worker: CopyApplyWorker | OriginalApplyWorker | None = None
         self._result_dialog: ApplyResultDialog | None = None
 
         self.overlay.manual_requested.connect(self.request_manual)
         self.overlay.settings_requested.connect(self.show_settings)
         self.overlay.apply_requested.connect(self.apply_selected)
+        self.overlay.apply_original_requested.connect(self.apply_selected_to_original)
         self.overlay.exit_requested.connect(self.request_exit)
         self.settings_dialog.settings_saved.connect(self.restart_collection)
         self.detected.connect(self._on_detected)
@@ -1083,52 +1136,10 @@ class OverlayController(QObject):
         self.overlay.show_report(report, skip_reasons)
 
     def apply_selected(self):
-        report = self.overlay._report
-        proposal_ids = self.overlay.selected_proposal_ids()
-        if report is None or not proposal_ids:
+        report = self._ready_to_apply("사본 적용 불가")
+        if report is None:
             return
-        selected = [item for item in report.proposals if item.id in set(proposal_ids)]
-        conflicts = _selection_conflicts(report, selected)
-        if conflicts:
-            QMessageBox.warning(
-                self.overlay,
-                "수정 제안 충돌",
-                "함께 적용할 수 없는 제안이 있습니다. 선택을 정리해 주세요.\n\n"
-                + "\n".join(conflicts),
-            )
-            return
-
-        state = self.state_provider()
         source = Path(report.deck.source_path)
-        if state.path is None or not _same_path(state.path, source):
-            QMessageBox.warning(
-                self.overlay,
-                "사본 적용 불가",
-                "현재 편집 중인 문서가 검사한 문서와 다릅니다. 해당 문서를 열고 다시 시도해 주세요.",
-            )
-            return
-        if not state.saved:
-            QMessageBox.warning(
-                self.overlay,
-                "저장 후 재검사 필요",
-                "PowerPoint에 저장하지 않은 편집 내용이 있습니다. 저장 후 다시 검사해 주세요.",
-            )
-            return
-        try:
-            if _sha256(source) != report.deck.source_sha256:
-                raise ValueError
-        except (OSError, ValueError):
-            message = "원본 파일이 검사 후 변경되었습니다. 저장 후 다시 검사해 주세요."
-            self.overlay.mark_report_stale(
-                "저장된 파일과 검사 결과가 다릅니다. 자동 검사를 기다리거나 검사 실행을 눌러 주세요."
-            )
-            QMessageBox.warning(
-                self.overlay,
-                "저장 후 재검사 필요",
-                message,
-            )
-            return
-
         default = source.with_name(f"{source.stem}_SlideGuard{source.suffix}")
         chosen, _filter = QFileDialog.getSaveFileName(
             self.overlay,
@@ -1142,6 +1153,120 @@ class OverlayController(QObject):
         if output.suffix.lower() != ".pptx":
             output = output.with_suffix(".pptx")
         self.apply_to_output(output)
+
+    def apply_selected_to_original(self):
+        """선택한 제안을 원본에 적용 (백업을 먼저 만들고 원본에 저장)."""
+        from slideguard.adapters.powerpoint.patcher import default_backup_dir
+
+        report = self._ready_to_apply("원본 적용 불가")
+        if report is None:
+            return
+        backup_dir = default_backup_dir()
+        count = len(self.overlay.selected_proposal_ids())
+        answer = QMessageBox.question(
+            self.overlay,
+            "원본에 적용",
+            f"선택한 제안 {count}건을 원본에 적용하고 저장합니다.\n"
+            f"적용 전 원본은 아래 폴더에 백업합니다.\n\n{backup_dir}\n\n계속할까요?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.overlay.set_apply_busy(True)
+        self._apply_thread = QThread(self)
+        self._apply_worker = OriginalApplyWorker(
+            report,
+            self.overlay.selected_proposal_ids(),
+            backup_dir,
+            build_analysis_policy(),
+            patcher_builder=self.patcher_builder,
+        )
+        self._apply_worker.moveToThread(self._apply_thread)
+        self._apply_thread.started.connect(self._apply_worker.run)
+        self._apply_worker.succeeded.connect(self._on_original_apply_succeeded)
+        self._apply_worker.failed.connect(self._on_apply_failed)
+        self._apply_worker.succeeded.connect(self._apply_thread.quit)
+        self._apply_worker.failed.connect(self._apply_thread.quit)
+        self._apply_thread.finished.connect(self._apply_worker.deleteLater)
+        self._apply_thread.finished.connect(self._apply_finished)
+        self._apply_thread.start()
+
+    def _on_original_apply_succeeded(self, outcome: OriginalApplyOutcome):
+        self.overlay.set_apply_busy(False)
+        self.overlay.mark_report_stale(
+            "원본에 수정이 저장되었습니다. 자동 검사를 기다리거나 검사 실행을 눌러 주세요."
+        )
+        self.overlay.status_label.setText(
+            f"원본 적용 완료 · 성공 {len(outcome.applied_ids)}건 · 실패 {len(outcome.rejected)}건"
+        )
+        lines = [f"원본: {outcome.original_path}", f"백업: {outcome.backup_path}"]
+        if outcome.was_open:
+            lines.append("PowerPoint에 열려 있던 문서에 적용하고 저장했습니다.")
+        if outcome.rejected:
+            lines.append("적용하지 못한 제안:")
+            lines.extend(f"- {reason}" for _proposal_id, reason in outcome.rejected)
+        if outcome.warnings:
+            lines.append("경고:")
+            lines.extend(f"- {warning}" for warning in outcome.warnings)
+        lines.append("되돌리려면 파일을 닫은 뒤 백업 파일로 바꾸면 됩니다.")
+        box = QMessageBox(
+            QMessageBox.Icon.Information, "원본 적용 결과", "\n".join(lines), parent=self.overlay
+        )
+        open_folder = box.addButton("백업 폴더 열기", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is open_folder:
+            try:
+                os.startfile(outcome.backup_path.parent)  # type: ignore[attr-defined]  # Windows 전용
+            except (AttributeError, OSError) as error:
+                QMessageBox.warning(self.overlay, "폴더 열기 실패", str(error))
+
+    def _ready_to_apply(self, blocked_title: str) -> AnalysisReport | None:
+        """사본·원본 적용 공통 확인: 선택 충돌, 편집 중인 문서, 저장 여부, 파일 변경."""
+        report = self.overlay._report
+        proposal_ids = self.overlay.selected_proposal_ids()
+        if report is None or not proposal_ids:
+            return None
+        selected = [item for item in report.proposals if item.id in set(proposal_ids)]
+        conflicts = _selection_conflicts(report, selected)
+        if conflicts:
+            QMessageBox.warning(
+                self.overlay,
+                "수정 제안 충돌",
+                "함께 적용할 수 없는 제안이 있습니다. 선택을 정리해 주세요.\n\n" + "\n".join(conflicts),
+            )
+            return None
+
+        state = self.state_provider()
+        source = Path(report.deck.source_path)
+        if state.path is None or not _same_path(state.path, source):
+            QMessageBox.warning(
+                self.overlay,
+                blocked_title,
+                "현재 편집 중인 문서가 검사한 문서와 다릅니다. 해당 문서를 열고 다시 시도해 주세요.",
+            )
+            return None
+        if not state.saved:
+            QMessageBox.warning(
+                self.overlay,
+                "저장 후 재검사 필요",
+                "PowerPoint에 저장하지 않은 편집 내용이 있습니다. 저장 후 다시 검사해 주세요.",
+            )
+            return None
+        try:
+            if _sha256(source) != report.deck.source_sha256:
+                raise ValueError
+        except (OSError, ValueError):
+            message = "원본 파일이 검사 후 변경되었습니다. 저장 후 다시 검사해 주세요."
+            self.overlay.mark_report_stale(
+                "저장된 파일과 검사 결과가 다릅니다. 자동 검사를 기다리거나 검사 실행을 눌러 주세요."
+            )
+            QMessageBox.warning(
+                self.overlay,
+                "저장 후 재검사 필요",
+                message,
+            )
+            return None
+        return report
 
     def apply_to_output(self, output: Path):
         report = self.overlay._report
@@ -1193,7 +1318,7 @@ class OverlayController(QObject):
 
     def _on_apply_failed(self, message: str):
         self.overlay.set_apply_busy(False)
-        QMessageBox.warning(self.overlay, "사본 적용 실패", message)
+        QMessageBox.warning(self.overlay, "적용 실패", message)
 
     def _apply_finished(self):
         if self._apply_thread is not None:
@@ -1311,9 +1436,7 @@ def _normalized_value(value):
     return value
 
 
-def _selection_conflicts(
-    report: AnalysisReport, selected: list[ChangeProposal]
-) -> list[str]:
+def _selection_conflicts(report: AnalysisReport, selected: list[ChangeProposal]) -> list[str]:
     messages = []
     selected_ids = {item.id for item in selected}
     groups: dict[str, set[str]] = {}

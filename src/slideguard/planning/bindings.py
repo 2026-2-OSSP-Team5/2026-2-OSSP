@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 from typing import ClassVar
 
+from slideguard.domain.policy import Purpose
 from slideguard.planning.color import contrast_ratio
 from slideguard.planning.contracts import (
     USER_LOCK_GROUPS,
@@ -32,7 +33,9 @@ from slideguard.planning.contracts import (
     ShapeInfo,
     Status,
 )
-from slideguard.planning.standards import DEFAULT_PURPOSE, DEFAULT_SLIDE_HEIGHT_PT
+
+# PowerPoint 기본 슬라이드 크기 (16:9, pt). 스냅샷에 크기가 없을 때만 씀 (가독성 기준값 아님)
+DEFAULT_SLIDE_SIZE_PT = (960.0, 540.0)
 
 # 객체 주소 "슬라이드번호:도형ID" (예: "3:12").
 # 그룹 안 객체·표 칸·차트 글자 등은 "3:12/7:table_cell:2,1"처럼 더 길어서 이 형태가 아닙니다.
@@ -211,15 +214,11 @@ class TeamBindings:
     # 권장 글씨체 (회의록: 기본적으로 고딕 권장). 정책의 recommended_font로 바꿀 수 있음
     RECOMMENDED_FONT = "맑은 고딕"
 
-    # 팀 정책의 발표 목적 이름 → standards.PURPOSES 키
-    # 실제 Purpose: presentation / lecture / report
-    PURPOSE_NAMES: ClassVar[dict[str, str]] = {
-        "presentation": "presentation",
-        "projector": "presentation",
-        "lecture": "lecture",
-        "report": "document",  # 보고용 = 개인 화면·인쇄로 읽는 배포 자료
-        "online": "online",
-        "document": "document",
+    # 팀 정책의 발표 목적 이름 → B의 Purpose (기준값은 B가 용도별로 정함)
+    PURPOSE_NAMES: ClassVar[dict[str, Purpose]] = {
+        "presentation": Purpose.PRESENTATION,
+        "lecture": Purpose.LECTURE,
+        "report": Purpose.REPORT,
     }
 
     # ------------------------------------------------------------------
@@ -306,10 +305,14 @@ class TeamBindings:
             if other is not None:
                 values["other_shape_id"] = other
         elif rule == Rule.DENSITY:
-            # B: id 끝이 ":lines"면 줄 수, ":chars"면 글자 수
+            # B: id 끝이 ":lines"면 줄 수, ":chars"면 글자 수. expected = B의 기준값
             finding_id = str(getattr(finding, "id", ""))
             if finding_id.endswith(":lines") and measured is not None:
                 values["line_count"] = int(measured)
+            elif finding_id.endswith(":chars") and measured is not None:
+                values["char_count"] = int(measured)
+            if expected is not None:
+                values["required_count"] = expected
 
         return FindingInfo(
             rule=rule,
@@ -329,7 +332,9 @@ class TeamBindings:
     def _contrast_colors(self, shape: object, ratio: float | None) -> dict:
         """B가 판정한 명암비와 같은 값이 나오는 글자색을 찾음. 못 찾으면 비워 둠 (추측 금지)."""
         background = _normalize_color(getattr(shape, "background", None))
-        if background is None or ratio is None:
+        if background is None:
+            return self._unknown_background_colors(shape, ratio)
+        if ratio is None:
             return {}
         for run in getattr(shape, "runs", ()) or ():
             if not str(getattr(run, "text", "")).strip():
@@ -340,6 +345,37 @@ class TeamBindings:
             if abs(contrast_ratio(color, background) - ratio) <= _RATIO_TOLERANCE:
                 return {"foreground": color, "background": background, "background_kind": "solid"}
         return {}
+
+    def _unknown_background_colors(self, shape: object, ratio: float | None) -> dict:
+        """배경이 한 가지 색이 아닌 글씨(사진·그라데이션·반투명 등).
+
+        배경색은 비워 두고 background_kind="image"로 표시합니다 → planner가 '어떤 배경에서도
+        기준을 넘는 배경판'만 제안합니다. 렌더링 픽셀 근거(B의 근사 판정)가 있으면 그 판정에
+        쓰인 글자색을, 없으면 색이 정해진 첫 글자색을 씁니다. 글자색을 모르면 비워 둠.
+        """
+        runs = [
+            color
+            for run in getattr(shape, "runs", ()) or ()
+            if str(getattr(run, "text", "")).strip()
+            for color in [_normalize_color(getattr(run, "color", None))]
+            if color is not None
+        ]
+        if not runs:
+            return {}
+        foreground = runs[0]
+        samples = [
+            _normalize_color(sample[2:5])
+            for sample in getattr(shape, "background_samples", ()) or ()
+            if len(sample) == 5
+        ]
+        samples = [color for color in samples if color is not None]
+        if samples and ratio is not None:
+            for color in runs:
+                worst = min(contrast_ratio(color, sample) for sample in samples)
+                if abs(worst - ratio) <= _RATIO_TOLERANCE:
+                    foreground = color
+                    break
+        return {"foreground": foreground, "background_kind": "image"}
 
     # ------------------------------------------------------------------
     # 스냅샷(A) 읽기
@@ -352,7 +388,7 @@ class TeamBindings:
             width = getattr(snapshot, "slide_width", None)  # 테스트 대역
             height = getattr(snapshot, "slide_height", None)
         if width is None or height is None:
-            return (960.0, DEFAULT_SLIDE_HEIGHT_PT)  # PowerPoint 16:9 기본 크기
+            return DEFAULT_SLIDE_SIZE_PT
         return (float(width), float(height))
 
     def shapes_on_slide(self, snapshot: object, slide_index: int) -> list[ShapeInfo]:
@@ -504,19 +540,17 @@ class TeamBindings:
             raise ValueError(f"알 수 없는 수정 강도: {name!r}. TeamBindings.STRENGTH_NAMES에 추가하세요.")
         return self.STRENGTH_NAMES[name]
 
-    def purpose(self, policy: object) -> str:
-        """정책에 용도가 없으면 기본값(발표). 이름을 모르면 추측하지 않고 오류."""
+    def purpose(self, policy: object) -> Purpose:
+        """정책에 용도가 없으면 B의 기본값(발표). 이름을 모르면 추측하지 않고 오류."""
         raw = getattr(policy, "purpose", None)
         if raw is None:
-            return DEFAULT_PURPOSE
+            return Purpose.PRESENTATION
         name = _enum_text(raw)
         if name not in self.PURPOSE_NAMES:
-            raise ValueError(f"알 수 없는 발표 목적: {name!r}. TeamBindings.PURPOSE_NAMES에 추가하세요.")
+            raise ValueError(
+                f"알 수 없는 발표 목적: {name!r}. B의 Purpose(presentation/lecture/report)만 씁니다."
+            )
         return self.PURPOSE_NAMES[name]
-
-    def standard_overrides(self, policy: object) -> dict:
-        """사용자가 바꾼 기준값·시청 조건 (standards.build_standards의 overrides)"""
-        return dict(getattr(policy, "standard_overrides", None) or {})
 
     # ------------------------------------------------------------------
     # 수정 후보 ↔ 팀 모델 (domain.models.ChangeProposal)

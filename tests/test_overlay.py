@@ -126,9 +126,7 @@ def test_collapsed_overlay_keeps_state_and_shows_result_count(application, tmp_p
     path.write_bytes(b"deck")
     widget = overlay.OverlayWidget()
     try:
-        widget.set_target(
-            overlay.PowerPointWindow(1, QRect(0, 0, 1200, 800), "deck.pptx - PowerPoint")
-        )
+        widget.set_target(overlay.PowerPointWindow(1, QRect(0, 0, 1200, 800), "deck.pptx - PowerPoint"))
         widget.show_report(_report(path, overlay._sha256(path)))
         application.processEvents()
 
@@ -235,8 +233,7 @@ def test_proposal_selection_by_severity_and_bundle(application, tmp_path):
         first_item = widget.proposals_list.item(0)
         assert widget.proposals_list.itemWidget(first_item) is None
         assert (
-            widget.proposals_list.verticalScrollMode()
-            == overlay.QAbstractItemView.ScrollMode.ScrollPerPixel
+            widget.proposals_list.verticalScrollMode() == overlay.QAbstractItemView.ScrollMode.ScrollPerPixel
         )
         widget.clear_proposals()
         assert widget.apply_button.isEnabled() is False
@@ -373,9 +370,7 @@ def test_manual_and_saved_analysis_share_collection_and_stale_result_is_rejected
 
     current = {"path": active}
     monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: settings)
-    tracker = _Tracker(
-        overlay.PowerPointWindow(1, QRect(0, 0, 1200, 800), "active.pptx - PowerPoint")
-    )
+    tracker = _Tracker(overlay.PowerPointWindow(1, QRect(0, 0, 1200, 800), "active.pptx - PowerPoint"))
     controller = overlay.OverlayController(
         tracker=tracker,
         path_provider=lambda: current["path"],
@@ -552,9 +547,7 @@ def test_unsaved_active_presentation_blocks_copy_apply(application, tmp_path, mo
     )
     try:
         controller.overlay.show_report(report)
-        controller.overlay.proposal_items[report.proposals[0].id].setCheckState(
-            Qt.CheckState.Checked
-        )
+        controller.overlay.proposal_items[report.proposals[0].id].setCheckState(Qt.CheckState.Checked)
 
         controller.apply_selected()
 
@@ -567,9 +560,7 @@ def test_unsaved_active_presentation_blocks_copy_apply(application, tmp_path, mo
         controller.overlay.close()
 
 
-def test_changed_saved_file_marks_report_stale_and_reenables_manual_check(
-    application, tmp_path, monkeypatch
-):
+def test_changed_saved_file_marks_report_stale_and_reenables_manual_check(application, tmp_path, monkeypatch):
     source = tmp_path / "source.pptx"
     source.write_bytes(b"original bytes")
     report = _proposal_report(source, overlay._sha256(source))
@@ -595,9 +586,7 @@ def test_changed_saved_file_marks_report_stale_and_reenables_manual_check(
     )
     try:
         controller.overlay.show_report(report)
-        controller.overlay.proposal_items[report.proposals[0].id].setCheckState(
-            Qt.CheckState.Checked
-        )
+        controller.overlay.proposal_items[report.proposals[0].id].setCheckState(Qt.CheckState.Checked)
         assert controller.overlay.apply_button.isEnabled() is True
         source.write_bytes(b"saved after analysis")
 

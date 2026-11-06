@@ -353,9 +353,7 @@ def test_file_analysis_details_history_and_back_flow(tmp_path, monkeypatch, appl
         window.close()
 
 
-def test_history_clear_cancel_then_confirm_preserves_workspace(
-    tmp_path, monkeypatch, application
-):
+def test_history_clear_cancel_then_confirm_preserves_workspace(tmp_path, monkeypatch, application):
     workspace = tmp_path / "presentations"
     workspace.mkdir()
     deck = DeckSnapshot(
@@ -409,9 +407,7 @@ def test_history_clear_cancel_then_confirm_preserves_workspace(
         window.close()
 
 
-def test_unknown_empty_not_configured_and_failure_states_are_distinct(
-    tmp_path, monkeypatch, application
-):
+def test_unknown_empty_not_configured_and_failure_states_are_distinct(tmp_path, monkeypatch, application):
     monkeypatch.setattr(desktop, "build_workspace_settings_repository", FakeSettingsRepository)
     monkeypatch.setattr(desktop, "build_report_repository", FakeReportRepository)
     warnings = []
