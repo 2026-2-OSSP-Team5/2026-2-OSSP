@@ -24,7 +24,7 @@ _LIMITATIONS = (
     "Individual chart tick and legend entry glyph bounds are unavailable; complex background samples are approximate",
     "COM measurements are not pixel rendering; unresolved properties remain unknown and are described in shape notes",
     "Rendered bounds require verified horizontal, unrotated, unflipped, 2D visible text",
-    "Background RGB requires confirmed uniform opaque coverage; complex layers and inherited backgrounds are not composed",
+    "Background RGB requires confirmed uniform opaque coverage; inherited slide backgrounds are read only without overlapping layout/master decorations",
 )
 
 

@@ -1,4 +1,11 @@
-"""Use known foreground/background colors; unresolved colors must remain unknown."""
+"""Use known foreground/background colors; unresolved colors must remain unknown.
+
+배경색을 하나로 정할 수 없을 때(사진·그라데이션·반투명 등)는 렌더링에서 모은
+글자 주변 픽셀(background_samples)이 있으면 '가장 불리한 픽셀' 기준으로 근사 판정합니다.
+  - 모든 픽셀에서 기준 통과 → 통과
+  - 하나라도 미달 → 검토 필요(review): 근사값이라 경고로 단정하지 않음
+  - 픽셀 근거도 없으면 → 판정 불가(unknown)
+"""
 
 from slideguard.domain.models import Color, DeckSnapshot, Finding, Severity, Shape, TextRun
 from slideguard.domain.policy import (
@@ -90,10 +97,15 @@ def _evaluate_shape(shape: Shape) -> list[_Result]:
     if not runs:
         return [_unknown("글자 색 정보가 없어 명암비를 판정할 수 없습니다", "텍스트 런(run) 정보 없음")]
     if shape.background is None:
+        samples = _sample_colors(shape)
+        if samples:
+            return _evaluate_with_samples(runs, samples)
+        reason = _background_reason(shape)
         return [
             _unknown(
                 "배경색을 알 수 없어 명암비를 판정할 수 없습니다",
-                "배경이 이미지·그라데이션·투명이거나 색을 확인하지 못함",
+                "배경이 이미지·그라데이션·투명이거나 색을 확인하지 못함"
+                + (f" (추출 근거: {reason})" if reason else ""),
             )
         ]
 
@@ -107,6 +119,68 @@ def _evaluate_shape(shape: Shape) -> list[_Result]:
         result = _judge_run(run, shape.background)
         if result is not None:
             results.append(result)
+    return results
+
+
+def _background_reason(shape: Shape) -> str:
+    """A(스냅샷)가 배경을 정하지 못한 이유 중 가장 마지막 기록."""
+    for note in reversed(shape.notes):
+        if "ackground" in note or "fill" in note.lower():
+            return note
+    return ""
+
+
+# 렌더링 픽셀 근거로 판정하려면 최소 이만큼의 픽셀이 필요 (A의 렌더링 코드와 같은 값)
+MIN_BACKGROUND_SAMPLES = 4
+
+
+def _sample_colors(shape: Shape) -> list[Color]:
+    samples = getattr(shape, "background_samples", ()) or ()
+    colors = []
+    for sample in samples:
+        if len(sample) != 5:
+            continue
+        _x, _y, r, g, b = sample
+        if all(type(value) is int and 0 <= value <= 255 for value in (r, g, b)):
+            colors.append((r, g, b))
+    return colors if len(colors) >= MIN_BACKGROUND_SAMPLES else []
+
+
+def _evaluate_with_samples(runs: list[TextRun], samples: list[Color]) -> list[_Result]:
+    results: list[_Result] = []
+    seen: set[tuple] = set()
+    for run in runs:
+        key = (run.color, run.font_size_pt, run.bold)
+        if key in seen:
+            continue
+        seen.add(key)
+        if run.color is None:
+            results.append(
+                _unknown(
+                    "글자 색을 알 수 없어 명암비를 판정할 수 없습니다",
+                    "글자 색이 지정되지 않음(테마 상속 등)",
+                )
+            )
+            continue
+        worst_color = min(samples, key=lambda color: contrast_ratio(run.color, color))
+        worst = contrast_ratio(run.color, worst_color)
+        large = large_text_state(run.font_size_pt, run.bold)
+        # 글자 유형을 모르면 더 엄격한 일반 기준 (근사 판정이라 보수적으로)
+        expected = CONTRAST_LARGE if large else CONTRAST_NORMAL
+        if worst >= expected:
+            continue
+        kind = "대형" if large else "일반"
+        results.append(
+            (
+                "review",
+                f"배경이 고르지 않아 일부 위치에서 명암비가 부족할 수 있습니다 (최저 {worst:.2f}:1, 근사)",
+                round(worst, 2),
+                expected,
+                f"글자 {hex_color(run.color)} / 렌더링된 주변 픽셀 {len(samples)}개 중 가장 불리한 "
+                f"{hex_color(worst_color)} → {worst:.2f}:1 < {expected}:1 ({kind} 텍스트 기준, "
+                "배경이 사진·그라데이션·반투명이라 근사값)",
+            )
+        )
     return results
 
 

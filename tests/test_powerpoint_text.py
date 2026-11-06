@@ -383,6 +383,8 @@ def test_unverified_slide_background_layers_are_not_assumed_white(mode):
     elif mode == "master":
         slide.DisplayMasterShapes = -1
     elif mode == "layout":
+        # 레이아웃 장식은 배경 그래픽이 표시될 때만 슬라이드에 그려짐
+        slide.DisplayMasterShapes = -1
         slide.CustomLayout.Shapes = Collection([object()])
     elif mode in {"footer", "date", "page"}:
         name = {"footer": "Footer", "date": "DateAndTime", "page": "SlideNumber"}[mode]
