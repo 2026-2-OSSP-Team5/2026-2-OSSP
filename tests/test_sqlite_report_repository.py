@@ -44,7 +44,9 @@ def make_report(status="analyzed"):
                 evidence="12pt < 18pt",
                 box=Box(1.0, 2.0, 3.0, 4.0),
             )
-        ] if status == "analyzed" else [],
+        ]
+        if status == "analyzed"
+        else [],
         executed_rules=("font-size",) if status == "analyzed" else (),
         status=status,
     )

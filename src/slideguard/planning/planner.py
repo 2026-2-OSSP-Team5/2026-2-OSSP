@@ -19,13 +19,15 @@
                        사진 위 글씨·겹침·넘친 글자와 그림의 충돌까지 고침
                        (겹친 글상자 떼어 놓기, 아래 그림 밀어내기 — 의도적 겹침 계약의 예외, 팀 결정)
    모든 수준에서 '기준을 넘는 범위 안에서 원래 모습에 가장 가까운' 후보를 고릅니다 (글자색도 원래 색 쪽으로).
+   기준값은 C가 정하지 않고 모두 B에서 가져옵니다 (Finding.expected → domain/policy.py, standards.py 참고).
    + 사용자 지정: 글자 크기 고정 / 레이아웃 고정 / 검사 제외 (bindings 참고)
    어떤 수준에서도 통과 기준은 낮추지 않습니다. 고치지 않은 문제는 이유와 함께 남습니다.
 
-3) 지켜야 할 계약 (ARCHITECTURE.md)
+3) 지켜야 할 계약
    - 고정 항목은 후보를 만들지 않음
    - 측정 불가를 '정상'으로 가정하지 않음
-     (사진 위 글씨는 배경을 모르는 채로도 '최악의 배경'에서 기준을 넘는 배경판만 제안)
+     (사진·그라데이션 위 글씨는 배경을 모르는 채로도 '최악의 배경'에서 기준을 넘는 배경판만 제안.
+      B가 렌더링 픽셀로 근사 판정해 '검토 필요'로 보낸 경우도 같음)
    - 의도적 겹침은 자동 수정·이동하지 않음
    - 파일·COM·UI에 접근하지 않음 (순수 계산)
 """
@@ -35,6 +37,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from slideguard.domain.policy import GEOMETRY_TOLERANCE_PT
 from slideguard.planning.bindings import TeamBindings
 from slideguard.planning.color import (
     color_distance,
@@ -116,8 +119,8 @@ FONT_FAMILY_COST = 0.3
 # 표준 팔레트 (회의록: 가독성 높은 기본 텍스트 색 = 진회색 계열)
 PALETTE_DARK = "333333"
 PALETTE_LIGHT = "F2F2F2"
-# 좌표 비교 허용 오차 (pt)
-TOLERANCE = 0.5
+# 좌표 비교 허용 오차 (pt) — B 기준 (domain/policy.py)
+TOLERANCE = GEOMETRY_TOLERANCE_PT
 
 REVIEW_REASONS = {
     Rule.TEXT_OVERLAP: "겹침은 의도한 배치일 수 있어 사람이 판단 (최대 수정에서는 자동으로 떼어 놓음)",
@@ -132,7 +135,7 @@ class RuleBasedPlanner:
         allow_large_text_option: bool = True,
     ) -> None:
         self.bindings = bindings or TeamBindings()
-        # standards를 넘기면 그 기준을 쓰고, 없으면 정책의 용도·사용자 설정으로 만듭니다.
+        # standards를 넘기면 그 기준을 쓰고, 없으면 정책의 용도로 B 기준을 가져옵니다.
         self.standards = standards
         self.allow_large_text_option = allow_large_text_option
 
@@ -147,11 +150,7 @@ class RuleBasedPlanner:
         slide_w, slide_h = self.bindings.slide_size(snapshot)
         standards = self.standards
         if standards is None:
-            standards = build_standards(
-                self.bindings.purpose(policy),
-                self.bindings.standard_overrides(policy),
-                slide_h,
-            )
+            standards = build_standards(self.bindings.purpose(policy))
         context = {
             "standards": standards,
             "slide_w": slide_w,
@@ -175,7 +174,7 @@ class RuleBasedPlanner:
             if category == Category.REVIEW_ONLY:
                 skip(self._review_reason(info, standards))
                 continue
-            if info.status == Status.REVIEW:
+            if info.status == Status.REVIEW and not _is_photo_text(info):
                 skip("사람의 검토가 필요한 항목")
                 continue
             if info.status == Status.UNMEASURABLE and not _is_photo_text(info):
@@ -273,10 +272,15 @@ class RuleBasedPlanner:
 
     def _review_reason(self, info: FindingInfo, standards: Standards) -> str:
         if info.rule == Rule.DENSITY:
-            lines = info.values.get("line_count", "?")
-            words = info.values.get("max_words", "?")
-            limit = f"{standards.max_lines.value:g}줄 x 줄당 {standards.max_words_per_line.value:g}단어"
-            return f"정보 과다 ({lines}줄, 줄당 최대 {words}단어 / 기준 {limit}) → 문장 압축·슬라이드 분할은 사람이 판단"
+            if "char_count" in info.values:
+                measured = f"{info.values['char_count']}자"
+                limit = info.values.get("required_count", standards.max_chars.value)
+                limit = f"{limit:g}자"
+            else:
+                measured = f"{info.values.get('line_count', '?')}줄"
+                limit = info.values.get("required_count", standards.max_lines.value)
+                limit = f"{limit:g}줄"
+            return f"정보 과다 ({measured} / {standards.label} 기준 {limit}) → 문장 압축·슬라이드 분할은 사람이 판단"
         return REVIEW_REASONS.get(info.rule, "사람이 판단할 항목")
 
     # ==================================================================
@@ -336,11 +340,13 @@ class RuleBasedPlanner:
         required = info.values.get("required_pt", standards.min_font_pt.value)
         if size is None:
             return [], "글자 크기 측정값이 없음"
+        if required is None:
+            return [], "B의 글자 크기 기준값이 없음"
         if size <= 0:
             return [], "글자 크기 측정값이 0 이하"
         if size >= required:
             return [], f"현재 {size}pt가 이미 기준 {required}pt 이상 (글자를 줄이는 후보는 만들지 않음)"
-        note = f"글자 크기 {size}pt → {required}pt (기준: {standards.label} 최소 {required}pt)"
+        note = f"글자 크기 {size}pt → {required}pt (B 기준: {standards.label} 최소 {required}pt)"
         cost = _ratio_cost(size, required)
         return [self._proposal(info, shape, Property.FONT_SIZE, size, required, cost, category, note)], ""
 
@@ -661,13 +667,15 @@ class RuleBasedPlanner:
     def _line_spacing(self, info, shape, standards, category):
         current = info.values.get("line_spacing")
         required = info.values.get("required_spacing", standards.min_line_spacing.value)
+        if required is None:
+            return [], "B에 줄 간격 기준이 없음 (C는 기준을 따로 정하지 않음)"
         if current is None:
             return [], "줄 간격 측정값이 없음"
         if current <= 0:
             return [], "줄 간격 측정값이 0 이하"
         if current >= required:
             return [], f"줄 간격 {current}배가 이미 기준 {required}배 이상"
-        note = f"줄 간격 {current}배 → {required}배 (윗줄·아랫줄 글자 겹침 방지)"
+        note = f"줄 간격 {current}배 → {required}배 (B 기준)"
         cost = _ratio_cost(current, required)
         return [
             self._proposal(info, shape, Property.LINE_SPACING, current, required, cost, category, note)
@@ -697,7 +705,9 @@ class RuleBasedPlanner:
         body = info.values.get("body_size_pt")
         if title is None or body is None:
             return [], "제목·본문 글자 크기 측정값이 없음"
-        ratio = standards.title_body_ratio.value
+        ratio = info.values.get("required_ratio", standards.title_body_ratio.value)
+        if ratio is None:
+            return [], "B에 제목/본문 크기 비율 기준이 없음 (C는 기준을 따로 정하지 않음)"
         target = math.ceil(body * ratio * 2) / 2  # 0.5pt 단위로 올림
         if title >= target:
             return [], f"제목 {title}pt가 이미 본문의 {ratio}배({target}pt) 이상"

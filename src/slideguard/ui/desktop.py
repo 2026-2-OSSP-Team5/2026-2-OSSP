@@ -168,11 +168,15 @@ class WhiteCheckBox(QCheckBox):
         self.initStyleOption(option)
         painter = QStylePainter(self)
 
-        indicator = self.style().subElementRect(
-            QStyle.SubElement.SE_CheckBoxIndicator,
-            option,
-            self,
-        ).adjusted(1, 1, -1, -1)
+        indicator = (
+            self.style()
+            .subElementRect(
+                QStyle.SubElement.SE_CheckBoxIndicator,
+                option,
+                self,
+            )
+            .adjusted(1, 1, -1, -1)
+        )
         checked = self.isChecked()
         border = QColor("#2468d8" if checked else "#aab3c0")
         fill = QColor("#2468d8" if checked else "#ffffff")
@@ -313,9 +317,7 @@ class MainWindow(QMainWindow):
         folder_actions.addWidget(self.file_count_label)
         self.file_refresh_button = QPushButton(objectName="refreshButton")
         self.file_refresh_button.setFixedWidth(34)
-        self.file_refresh_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
-        )
+        self.file_refresh_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.file_refresh_button.setIconSize(QSize(16, 16))
         self.file_refresh_button.setToolTip("파일 목록 새로고침")
         self.file_refresh_button.setAccessibleName("파일 목록 새로고침")
@@ -417,7 +419,9 @@ class MainWindow(QMainWindow):
         )
         self.progress_page = self._build_progress_page()
         self.results_page = self._build_results_page()
-        self.error_page = self._build_state_page("검사에 실패했습니다", "오류 내용을 확인한 뒤 다시 시도하세요.")
+        self.error_page = self._build_state_page(
+            "검사에 실패했습니다", "오류 내용을 확인한 뒤 다시 시도하세요."
+        )
         self.history_empty_page = self._build_state_page(
             "검사 이력을 선택하세요",
             "왼쪽 이력 목록에서 항목을 선택하면 검사 당시 저장된 결과와 판정 근거를 표시합니다.",
@@ -500,7 +504,9 @@ class MainWindow(QMainWindow):
 
         detail = QFrame(objectName="detailPanel")
         detail_layout = QVBoxLayout(detail)
-        self.detail_title = QLabel("결과 행을 선택하면 상세 내용을 확인할 수 있습니다.", objectName="sectionTitle")
+        self.detail_title = QLabel(
+            "결과 행을 선택하면 상세 내용을 확인할 수 있습니다.", objectName="sectionTitle"
+        )
         self.detail_title.setWordWrap(True)
         detail_layout.addWidget(self.detail_title)
         self.detail_values = QLabel(objectName="detailCaption")
@@ -735,7 +741,9 @@ class MainWindow(QMainWindow):
         deck = report.deck
         source_name = Path(deck.source_path).name
         self.selected_file_label.setText(source_name)
-        self.file_meta_label.setText(f"{deck.slide_count}개 슬라이드 · 실행 규칙 {len(report.executed_rules)}개")
+        self.file_meta_label.setText(
+            f"{deck.slide_count}개 슬라이드 · 실행 규칙 {len(report.executed_rules)}개"
+        )
 
         if from_history:
             self.history_banner.setText(f"과거 이력 결과 · 검사 시각 {_display_time(created_at)}")
@@ -1009,9 +1017,7 @@ def _acquire_instance_lock(lock_path: Path) -> QLockFile | None:
 
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
-    instance_lock = _acquire_instance_lock(
-        report_database_path().with_name("slideguard-instance.lock")
-    )
+    instance_lock = _acquire_instance_lock(report_database_path().with_name("slideguard-instance.lock"))
     if instance_lock is None:
         return 0
     app._slideguard_instance_lock = instance_lock

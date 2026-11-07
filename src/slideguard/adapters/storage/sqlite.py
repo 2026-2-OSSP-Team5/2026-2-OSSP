@@ -95,9 +95,7 @@ class SqliteWorkspaceSettingsRepository:
         with sqlite3.connect(self.database_path) as connection:
             _create_schema(connection)
             if purpose is None:
-                current = connection.execute(
-                    "SELECT purpose FROM workspace_settings WHERE id = 1"
-                ).fetchone()
+                current = connection.execute("SELECT purpose FROM workspace_settings WHERE id = 1").fetchone()
                 purpose = current[0] if current is not None else "presentation"
             connection.execute(
                 """
@@ -257,13 +255,9 @@ def _report_from_json(payload: str) -> AnalysisReport:
                 fill_color=_color(shape_data.get("fill_color")),
                 fill_transparency=shape_data.get("fill_transparency"),
                 properties=_properties(shape_data.get("properties")),
-                measurements=tuple(
-                    _measurement(item) for item in shape_data.get("measurements", [])
-                ),
+                measurements=tuple(_measurement(item) for item in shape_data.get("measurements", [])),
                 spans=tuple(_text_span(item) for item in shape_data.get("spans", [])),
-                evidence=tuple(
-                    _object_evidence(item) for item in shape_data.get("evidence", [])
-                ),
+                evidence=tuple(_object_evidence(item) for item in shape_data.get("evidence", [])),
                 visible_object_box=_box(shape_data.get("visible_object_box")),
                 visible_text_box=_box(shape_data.get("visible_text_box")),
                 background_samples=tuple(

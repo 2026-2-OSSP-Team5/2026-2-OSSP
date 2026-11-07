@@ -1,10 +1,9 @@
 from slideguard.planning.bindings import TeamBindings
 from slideguard.planning.contracts import Category, ChangeProposal, PlanResult, Property, Rule, SkippedFinding
 from slideguard.planning.planner import STRENGTH_PROFILES, MinimumChangePlanner, RuleBasedPlanner
-from slideguard.planning.standards import PURPOSES, Standards, build_standards, load_overrides
+from slideguard.planning.standards import Standards, build_standards
 
 __all__ = [
-    "PURPOSES",
     "STRENGTH_PROFILES",
     "Category",
     "ChangeProposal",
@@ -17,5 +16,4 @@ __all__ = [
     "Standards",
     "TeamBindings",
     "build_standards",
-    "load_overrides",
 ]

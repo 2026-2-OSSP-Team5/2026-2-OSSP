@@ -51,6 +51,5 @@ class FakePolicy:  # B의 AnalysisPolicy 대역
     purpose: str = "presentation"
     locked_shapes: frozenset = frozenset()
     locked_properties: frozenset = frozenset()
-    standard_overrides: dict = field(default_factory=dict)
     user_locks: tuple = ()  # 사용자 지정 체크박스: "font_size", "layout" …
     excluded_rules: tuple = ()  # 검사 제외: "contrast" …
