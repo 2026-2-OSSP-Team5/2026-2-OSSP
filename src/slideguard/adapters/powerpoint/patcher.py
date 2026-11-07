@@ -59,6 +59,8 @@ from typing import Protocol
 from slideguard.planning.bindings import TeamBindings
 from slideguard.planning.contracts import ChangeProposal, Property
 
+from .properties import indexed_property
+
 TOLERANCE = 0.5  # 좌표 비교 허용 오차 (pt)
 
 # ======================================================================
@@ -622,21 +624,44 @@ class _ComShape:
         self._shape = shape
         self._slide_height = slide_height
 
-    def _items(self, collection) -> list:
+    def _text_ranges(self, property_name: str) -> list:
+        text_range = self._shape.TextFrame2.TextRange
+        text = str(text_range.Text)
+        if not text:
+            return []
+        # TextRange2.Runs/Paragraphs are indexed properties, not collections.
+        # They clamp an out-of-range index to the last item, so stop when the
+        # returned source position repeats or the complete text is covered.
+        maximum = max(1, len(text.encode("utf-16-le")) // 2)
         result = []
-        for i in range(1, collection.Count + 1):  # COM 컬렉션은 1부터
-            result.append(collection.Item(i))
+        covered = ""
+        previous_start = None
+        for index in range(1, maximum + 1):
+            item = indexed_property(text_range, property_name, index, 1)
+            start = int(item.Start)
+            if previous_start is not None and start <= previous_start:
+                break
+            previous_start = start
+            value = str(item.Text)
+            result.append(item)
+            covered += value
+            if covered == text:
+                break
+            if not text.startswith(covered):
+                raise ApplyRejected(f"{property_name} 범위를 원문과 일치하게 확인할 수 없습니다.")
+        if covered != text:
+            raise ApplyRejected(f"{property_name} 범위가 원문 전체를 포함하지 않습니다.")
         return result
 
     def runs(self) -> list[_ComRun]:
         if self._shape.HasTextFrame != MSO_TRUE:
             return []
-        return [_ComRun(r) for r in self._items(self._shape.TextFrame2.TextRange.Runs())]
+        return [_ComRun(item) for item in self._text_ranges("Runs")]
 
     def paragraphs(self) -> list[_ComParagraph]:
         if self._shape.HasTextFrame != MSO_TRUE:
             return []
-        return [_ComParagraph(p) for p in self._items(self._shape.TextFrame2.TextRange.Paragraphs())]
+        return [_ComParagraph(item) for item in self._text_ranges("Paragraphs")]
 
     def text_overflows(self) -> bool | None:
         try:

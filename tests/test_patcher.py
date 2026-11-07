@@ -3,9 +3,11 @@
 """
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
+from slideguard.adapters.powerpoint import patcher
 from slideguard.adapters.powerpoint.patcher import ApplyRejected, PowerPointPatcher, sha256_of
 from slideguard.planning import ChangeProposal, Property
 from tests.fakes import FakePolicy
@@ -134,6 +136,35 @@ def run_apply(original, tmp_path, shape, proposals, policy=None):
     return PowerPointPatcher(opener_for(Doc(shape))).apply(
         str(original), sha256_of(str(original)), proposals, policy or FakePolicy(), str(out)
     )
+
+
+def test_com_text_range_indexed_properties_are_traversed_without_collection_count():
+    first = SimpleNamespace(
+        Start=1,
+        Text="small ",
+        Font=SimpleNamespace(Size=10.0),
+    )
+    second = SimpleNamespace(
+        Start=7,
+        Text="text",
+        Font=SimpleNamespace(Size=12.0),
+    )
+
+    class TextRange:
+        Text = "small text"
+
+        def Runs(self, index, length):
+            assert length == 1
+            return (first, second)[min(index, 2) - 1]
+
+    shape = SimpleNamespace(
+        HasTextFrame=-1,
+        TextFrame2=SimpleNamespace(TextRange=TextRange()),
+    )
+
+    runs = patcher._ComShape(shape, 540).runs()
+
+    assert [item.get_size() for item in runs] == [10.0, 12.0]
 
 
 # ---------------------------------------------------------------- 공통 안전장치

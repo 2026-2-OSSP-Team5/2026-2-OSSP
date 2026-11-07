@@ -1,24 +1,64 @@
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from slideguard.adapters.ooxml.reader import OoxmlDeckReader
+from slideguard.adapters.storage.sqlite import SqliteReportRepository, SqliteWorkspaceSettingsRepository
 from slideguard.application.analyze import AnalyzePresentation
 from slideguard.application.collect import SnapshotCollector
 from slideguard.application.ports import (
     CollectionFailureCallback,
+    FileRemoved,
     SnapshotCallback,
     SuccessfulAnalysisHashes,
 )
+from slideguard.checks.contrast import ContrastRule
+from slideguard.checks.layout import LayoutRule
+from slideguard.checks.typography import TypographyRule
+from slideguard.domain.policy import AnalysisPolicy, Purpose
+from slideguard.planning import MinimumChangePlanner
 
 if TYPE_CHECKING:
     from slideguard.adapters.watching.monitor import SavedFileMonitor
 
 
 def build_analyzer() -> AnalyzePresentation:
-    """Build the analyzer with the configured reader and rules."""
-    return AnalyzePresentation(reader=OoxmlDeckReader(), rules=())
+    """Build the manual analyzer with the OOXML reader and configured rules."""
+    return AnalyzePresentation(
+        reader=OoxmlDeckReader(),
+        rules=(ContrastRule(), TypographyRule(), LayoutRule()),
+        planner=MinimumChangePlanner(),
+    )
+
+
+def build_presentation_patcher():
+    from slideguard.adapters.powerpoint.patcher import PowerPointPatcher
+
+    return PowerPointPatcher()
+
+
+def report_database_path() -> Path:
+    """Return a stable, per-user writable location for application data."""
+    app_data = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    base = Path(app_data) if app_data else Path.home() / ".local" / "share"
+    return base / "SlideGuard" / "reports.sqlite3"
+
+
+def build_report_repository() -> SqliteReportRepository:
+    return SqliteReportRepository(report_database_path())
+
+
+def build_workspace_settings_repository() -> SqliteWorkspaceSettingsRepository:
+    return SqliteWorkspaceSettingsRepository(report_database_path())
+
+
+def build_analysis_policy() -> AnalysisPolicy:
+    settings = build_workspace_settings_repository().load()
+    purpose = Purpose(settings.purpose) if settings is not None else Purpose.PRESENTATION
+    return AnalysisPolicy(purpose=purpose)
 
 
 def build_powerpoint_reader(*, render: bool = False):
@@ -69,6 +109,7 @@ def build_snapshot_collection(
     recursive: bool = False,
     successful_hashes: SuccessfulAnalysisHashes | None = None,
     on_failure: CollectionFailureCallback | None = None,
+    on_detected: Callable[[Path], None] | None = None,
     settle_seconds: float = 0.8,
     max_attempts: int = 3,
     retry_delay_seconds: float = 0.2,
@@ -87,9 +128,15 @@ def build_snapshot_collection(
         max_attempts=max_attempts,
         retry_delay_seconds=retry_delay_seconds,
     )
+
+    def handle_event(event):
+        if on_detected is not None and not isinstance(event, FileRemoved):
+            on_detected(event.source_path)
+        collector.on_event(event)
+
     monitor = SavedFileMonitor(
         folder,
-        on_event=collector.on_event,
+        on_event=handle_event,
         recursive=recursive,
         settle_seconds=settle_seconds,
     )

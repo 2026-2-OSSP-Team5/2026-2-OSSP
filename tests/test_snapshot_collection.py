@@ -15,6 +15,7 @@ from pptx import Presentation
 from slideguard import bootstrap
 from slideguard.adapters.powerpoint import session
 from slideguard.adapters.powerpoint.reader import PowerPointDeckReader
+from slideguard.adapters.storage.sqlite import SqliteReportRepository
 from slideguard.adapters.watching.catalog import SavedFileCatalog
 from slideguard.application import collect
 from slideguard.application.collect import SnapshotCollector
@@ -689,8 +690,15 @@ def test_bootstrap_start_failure_cleans_up_and_existing_analyzer_stays_ooxml(tmp
 
     monkeypatch.setattr(session, "_load_runtime", forbidden)
     report = bootstrap.build_analyzer().execute(path, AnalysisPolicy())
-    assert report.status == "not_configured" and report.executed_rules == ()
+    assert report.status == "analyzed"
+    assert report.executed_rules == ("contrast", "typography", "layout")
+    assert all(finding.severity == "unknown" for finding in report.findings)
     assert report.deck.source_sha256 == sha256(path.read_bytes()).hexdigest()
+
+    database_path = tmp_path / "history.sqlite3"
+    SqliteReportRepository(database_path).save(report)
+    restored = SqliteReportRepository(database_path).list_recent()[0].report
+    assert restored == report
 
 
 def test_bootstrap_worker_start_failure_preserves_error_and_stops_monitor(tmp_path, monkeypatch):
