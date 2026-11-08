@@ -1,8 +1,9 @@
+import hashlib
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QSize, Qt, QThread, Signal
+from PySide6.QtCore import QLockFile, QSignalBlocker, QSize, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,17 +23,20 @@ from PySide6.QtWidgets import (
     QStylePainter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from slideguard.adapters.watching.paths import presentation_paths
 from slideguard.bootstrap import (
+    build_analysis_policy,
     build_analyzer,
+    build_powerpoint_reader,
     build_report_repository,
     build_workspace_settings_repository,
     report_database_path,
 )
-from slideguard.domain.policy import AnalysisPolicy
 
 APP_STYLE = """
 QMainWindow, QWidget#appRoot {
@@ -52,6 +56,7 @@ QFrame#header {
     border-right: 0;
     border-top: 0;
 }
+QLabel { color: #1f2937; }
 QLabel#brand {
     color: #172033;
     font-size: 22px;
@@ -115,6 +120,7 @@ QPushButton#tabButton[active="true"] {
     font-weight: 700;
 }
 QTableWidget {
+    color: #1f2937;
     background: #ffffff;
     alternate-background-color: #f8fafc;
     border: 1px solid #e1e6ed;
@@ -124,7 +130,14 @@ QTableWidget {
     selection-color: #1f2937;
     outline: 0;
 }
-QTableWidget::item { padding: 7px; border: 0; }
+QTableWidget::item { color: #1f2937; padding: 7px; border: 0; }
+QTabBar::tab {
+    background: #f3f5f8;
+    color: #4b5565;
+    padding: 8px 14px;
+    border-bottom: 2px solid transparent;
+}
+QTabBar::tab:selected { background: #ffffff; color: #175fc7; border-bottom-color: #2468d8; }
 QTableWidget::item:selected {
     background: #e7f0ff;
     color: #1f2937;
@@ -222,8 +235,8 @@ class AnalysisWorker(QThread):
 
     def run(self):
         try:
-            analyzer = build_analyzer()
-            report = analyzer.execute(self.path, AnalysisPolicy())
+            analyzer = build_analyzer(build_powerpoint_reader(render=True))
+            report = analyzer.execute(self.path, build_analysis_policy(self.path))
         except Exception as error:
             self.failed.emit(f"{type(error).__name__}: {error}")
             return
@@ -236,6 +249,9 @@ class AnalysisWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    workspace_saved = Signal()
+    closing = Signal()
+
     def __init__(self):
         super().__init__()
         self.workspace: Path | None = None
@@ -243,6 +259,10 @@ class MainWindow(QMainWindow):
         self.worker: AnalysisWorker | None = None
         self.current_report = None
         self.viewing_history = False
+        self.controller = None
+        self.file_states: dict[Path, str] = {}
+        self._file_hashes: dict[Path, tuple[tuple[int, int, int], str]] = {}
+        self._awaiting_file: Path | None = None
 
         self.setWindowTitle("SlideGuard")
         self.resize(1280, 820)
@@ -300,10 +320,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 2, 0, 0)
         layout.setSpacing(8)
 
-        self.folder_label = QLabel("작업 폴더를 선택하세요.")
+        self.folder_label = QLabel("작업 폴더를 선택하세요.", objectName="folderCaption")
         self.folder_label.setWordWrap(True)
         self.folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.folder_label)
+        self.settings_button = QPushButton("검사 설정")
+        self.settings_button.setEnabled(False)
+        layout.addWidget(self.settings_button)
 
         folder_actions = QHBoxLayout()
         self.choose_button = QPushButton("폴더 변경")
@@ -338,7 +361,10 @@ class MainWindow(QMainWindow):
         self.file_table.currentCellChanged.connect(self.select_file)
         layout.addWidget(self.file_table, 1)
 
-        help_text = QLabel("PPTX 파일만 표시합니다.\n파일을 선택한 뒤 검사를 실행하세요.", objectName="muted")
+        help_text = QLabel(
+            "저장된 PPTX를 감시합니다.\n파일을 선택해 현재 결과를 보거나 다시 검사할 수 있습니다.",
+            objectName="muted",
+        )
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
         return page
@@ -484,6 +510,13 @@ class MainWindow(QMainWindow):
         self.result_label = QLabel()
         self.result_label.setWordWrap(True)
         layout.addWidget(self.result_label)
+        self.report_tabs = QTabWidget()
+        self.report_tabs.setDocumentMode(True)
+        layout.addWidget(self.report_tabs, 1)
+        findings_page = QWidget()
+        self.report_tabs.addTab(findings_page, "검사 결과")
+        findings_layout = QVBoxLayout(findings_page)
+        findings_layout.setContentsMargins(0, 8, 0, 0)
 
         self.result_table = QTableWidget(0, 4)
         self.result_table.setHorizontalHeaderLabels(["슬라이드 번호", "검사 항목", "판정", "문제 요약"])
@@ -500,7 +533,7 @@ class MainWindow(QMainWindow):
         self.result_table.horizontalHeader().resizeSection(2, 112)
         self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.result_table.currentCellChanged.connect(self.show_finding_details)
-        layout.addWidget(self.result_table, 3)
+        findings_layout.addWidget(self.result_table, 3)
 
         detail = QFrame(objectName="detailPanel")
         detail_layout = QVBoxLayout(detail)
@@ -517,8 +550,72 @@ class MainWindow(QMainWindow):
         self.detail_reason.setWordWrap(True)
         self.detail_reason.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         detail_layout.addWidget(self.detail_reason)
-        layout.addWidget(detail, 2)
+        findings_layout.addWidget(detail, 2)
+        self.report_tabs.addTab(self._build_proposals_page(), "수정안 (0)")
         return page
+
+    def _build_proposals_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        self.proposal_summary = QLabel()
+        self.proposal_summary.setWordWrap(True)
+        layout.addWidget(self.proposal_summary)
+
+        self.proposal_table = QTableWidget(0, 3)
+        self.proposal_table.setHorizontalHeaderLabels(["슬라이드", "대상 객체", "변경 전후"])
+        self.proposal_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.proposal_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.proposal_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.proposal_table.setAlternatingRowColors(True)
+        self.proposal_table.setShowGrid(False)
+        self.proposal_table.verticalHeader().setVisible(False)
+        header = self.proposal_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(1, 150)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.proposal_table, 1)
+
+        self.proposal_apply_hint = QLabel(
+            "적용하려면 PowerPoint에서 이 파일을 열고 SlideGuard 방패 버튼을 누르세요.",
+            objectName="muted",
+        )
+        self.proposal_apply_hint.setWordWrap(True)
+        layout.addWidget(self.proposal_apply_hint)
+        return page
+
+    def _show_proposals(self, report):
+        from slideguard.ui.overlay import proposal_change_text
+
+        proposals = report.proposals
+        self.report_tabs.setTabText(1, f"수정안 ({len(proposals)}건)")
+        self.proposal_table.setRowCount(len(proposals))
+        self.proposal_table.setVisible(bool(proposals))
+        self.proposal_apply_hint.setVisible(bool(proposals))
+        if proposals:
+            self.proposal_summary.setText(f"적용 가능한 수정안 {len(proposals)}건")
+        elif report.status == "not_configured":
+            self.proposal_summary.setText("검사 규칙이 설정되면 수정안을 확인할 수 있습니다.")
+        elif report.findings:
+            self.proposal_summary.setText(
+                f"발견 항목 {len(report.findings)}건 · 현재 검사 결과에서 자동 적용 가능한 수정안이 없습니다."
+            )
+        else:
+            self.proposal_summary.setText("발견된 가독성 문제가 없습니다.")
+
+        shape_names = {shape.key: shape.name for shape in report.deck.shapes}
+        evidence = {finding.id: finding.message for finding in report.findings}
+        for row, proposal in enumerate(proposals):
+            values = (
+                _slide_number(proposal.shape_key),
+                shape_names.get(proposal.shape_key) or proposal.shape_key,
+                proposal_change_text(proposal),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(evidence.get(proposal.finding_id, value))
+                self.proposal_table.setItem(row, column, item)
 
     def _set_active_tab(self, name: str):
         for button, active in (
@@ -530,20 +627,22 @@ class MainWindow(QMainWindow):
             button.style().polish(button)
 
     def show_file_tab(self):
+        was_history = self.left_stack.currentWidget() is self.history_left_page
         self._set_active_tab("files")
         self.left_stack.setCurrentWidget(self.files_left_page)
         self.history_banner.hide()
         self.analyze_button.show()
-        if self.viewing_history:
-            self.viewing_history = False
-            if self.selected_file is not None:
-                self.selected_file_label.setText(self.selected_file.name)
-                self.file_meta_label.setText("PPTX")
-            else:
-                self.selected_file_label.setText("PPTX 파일을 선택하세요")
-                self.file_meta_label.setText("왼쪽 목록에서 검사할 파일을 선택하세요.")
-            self.show_pre_analysis()
-        elif self.current_report is None:
+        if not was_history:
+            return
+        self.viewing_history = False
+        self.refresh_files()
+        row = self.file_table.currentRow()
+        if row >= 0 and self.file_table.item(row, 0) is not None:
+            self.select_file(row, 0, -1, -1)
+        else:
+            self.selected_file_label.setText("PPTX 파일을 선택하세요")
+            self.file_meta_label.setText("왼쪽 목록에서 검사할 파일을 선택하세요.")
+            self.analyze_button.setEnabled(False)
             self.show_pre_analysis()
 
     def show_history_list(self):
@@ -553,11 +652,15 @@ class MainWindow(QMainWindow):
         self.left_stack.setCurrentWidget(self.history_left_page)
         self.analyze_button.hide()
         self.refresh_history()
-        if self.history_table.currentRow() < 0:
+        row = self.history_table.currentRow()
+        if row < 0:
             self._show_empty_history_detail()
+        else:
+            self.select_history(row)
 
     def show_pre_analysis(self):
         self.current_report = None
+        self.report_tabs.setCurrentIndex(0)
         self.result_table.setRowCount(0)
         self.detail_title.setText("결과 행을 선택하면 상세 내용을 확인할 수 있습니다.")
         self.detail_values.clear()
@@ -604,7 +707,9 @@ class MainWindow(QMainWindow):
         if self.workspace is None:
             return
         try:
-            build_workspace_settings_repository().save(self.workspace, self.recursive.isChecked())
+            build_workspace_settings_repository().save(self.workspace.resolve(), self.recursive.isChecked())
+            self.file_states.clear()
+            self.workspace_saved.emit()
         except Exception as error:
             self.statusBar().showMessage("작업 폴더 설정 저장 실패")
             QMessageBox.warning(self, "설정 저장 실패", f"{type(error).__name__}: {error}")
@@ -642,6 +747,8 @@ class MainWindow(QMainWindow):
         self.refresh_files()
 
     def refresh_files(self):
+        blocker = QSignalBlocker(self.file_table)
+        previous = self.selected_file
         self.file_table.setRowCount(0)
         self.file_count_label.setText("0개")
         if self.workspace is None:
@@ -649,15 +756,12 @@ class MainWindow(QMainWindow):
         try:
             if not self.workspace.is_dir():
                 raise OSError("선택한 폴더가 없거나 접근할 수 없습니다.")
-            entries = self.workspace.rglob("*") if self.recursive.isChecked() else self.workspace.iterdir()
             files = sorted(
-                (
-                    path
-                    for path in entries
-                    if path.is_file() and path.suffix.lower() == ".pptx" and not path.name.startswith("~")
-                ),
+                presentation_paths(self.workspace, recursive=self.recursive.isChecked()),
                 key=lambda path: str(path).casefold(),
             )
+            settings = build_workspace_settings_repository().load() if self.controller is not None else None
+            repository = build_report_repository() if settings is not None else None
         except OSError as error:
             self.statusBar().showMessage("파일 목록 읽기 실패")
             QMessageBox.warning(self, "폴더 읽기 실패", str(error))
@@ -668,17 +772,107 @@ class MainWindow(QMainWindow):
             relative_folder = path.parent.relative_to(self.workspace)
             folder_text = str(relative_folder) if str(relative_folder) != "." else "현재 폴더"
             try:
-                size_mb = path.stat().st_size / (1024 * 1024)
-                metadata = f"{folder_text} · {size_mb:.1f} MB"
-            except OSError:
-                metadata = folder_text
+                stat = path.stat()
+                size_mb = stat.st_size / (1024 * 1024)
+                state = self.file_states.get(path)
+                if state is None:
+                    state = self._file_state(path, stat, settings, repository)
+                metadata = f"{folder_text} · {size_mb:.1f} MB · {state}"
+            except (OSError, ValueError):
+                metadata = f"{folder_text} · 저장본 확인 필요"
             name_item = QTableWidgetItem(f"{path.name}\n{metadata}")
             name_item.setData(Qt.ItemDataRole.UserRole, str(path))
             name_item.setToolTip(str(path))
             self.file_table.setItem(row, 0, name_item)
             self.file_table.setRowHeight(row, 62)
+            if path == previous:
+                self.file_table.selectRow(row)
+        if previous is not None and previous not in files:
+            self.selected_file = None
+            self.analyze_button.setEnabled(False)
+            if not self.viewing_history:
+                self.selected_file_label.setText("PPTX 파일을 선택하세요")
+                self.file_meta_label.clear()
+                self.show_pre_analysis()
+        self._file_hashes = {path: value for path, value in self._file_hashes.items() if path in files}
+        blocker.unblock()
         self.file_count_label.setText(f"{len(files)}개")
         self.statusBar().showMessage(f"PPTX 파일 {len(files)}개")
+
+    def _file_state(self, path, stat, settings, repository) -> str:
+        if repository is None:
+            return "미검사"
+        key = settings.policy_for(path).cache_key
+        saved = repository.last_successful_sha256(path, key)
+        if saved is None:
+            return "미검사"
+        return "검사 완료" if self._file_hash(path, stat) == saved else "변경됨"
+
+    def _file_hash(self, path: Path, stat) -> str:
+        identity = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+        previous = self._file_hashes.get(path)
+        if previous is None or previous[0] != identity:
+            with path.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            self._file_hashes[path] = identity, digest
+        return self._file_hashes[path][1]
+
+    def connect_overlay(self, controller):
+        self.controller = controller
+        self.workspace_saved.connect(controller.restart_collection)
+        self.settings_button.setEnabled(True)
+        self.settings_button.clicked.connect(lambda: controller.show_settings())
+        controller.settings_dialog.settings_saved.connect(self._reload_workspace)
+        controller.file_activity.connect(self._on_file_activity)
+        controller.completed.connect(self._on_collection_report)
+        controller.workspace_requested.connect(self._raise_window)
+        self.closing.connect(controller.request_exit)
+        self.refresh_files()
+
+    def _raise_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _reload_workspace(self):
+        self.file_states.clear()
+        self._awaiting_file = None
+        self.restore_workspace_settings()
+        if not self.viewing_history:
+            self.show_pre_analysis()
+            row = self.file_table.currentRow()
+            if row >= 0:
+                self.select_file(row, 0, -1, -1)
+
+    def _on_file_activity(self, path: Path, status: str):
+        if status in {"제거", "검사 완료"}:
+            self.file_states.pop(path, None)
+        else:
+            self.file_states[path] = status
+        self._file_hashes.pop(path, None)
+        self.refresh_files()
+        if self._awaiting_file == path and status == "검사 실패":
+            self._awaiting_file = None
+            self.analyze_button.setEnabled(True)
+            self.error_page.description_label.setText(
+                "자동 검사가 실패했습니다. 파일을 확인하고 다시 시도하세요."
+            )
+            self.inspection_stack.setCurrentWidget(self.error_page)
+
+    def _on_collection_report(self, outcome):
+        from slideguard.ui.overlay import AnalysisOutcome
+
+        report = outcome.report if isinstance(outcome, AnalysisOutcome) else outcome
+        path = Path(report.deck.source_path)
+        if self.left_stack.currentWidget() is self.history_left_page:
+            self.refresh_history()
+        if self.selected_file != path or self.left_stack.currentWidget() is self.history_left_page:
+            return
+        current = self._file_hashes.get(path)
+        if current is not None and current[1] == report.deck.source_sha256:
+            self._awaiting_file = None
+            self.analyze_button.setEnabled(True)
+            self.show_report(report)
 
     def select_file(self, current_row: int, _current_column: int, _previous_row: int, _previous_column: int):
         if current_row < 0 or self.worker is not None:
@@ -699,7 +893,21 @@ class MainWindow(QMainWindow):
         self.history_banner.hide()
         self._set_active_tab("files")
         self.left_stack.setCurrentWidget(self.files_left_page)
+        self._awaiting_file = None
         self.show_pre_analysis()
+        if self.controller is not None:
+            path = self.selected_file
+            try:
+                stored = build_report_repository().find_successful(
+                    path, build_analysis_policy(path).cache_key
+                )
+                if (
+                    stored is not None
+                    and self._file_hash(path, path.stat()) == stored.report.deck.source_sha256
+                ):
+                    self.show_report(stored.report)
+            except (OSError, ValueError):
+                return
 
     def start_analysis(self):
         if self.worker is not None:
@@ -717,6 +925,13 @@ class MainWindow(QMainWindow):
         self.progress_file_label.setText(f"검사 중 · {path.name}")
         self.inspection_stack.setCurrentWidget(self.progress_page)
         self.statusBar().showMessage("검사 중")
+        if self.controller is not None:
+            if self.controller.request_path(path):
+                self._awaiting_file = path
+                self.analyze_button.setEnabled(False)
+            else:
+                self.show_analysis_error("작업 폴더 감시를 시작한 뒤 다시 시도하세요.")
+            return
         self._set_busy(True)
 
         self.worker = AnalysisWorker(path, self)
@@ -758,6 +973,7 @@ class MainWindow(QMainWindow):
             self.left_stack.setCurrentWidget(self.files_left_page)
 
         self.inspection_stack.setCurrentWidget(self.results_page)
+        self._show_proposals(report)
         self.result_table.setRowCount(len(report.findings))
 
         if report.status == "not_configured":
@@ -772,6 +988,11 @@ class MainWindow(QMainWindow):
             )
         else:
             self.result_label.setText(f"검사 완료 · {deck.slide_count}개 슬라이드 · 발견 항목 없음")
+
+        if report.comparison is not None:
+            from slideguard.ui.overlay import comparison_text
+
+            self.result_label.setText(self.result_label.text() + "\n" + comparison_text(report))
 
         limitations = tuple(
             limitation
@@ -926,6 +1147,7 @@ class MainWindow(QMainWindow):
             return
         self.history_table.clearSelection()
         self.refresh_history()
+        self.refresh_files()
         if self.viewing_history:
             self._show_empty_history_detail()
         self.statusBar().showMessage("검사 이력을 초기화했습니다")
@@ -956,6 +1178,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         super().closeEvent(event)
+        self.closing.emit()
 
 
 def _slide_number(shape_key: str) -> str:
@@ -1023,7 +1246,9 @@ def main() -> int:
     app._slideguard_instance_lock = instance_lock
     from slideguard.ui.overlay import start_overlay
 
-    start_overlay(app)
+    window = MainWindow()
+    window.connect_overlay(start_overlay(app))
+    window.show()
     return app.exec()
 
 

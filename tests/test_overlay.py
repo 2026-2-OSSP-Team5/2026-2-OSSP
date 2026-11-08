@@ -1,8 +1,10 @@
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QRect, Qt
+from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from slideguard.adapters.powerpoint.patcher import ApplyResult
@@ -121,7 +123,7 @@ def _proposal_report(path: Path, source_sha256: str) -> AnalysisReport:
     )
 
 
-def test_collapsed_overlay_keeps_state_and_shows_result_count(application, tmp_path):
+def test_collapsed_overlay_counts_only_actionable_proposals(application, tmp_path):
     path = tmp_path / "deck.pptx"
     path.write_bytes(b"deck")
     widget = overlay.OverlayWidget()
@@ -133,10 +135,13 @@ def test_collapsed_overlay_keeps_state_and_shows_result_count(application, tmp_p
         assert widget.collapsed is True
         assert widget.size().width() == 58
         assert widget.size().height() == 58
-        assert widget.count_badge.text() == "1"
-        assert widget.count_badge.isVisible() is True
+        assert widget.count_badge.text() == ""
+        assert widget.count_badge.isVisible() is False
         assert widget.findings_table.rowCount() == 1
         assert widget.apply_button.isEnabled() is False
+        widget.show_report(_proposal_report(path, overlay._sha256(path)))
+        assert widget.count_badge.text() == "3"
+        assert widget.count_badge.isVisible() is True
         assert widget.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) is False
         assert widget.mask().isEmpty() is False
         assert isinstance(widget.shield_button, overlay.ShieldButton)
@@ -198,6 +203,72 @@ def test_collapsing_visible_overlay_keeps_one_visible_window(application, monkey
         assert geometry_calls == []
     finally:
         widget.close()
+
+
+def test_floating_shield_paint_is_centered_in_its_round_window(application):
+    widget = overlay.OverlayWidget()
+    try:
+        widget.set_target(overlay.PowerPointWindow(1, QRect(10, 20, 1200, 800), "deck.pptx - PowerPoint"))
+        application.processEvents()
+        button = widget.shield_button
+        assert button.geometry() == widget.rect()
+        assert widget.count_badge.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        rendered = button.grab().toImage()
+        width, height = rendered.width(), rendered.height()
+        shield_pixels = []
+        for y in range(height // 5, height * 4 // 5):
+            for x in range(width // 5, width * 4 // 5):
+                color = rendered.pixelColor(x, y)
+                if color.red() < 80 and color.green() < 140 and color.blue() > 150:
+                    shield_pixels.append((x, y))
+        assert shield_pixels
+        xs, ys = zip(*shield_pixels, strict=True)
+        assert abs(min(xs) + max(xs) - (width - 1)) <= 2
+        assert abs(min(ys) + max(ys) - (height - 1)) <= 2
+    finally:
+        widget.close()
+
+
+def test_floating_shield_drag_clamps_and_stays_in_place_after_click_and_window_move(application):
+    widget = overlay.OverlayWidget()
+    target = overlay.PowerPointWindow(1, QRect(100, 100, 600, 500), "deck.pptx - PowerPoint")
+    try:
+        widget.set_target(target)
+        button = widget.shield_button
+        center = button.rect().center()
+        original = widget.pos()
+
+        QTest.mousePress(button, Qt.MouseButton.LeftButton, pos=center)
+        QTest.mouseMove(button, center + QPoint(-100, 90))
+        QTest.mouseRelease(button, Qt.MouseButton.LeftButton, pos=center)
+        assert widget.collapsed
+        assert widget.pos() == original + QPoint(-100, 90)
+
+        moved = overlay.PowerPointWindow(1, target.rect.translated(50, 40), target.title)
+        widget.set_target(moved)
+        assert widget.pos() == original + QPoint(-50, 130)
+        QTest.mouseClick(button, Qt.MouseButton.LeftButton, pos=center)
+        assert not widget.collapsed
+        widget.collapse_button.click()
+        assert widget.pos() == original + QPoint(-50, 130)
+
+        QTest.mousePress(button, Qt.MouseButton.LeftButton, pos=center)
+        QTest.mouseMove(button, center - QPoint(900, 900))
+        QTest.mouseRelease(button, Qt.MouseButton.LeftButton, pos=center)
+        assert widget.collapsed
+        assert widget.pos() == moved.rect.topLeft()
+        assert moved.rect.contains(widget.geometry())
+    finally:
+        widget.close()
+
+
+def test_save_dialog_owner_keeps_the_overlay_attached():
+    parents = {1: 0, 2: 1, 3: 2, 4: 0}
+    windows = SimpleNamespace(
+        IsWindow=lambda hwnd: hwnd in parents, GetWindow=lambda hwnd, _flag: parents[hwnd]
+    )
+    assert overlay.PowerPointTracker._owns_foreground(3, {1}, windows, 4)
+    assert not overlay.PowerPointTracker._owns_foreground(4, {1}, windows, 4)
 
 
 def test_powerpoint_physical_rect_is_mapped_to_qt_monitor_coordinates():
@@ -319,7 +390,8 @@ class _SettingsRepository:
     def load(self):
         return self.settings
 
-    def save(self, workspace, recursive, purpose=None):
+    def save(self, workspace, recursive, purpose=None, *, policy=None, document=None):
+        purpose = policy.purpose.value if policy is not None else purpose
         self.settings = WorkspaceSettings(workspace, recursive, purpose or self.settings.purpose)
 
 

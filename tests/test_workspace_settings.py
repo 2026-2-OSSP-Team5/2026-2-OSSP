@@ -1,6 +1,8 @@
 import sqlite3
+from hashlib import sha256
 
 import pytest
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from slideguard import bootstrap
@@ -9,7 +11,7 @@ from slideguard.adapters.storage.sqlite import (
     StoredReport,
     WorkspaceSettings,
 )
-from slideguard.domain.models import AnalysisReport, DeckSnapshot, Finding
+from slideguard.domain.models import AnalysisReport, ChangeProposal, DeckSnapshot, Finding
 from slideguard.domain.policy import Purpose
 from slideguard.ui import desktop
 
@@ -353,6 +355,107 @@ def test_file_analysis_details_history_and_back_flow(tmp_path, monkeypatch, appl
         window.close()
 
 
+def test_completed_file_restores_its_saved_proposals_after_returning_from_history(
+    tmp_path, monkeypatch, application
+):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "state"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "deck.pptx"
+    source.write_bytes(b"saved test revision")
+    bootstrap.build_workspace_settings_repository().save(workspace, False)
+    policy_key = bootstrap.build_analysis_policy(source).cache_key
+    finding = Finding("font-size", "typography", "1:2", "warning", "글자가 작습니다", 10, 14, "10pt < 14pt")
+    proposal = ChangeProposal("font.size@1:2", finding.id, finding.shape_key, "font.size", 10, 14, 0.2)
+    report = AnalysisReport(
+        deck=DeckSnapshot(str(source), sha256(source.read_bytes()).hexdigest(), 1, 960, 540),
+        findings=[finding],
+        proposals=[proposal],
+        status="analyzed",
+        policy_key=policy_key,
+    )
+    repository = bootstrap.build_report_repository()
+    repository.save(report)
+    repository.save(
+        AnalysisReport(
+            deck=DeckSnapshot(str(tmp_path / "other.pptx"), "other-sha", 1, 960, 540),
+            findings=[finding],
+            status="analyzed",
+            policy_key=policy_key,
+        )
+    )
+
+    window = desktop.MainWindow()
+    try:
+        window.controller = object()
+        window.refresh_files()
+        assert "검사 완료" in window.file_table.item(0, 0).text()
+        window.file_table.setCurrentCell(0, 0)
+        assert window.inspection_stack.currentWidget() is window.results_page
+        assert window.report_tabs.tabText(1) == "수정안 (1건)"
+        assert window.proposal_table.item(0, 2).text() == "글자 크기 · 10 → 14"
+
+        window.show_history_list()
+        window.history_table.setCurrentCell(0, 0)
+        assert window.report_tabs.tabText(1) == "수정안 (0건)"
+        assert "자동 적용 가능한 수정안이 없습니다" in window.proposal_summary.text()
+        assert window.proposal_table.isHidden()
+
+        window.show_file_tab()
+        assert window.inspection_stack.currentWidget() is window.results_page
+        assert window.current_report.deck.source_path == str(source)
+        assert window.report_tabs.tabText(1) == "수정안 (1건)"
+
+        window.show_history_list()
+        source.write_bytes(b"different revision")
+        window.show_file_tab()
+        assert "변경됨" in window.file_table.item(0, 0).text()
+        assert window.inspection_stack.currentWidget() is window.pre_page
+        assert window.current_report is None
+    finally:
+        window.close()
+
+
+def test_unselected_file_and_history_rows_are_readable_with_a_dark_system_palette(
+    tmp_path, monkeypatch, application
+):
+    source = tmp_path / "Visible file.pptx"
+    source.touch()
+    report = AnalysisReport(DeckSnapshot(str(source), "sha", 1, 960, 540), status="analyzed")
+    history = FakeReportRepository([StoredReport(1, "2026-11-08T04:00:00", report)])
+    settings = FakeSettingsRepository(WorkspaceSettings(tmp_path, False))
+    monkeypatch.setattr(desktop, "build_workspace_settings_repository", lambda: settings)
+    monkeypatch.setattr(desktop, "build_report_repository", lambda: history)
+    original_palette = application.palette()
+    dark_palette = QPalette(original_palette)
+    dark_palette.setColor(QPalette.ColorRole.Text, QColor("white"))
+    dark_palette.setColor(QPalette.ColorRole.WindowText, QColor("white"))
+    dark_palette.setColor(QPalette.ColorRole.Base, QColor("#202020"))
+    application.setPalette(dark_palette)
+    window = desktop.MainWindow()
+    try:
+        window.show()
+        for show_tab, table in (
+            (window.show_file_tab, window.file_table),
+            (window.show_history_list, window.history_table),
+        ):
+            show_tab()
+            table.clearSelection()
+            application.processEvents()
+            item = table.item(0, 0)
+            assert not item.isSelected()
+            cell = table.visualItemRect(item).adjusted(6, 4, -6, -4)
+            image = table.viewport().grab(cell).toImage()
+            assert any(
+                image.pixelColor(x, y).value() < 140
+                for x in range(image.width())
+                for y in range(image.height())
+            ), table.objectName()
+    finally:
+        window.close()
+        application.setPalette(original_palette)
+
+
 def test_history_clear_cancel_then_confirm_preserves_workspace(tmp_path, monkeypatch, application):
     workspace = tmp_path / "presentations"
     workspace.mkdir()
@@ -455,6 +558,32 @@ def test_unknown_empty_not_configured_and_failure_states_are_distinct(tmp_path, 
         assert warnings
     finally:
         window.close()
+
+
+def test_document_lock_follows_the_same_slide_when_slides_are_reordered(tmp_path):
+    from pptx import Presentation
+
+    from slideguard.domain.policy import AnalysisPolicy
+
+    document = tmp_path / "deck.pptx"
+    deck = Presentation()
+    layout = deck.slide_layouts[6]
+    deck.slides.add_slide(layout)
+    deck.slides.add_slide(layout)
+    deck.save(document)
+    repository = SqliteWorkspaceSettingsRepository(tmp_path / "settings.sqlite3")
+    policy = AnalysisPolicy(locked_shapes=frozenset({"1:3"}))
+    repository.save(tmp_path, False, policy=policy, document=document)
+    assert repository.load().policy_for(document).locked_shapes == {"1:3"}
+
+    order = deck.slides._sldIdLst
+    first = order[0]
+    order.remove(first)
+    order.append(first)
+    deck.save(document)
+
+    assert repository.load().policy_for(document).locked_shapes == {"2:3"}
+    assert not repository.load().policy_for(tmp_path / "different.pptx").locked_shapes
 
 
 def test_legacy_workspace_settings_gain_default_analysis_purpose(tmp_path):
