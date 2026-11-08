@@ -156,6 +156,16 @@ class ChangeProposal:
     cost: float
 
 
+@dataclass(frozen=True)
+class FindingComparison:
+    baseline_path: str
+    baseline_sha256: str
+    improved: int
+    new_or_worse: int
+    unchanged: int
+    indeterminate: int = 0
+
+
 @dataclass
 class AnalysisReport:
     deck: DeckSnapshot
@@ -164,3 +174,29 @@ class AnalysisReport:
     executed_rules: tuple[str, ...] = ()
     status: Literal["not_configured", "analyzed"] = "not_configured"
     schema_version: str = "0.3"
+    policy_key: str | None = None
+    comparison: FindingComparison | None = None
+
+    def compare_with(self, before: "AnalysisReport") -> None:
+        rank = {"review": 1, "warning": 2, "unknown": None}
+        previous = {(f.id, f.shape_key): rank[f.severity] for f in before.findings}
+        current = {(f.id, f.shape_key): rank[f.severity] for f in self.findings}
+        improved = new_or_worse = unchanged = indeterminate = 0
+        for key in previous.keys() | current.keys():
+            old, new = previous.get(key, 0), current.get(key, 0)
+            if old is None or new is None:
+                indeterminate += 1
+            elif new < old:
+                improved += 1
+            elif new > old:
+                new_or_worse += 1
+            else:
+                unchanged += 1
+        self.comparison = FindingComparison(
+            before.deck.source_path,
+            before.deck.source_sha256,
+            improved,
+            new_or_worse,
+            unchanged,
+            indeterminate,
+        )

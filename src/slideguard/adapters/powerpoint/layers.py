@@ -109,7 +109,10 @@ def _uniform(target, layers, slide, notes):
         fill = optional(lambda item=item: item.Fill, "Fill", [])
         visible = optional(lambda fill=fill: fill.Visible, "Fill visibility", [])
         if visible == 0:
-            continue
+            if _transparent(item):
+                continue
+            notes.append(f"Background is unknown: object {shape.shape_id} can draw content without a fill")
+            return None
         if not _contains(shape.box, bounds):
             notes.append(f"Background is unknown: filled object {shape.shape_id} only partly covers the text")
             return None

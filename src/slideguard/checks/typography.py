@@ -9,7 +9,6 @@ from slideguard.domain.policy import (
     TITLE_PLACEHOLDERS,
     AnalysisPolicy,
     Purpose,
-    font_size_threshold,
 )
 
 from .scope import target_shapes
@@ -37,24 +36,29 @@ class TypographyRule:
         for shape in shapes:
             if not _has_text(shape):
                 continue
-            for number, result in enumerate(_evaluate_shape(shape, policy.purpose), start=1):
+            for number, result in enumerate(_evaluate_shape(shape, policy), start=1):
                 findings.append(self._finding(f"{self.id}:{shape.key}:{number}", shape, result))
 
         by_slide: dict[int, list[Shape]] = {}
         for shape in shapes:
             by_slide.setdefault(shape.slide_number, []).append(shape)
         for slide_number in sorted(by_slide):
-            found = _check_hierarchy(by_slide[slide_number])
+            found = _check_hierarchy(by_slide[slide_number], deck.height_pt)
             if found is not None:
-                anchor, result = found
-                findings.append(self._finding(f"{self.id}:{slide_number}:hierarchy", anchor, result))
+                anchor, result, inferred = found
+                rule_id = f"{self.id}.hierarchy.inferred" if inferred else self.id
+                findings.append(
+                    self._finding(f"{self.id}:{slide_number}:hierarchy", anchor, result, rule_id=rule_id)
+                )
         return findings
 
-    def _finding(self, finding_id: str, shape: Shape, result: _Result) -> Finding:
+    def _finding(
+        self, finding_id: str, shape: Shape, result: _Result, *, rule_id: str | None = None
+    ) -> Finding:
         severity, message, measured, expected, evidence = result
         return Finding(
             id=finding_id,
-            rule_id=self.id,
+            rule_id=rule_id or self.id,
             shape_key=shape.key,
             severity=severity,
             message=message,
@@ -73,7 +77,7 @@ def _unknown(message: str, evidence: str) -> _Result:
     return ("unknown", message, None, None, evidence)
 
 
-def _evaluate_shape(shape: Shape, purpose: Purpose) -> list[_Result]:
+def _evaluate_shape(shape: Shape, policy: AnalysisPolicy) -> list[_Result]:
     if not shape.supported:
         reason = "; ".join(shape.notes) or "지원하지 않는 객체 유형"
         return [_unknown("이 객체는 글자 크기를 판정할 수 없습니다", reason)]
@@ -81,8 +85,8 @@ def _evaluate_shape(shape: Shape, purpose: Purpose) -> list[_Result]:
     if not runs:
         return [_unknown("글자 크기 정보가 없어 판정할 수 없습니다", "텍스트 런(run) 정보 없음")]
 
-    threshold = font_size_threshold(purpose)
-    label = _PURPOSE_LABEL[purpose]
+    threshold = policy.font_limits
+    label = _PURPOSE_LABEL[policy.purpose]
     results: list[_Result] = []
     unknown_reported = False
     seen_sizes: set[float] = set()
@@ -146,12 +150,48 @@ def _largest_run_pt(shapes: list[Shape]) -> float | None:
     return max(sizes) if sizes else None
 
 
-def _required_title_pt(body_pt: float) -> float:
-    """본문의 정해진 배수. 0.5pt 단위로 올려 수정하기 쉬운 값으로 만든다."""
-    return math.ceil(body_pt * TITLE_BODY_RATIO * 2) / 2
+def _unmarked_boxes(shapes: list[Shape]) -> list[Shape]:
+    return sorted(
+        (
+            shape
+            for shape in shapes
+            if shape.supported
+            and shape.placeholder_type is None
+            and shape.shape_type in (1, 17)
+            and shape.box is not None
+            and _has_text(shape)
+        ),
+        key=lambda shape: shape.box.y,
+    )
 
 
-def _check_hierarchy(shapes: list[Shape]) -> tuple[Shape, _Result] | None:
+def _infer_roles(
+    titles: list[Shape], bodies: list[Shape], boxes: list[Shape], height: float
+) -> tuple[list[Shape], list[Shape]]:
+    if titles:
+        anchor = titles[0]
+        if anchor.box is None:
+            return titles, bodies
+    else:
+        if not boxes or height <= 0:
+            return titles, bodies
+        anchor = boxes[0]
+        text = anchor.text.strip()
+        if not 0 <= anchor.box.y <= height * 0.25 or "\n" in text or len(text) > 100:
+            return titles, bodies
+        if len(boxes) > 1 and boxes[1].box.y < anchor.box.y + anchor.box.height:
+            return titles, bodies
+        if bodies and not any(
+            shape.box and shape.box.y >= anchor.box.y + anchor.box.height for shape in bodies
+        ):
+            return titles, bodies
+        titles = [anchor]
+    if not bodies:
+        bodies = [shape for shape in boxes if anchor.box.y + anchor.box.height <= shape.box.y < height * 0.85]
+    return titles, bodies
+
+
+def _check_hierarchy(shapes: list[Shape], height: float) -> tuple[Shape, _Result, bool] | None:
     """한 슬라이드의 제목과 본문 크기 차이를 본다.
 
     제목이나 본문이 없는 슬라이드(표지·전체 이미지 등)는 검사 대상이 아니라
@@ -159,37 +199,50 @@ def _check_hierarchy(shapes: list[Shape]) -> tuple[Shape, _Result] | None:
     """
     titles = _role_shapes(shapes, TITLE_PLACEHOLDERS)
     bodies = _role_shapes(shapes, BODY_PLACEHOLDERS)
+    inferred = not titles or not bodies
+    if inferred:
+        titles, bodies = _infer_roles(titles, bodies, _unmarked_boxes(shapes), height)
     if not titles or not bodies:
         return None
 
-    anchor = titles[0]
-    title_pt = _largest_run_pt(titles)
+    anchor = max(titles, key=lambda title: _largest_run_pt([title]) or 0)
+    title_pt = _largest_run_pt([anchor])
     body_pt = _largest_run_pt(bodies)
     if title_pt is None or body_pt is None:
         missing = "제목" if title_pt is None else "본문"
-        return anchor, _unknown(
+        result = _unknown(
             "제목과 본문의 크기를 비교할 수 없습니다",
             f"{missing} 글자 크기가 지정되지 않음(테마 상속 등)",
         )
+        return anchor, result, inferred
 
-    required_pt = _required_title_pt(body_pt)
-    if title_pt >= required_pt:
+    minimum_pt = body_pt * TITLE_BODY_RATIO
+    if title_pt >= minimum_pt or math.isclose(title_pt, minimum_pt, rel_tol=1e-9):
         return None
-
     sizes = f"제목 {_fmt(title_pt)} / 본문 {_fmt(body_pt)}"
-    rule = f"본문의 {TITLE_BODY_RATIO}배인 {_fmt(required_pt)} 이상 필요 (시각적 위계 기준)"
-    if title_pt <= body_pt:
-        return anchor, (
-            "warning",
-            f"제목이 본문보다 크지 않습니다 ({_fmt(title_pt)})",
-            title_pt,
-            required_pt,
-            f"{sizes} — 제목이 본문 이하라 위계가 없음; {rule}",
+    rule = f"본문의 {TITLE_BODY_RATIO}배인 {_fmt(minimum_pt)} 이상 필요 (시각적 위계 기준)"
+    if inferred:
+        rule += " · 텍스트 상자의 위치를 기준으로 제목 또는 본문을 추정"
+    if title_pt <= body_pt and not inferred:
+        return (
+            anchor,
+            (
+                "warning",
+                f"제목이 본문보다 크지 않습니다 ({_fmt(title_pt)})",
+                title_pt,
+                minimum_pt,
+                f"{sizes} — 제목이 본문 이하라 위계가 없음; {rule}",
+            ),
+            inferred,
         )
-    return anchor, (
-        "review",
-        f"제목과 본문의 크기 차이가 작습니다 ({_fmt(title_pt)})",
-        title_pt,
-        required_pt,
-        f"{sizes} — {rule}; 의도한 편집인지 확인",
+    return (
+        anchor,
+        (
+            "review",
+            f"제목과 본문의 크기 차이가 작습니다 ({_fmt(title_pt)})",
+            title_pt,
+            minimum_pt,
+            f"{sizes} — {rule}; 의도한 편집인지 확인",
+        ),
+        inferred,
     )

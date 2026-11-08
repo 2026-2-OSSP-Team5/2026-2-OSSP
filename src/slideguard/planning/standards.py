@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from slideguard.domain import policy as team
-from slideguard.domain.policy import Purpose
+from slideguard.domain.policy import AnalysisPolicy, Purpose
 
 SOURCE = "B 기준 (domain/policy.py)"
 NO_TEAM_CRITERION = "B에 이 기준이 없음 → 수정 후보를 만들지 않음"
@@ -47,7 +47,7 @@ class Standards:
     max_lines: Criterion  # 정보 밀도: 슬라이드 전체 줄 수
     max_chars: Criterion  # 정보 밀도: 슬라이드 전체 글자 수 (공백 제외)
     min_line_spacing: Criterion  # B에 없음
-    title_body_ratio: Criterion  # B에 없음
+    title_body_ratio: Criterion
 
     def criteria(self) -> list[tuple[str, Criterion]]:
         """화면·보고서 출력용 (이름, 기준) 목록"""
@@ -66,11 +66,14 @@ class Standards:
         ]
 
 
-def build_standards(purpose: Purpose = Purpose.PRESENTATION) -> Standards:
+def build_standards(
+    purpose: Purpose = Purpose.PRESENTATION, policy: AnalysisPolicy | None = None
+) -> Standards:
     """B의 기준값으로 Standards를 만듭니다. purpose는 B의 Purpose."""
     purpose = Purpose(purpose)  # 문자열로 와도 B의 이름만 허용 (모르는 값이면 ValueError)
-    font = team.font_size_threshold(purpose)
-    density = team.density_threshold(purpose)
+    policy = policy or AnalysisPolicy(purpose=purpose)
+    font = policy.font_limits
+    density = policy.density_limits
     label = PURPOSE_LABELS[purpose]
     return Standards(
         purpose=purpose.value,
@@ -79,11 +82,11 @@ def build_standards(purpose: Purpose = Purpose.PRESENTATION) -> Standards:
         recommended_font_pt=Criterion(font.recommended_pt, f"{SOURCE} {label} 권장 크기"),
         large_text_pt=Criterion(team.LARGE_TEXT_PT, f"{SOURCE} WCAG 큰 글자"),
         large_bold_text_pt=Criterion(team.LARGE_BOLD_TEXT_PT, f"{SOURCE} WCAG 큰 글자(굵게)"),
-        contrast_normal=Criterion(team.CONTRAST_NORMAL, f"{SOURCE} WCAG 2.2 AA 일반 글자"),
-        contrast_large=Criterion(team.CONTRAST_LARGE, f"{SOURCE} WCAG 2.2 AA 큰 글자"),
-        safe_margin_ratio=Criterion(team.SAFE_MARGIN_RATIO, f"{SOURCE} 안전 여백"),
+        contrast_normal=Criterion(policy.normal_contrast, f"{SOURCE} WCAG 2.2 AA 일반 글자"),
+        contrast_large=Criterion(policy.large_contrast, f"{SOURCE} WCAG 2.2 AA 큰 글자"),
+        safe_margin_ratio=Criterion(policy.margin_ratio, f"{SOURCE} 안전 여백"),
         max_lines=Criterion(density.max_lines, f"{SOURCE} {label} 정보 밀도(줄)"),
         max_chars=Criterion(density.max_chars, f"{SOURCE} {label} 정보 밀도(글자)"),
         min_line_spacing=Criterion(None, NO_TEAM_CRITERION),
-        title_body_ratio=Criterion(None, NO_TEAM_CRITERION),
+        title_body_ratio=Criterion(team.TITLE_BODY_RATIO, f"{SOURCE} 시각적 위계"),
     )

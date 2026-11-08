@@ -1,5 +1,7 @@
 """여러 도형이 있는 슬라이드의 배경 판정: 글자에 닿는 도형만 엄격하게 확인합니다 (가짜 PowerPoint)."""
 
+import pytest
+
 from slideguard.domain.models import Box, Shape, TextRun
 from tests.test_powerpoint_text import Properties, extract, make_slide, shape
 
@@ -65,9 +67,12 @@ def test_samples_are_ignored_for_shapes_with_known_background():
     assert item.background_samples == ()
 
 
-def test_picture_behind_text_keeps_background_unknown_for_pixel_judgment():
+@pytest.mark.parametrize("auto_shape_type", [-2, 1])
+def test_picture_behind_text_keeps_background_unknown_for_pixel_judgment(auto_shape_type):
     picture = far_picture()
     picture.Left, picture.Top = 0.0, 0.0  # 글자 바로 뒤의 사진 → 단색 배경이 아님
+    picture.AutoShapeType = auto_shape_type
+    picture.Fill.Visible = 0  # 별도 도형 채우기가 없어도 사진 자체는 그려짐
     assert background_of_target(picture) is None
 
 
