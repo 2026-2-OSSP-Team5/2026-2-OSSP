@@ -172,10 +172,10 @@ def test_finding_expected_value_takes_priority_and_result_carries_b_standards():
 
 def test_rules_without_b_criterion_get_no_proposal():
     spacing = FakeFinding("line_spacing", 1, 5, "warning", {"line_spacing": 0.8})
-    hierarchy = FakeFinding("hierarchy", 1, 5, "warning", {"title_size_pt": 20.0, "body_size_pt": 20.0})
-    result = plan(deck(text_shape()), [spacing, hierarchy], strength="aggressive")
+    result = plan(deck(text_shape()), [spacing], strength="aggressive")
     assert result.proposals == []
-    assert all("B에" in item.reason for item in result.skipped)
+    assert len(result.skipped) == 1
+    assert "B에" in result.skipped[0].reason
 
 
 def test_text_already_meeting_standard_is_never_shrunk():

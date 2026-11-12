@@ -37,7 +37,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from slideguard.domain.policy import GEOMETRY_TOLERANCE_PT
+from slideguard.domain.policy import GEOMETRY_TOLERANCE_PT, AnalysisPolicy
 from slideguard.planning.bindings import TeamBindings
 from slideguard.planning.color import (
     color_distance,
@@ -150,7 +150,9 @@ class RuleBasedPlanner:
         slide_w, slide_h = self.bindings.slide_size(snapshot)
         standards = self.standards
         if standards is None:
-            standards = build_standards(self.bindings.purpose(policy))
+            standards = build_standards(
+                self.bindings.purpose(policy), policy if isinstance(policy, AnalysisPolicy) else None
+            )
         context = {
             "standards": standards,
             "slide_w": slide_w,
@@ -174,7 +176,9 @@ class RuleBasedPlanner:
             if category == Category.REVIEW_ONLY:
                 skip(self._review_reason(info, standards))
                 continue
-            if info.status == Status.REVIEW and not _is_photo_text(info):
+            if info.status == Status.REVIEW and not (
+                _is_photo_text(info) or info.values.get("confirmed_hierarchy")
+            ):
                 skip("사람의 검토가 필요한 항목")
                 continue
             if info.status == Status.UNMEASURABLE and not _is_photo_text(info):
@@ -260,6 +264,12 @@ class RuleBasedPlanner:
             return Category.DESIGN if profile.resolve_collisions else Category.REVIEW_ONLY
         if info.rule == Rule.DENSITY:
             return Category.REVIEW_ONLY
+        if (
+            info.rule == Rule.HIERARCHY
+            and info.status == Status.WARNING
+            and info.values.get("confirmed_hierarchy")
+        ):
+            return Category.READABILITY
         if info.rule in (Rule.FONT_FAMILY, Rule.HIERARCHY):
             return Category.DESIGN
         if info.rule == Rule.CONTRAST:
@@ -703,15 +713,18 @@ class RuleBasedPlanner:
     def _hierarchy(self, info, shape, standards, category):
         title = info.values.get("title_size_pt")
         body = info.values.get("body_size_pt")
-        if title is None or body is None:
-            return [], "제목·본문 글자 크기 측정값이 없음"
-        ratio = info.values.get("required_ratio", standards.title_body_ratio.value)
-        if ratio is None:
-            return [], "B에 제목/본문 크기 비율 기준이 없음 (C는 기준을 따로 정하지 않음)"
-        target = math.ceil(body * ratio * 2) / 2  # 0.5pt 단위로 올림
+        target = info.values.get("required_pt")
+        if target is None:
+            ratio = info.values.get("required_ratio", standards.title_body_ratio.value)
+            if body is None or ratio is None:
+                return [], "본문 글자 크기 또는 위계 기준을 확인할 수 없음"
+            target = body * ratio
+        target = math.ceil(target * 2) / 2
+        if title is None or title <= 0:
+            return [], "제목 글자 크기 측정값이 없음"
         if title >= target:
-            return [], f"제목 {title}pt가 이미 본문의 {ratio}배({target}pt) 이상"
-        note = f"제목 크기 {title}pt → {target}pt (본문 {body}pt의 {ratio}배, 시각적 위계)"
+            return [], f"제목 {title}pt가 이미 수정 목표({target}pt) 이상"
+        note = f"제목 크기 {title}pt → {target}pt (시각적 위계)"
         cost = _ratio_cost(title, target)
         return [self._proposal(info, shape, Property.FONT_SIZE, title, target, cost, category, note)], ""
 

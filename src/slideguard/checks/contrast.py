@@ -8,13 +8,7 @@
 """
 
 from slideguard.domain.models import Color, DeckSnapshot, Finding, Severity, Shape, TextRun
-from slideguard.domain.policy import (
-    CONTRAST_LARGE,
-    CONTRAST_NORMAL,
-    LARGE_BOLD_TEXT_PT,
-    LARGE_TEXT_PT,
-    AnalysisPolicy,
-)
+from slideguard.domain.policy import LARGE_BOLD_TEXT_PT, LARGE_TEXT_PT, AnalysisPolicy
 
 from .scope import target_shapes
 
@@ -63,7 +57,7 @@ class ContrastRule:
         for shape in target_shapes(deck, policy):
             if not _has_text(shape):
                 continue
-            for number, result in enumerate(_evaluate_shape(shape), start=1):
+            for number, result in enumerate(_evaluate_shape(shape, policy), start=1):
                 severity, message, measured, expected, evidence = result
                 findings.append(
                     Finding(
@@ -89,7 +83,7 @@ def _unknown(message: str, evidence: str) -> _Result:
     return ("unknown", message, None, None, evidence)
 
 
-def _evaluate_shape(shape: Shape) -> list[_Result]:
+def _evaluate_shape(shape: Shape, policy: AnalysisPolicy) -> list[_Result]:
     if not shape.supported:
         reason = "; ".join(shape.notes) or "지원하지 않는 객체 유형"
         return [_unknown("이 객체는 명암비를 판정할 수 없습니다", reason)]
@@ -99,7 +93,7 @@ def _evaluate_shape(shape: Shape) -> list[_Result]:
     if shape.background is None:
         samples = _sample_colors(shape)
         if samples:
-            return _evaluate_with_samples(runs, samples)
+            return _evaluate_with_samples(runs, samples, policy)
         reason = _background_reason(shape)
         return [
             _unknown(
@@ -116,7 +110,7 @@ def _evaluate_shape(shape: Shape) -> list[_Result]:
         if key in seen:
             continue
         seen.add(key)
-        result = _judge_run(run, shape.background)
+        result = _judge_run(run, shape.background, policy)
         if result is not None:
             results.append(result)
     return results
@@ -146,7 +140,9 @@ def _sample_colors(shape: Shape) -> list[Color]:
     return colors if len(colors) >= MIN_BACKGROUND_SAMPLES else []
 
 
-def _evaluate_with_samples(runs: list[TextRun], samples: list[Color]) -> list[_Result]:
+def _evaluate_with_samples(
+    runs: list[TextRun], samples: list[Color], policy: AnalysisPolicy
+) -> list[_Result]:
     results: list[_Result] = []
     seen: set[tuple] = set()
     for run in runs:
@@ -166,7 +162,7 @@ def _evaluate_with_samples(runs: list[TextRun], samples: list[Color]) -> list[_R
         worst = contrast_ratio(run.color, worst_color)
         large = large_text_state(run.font_size_pt, run.bold)
         # 글자 유형을 모르면 더 엄격한 일반 기준 (근사 판정이라 보수적으로)
-        expected = CONTRAST_LARGE if large else CONTRAST_NORMAL
+        expected = policy.large_contrast if large else policy.normal_contrast
         if worst >= expected:
             continue
         kind = "대형" if large else "일반"
@@ -184,25 +180,31 @@ def _evaluate_with_samples(runs: list[TextRun], samples: list[Color]) -> list[_R
     return results
 
 
-def _judge_run(run: TextRun, background: Color) -> _Result | None:
+def _judge_run(run: TextRun, background: Color, policy: AnalysisPolicy) -> _Result | None:
     if run.color is None:
         return _unknown(
             "글자 색을 알 수 없어 명암비를 판정할 수 없습니다", "글자 색이 지정되지 않음(테마 상속 등)"
         )
 
     ratio = contrast_ratio(run.color, background)
-    if ratio >= CONTRAST_NORMAL:
+    normal, large_threshold = policy.normal_contrast, policy.large_contrast
+    basis = (
+        "사용자 기준"
+        if policy.thresholds.contrast_normal is not None or policy.thresholds.contrast_large is not None
+        else "WCAG 2.2 AA"
+    )
+    if ratio >= normal:
         return None  # 일반·대형 어느 기준으로도 통과
 
     large = large_text_state(run.font_size_pt, run.bold)
     colors = f"글자 {hex_color(run.color)} / 배경 {hex_color(background)}"
 
-    if ratio >= CONTRAST_LARGE and large is None:
+    if ratio >= large_threshold and large is None:
         return _unknown(
             "글자 크기·굵기를 알 수 없어 일반/대형 기준을 정할 수 없습니다",
-            f"{colors} → {ratio:.2f}:1 (일반 {CONTRAST_NORMAL}:1 미만, 대형 {CONTRAST_LARGE}:1 이상)",
+            f"{colors} → {ratio:.2f}:1 (일반 {normal}:1 미만, 대형 {large_threshold}:1 이상)",
         )
-    if ratio >= CONTRAST_LARGE and large:
+    if ratio >= large_threshold and large:
         return None  # 대형 텍스트 기준 통과
 
     if large is None:
@@ -212,17 +214,17 @@ def _judge_run(run: TextRun, background: Color) -> _Result | None:
             "warning",
             f"글자와 배경의 명암비가 부족합니다 ({ratio:.2f}:1)",
             round(ratio, 2),
-            CONTRAST_NORMAL,
+            normal,
             f"{colors} → {ratio:.2f}:1 (글자 유형 미확정: 크기·굵기를 알 수 없음) "
-            f"< 일반 {CONTRAST_NORMAL}:1, 대형 {CONTRAST_LARGE}:1 — 두 기준 모두 미달 (WCAG 2.2 AA)",
+            f"< 일반 {normal}:1, 대형 {large_threshold}:1 — 두 기준 모두 미달 ({basis})",
         )
 
-    expected = CONTRAST_NORMAL if large is False else CONTRAST_LARGE
+    expected = normal if large is False else large_threshold
     kind = "일반" if large is False else "대형"
     return (
         "warning",
         f"글자와 배경의 명암비가 부족합니다 ({ratio:.2f}:1)",
         round(ratio, 2),
         expected,
-        f"{colors} → {ratio:.2f}:1 < {expected}:1 ({kind} 텍스트, WCAG 2.2 AA)",
+        f"{colors} → {ratio:.2f}:1 < {expected}:1 ({kind} 텍스트, {basis})",
     )

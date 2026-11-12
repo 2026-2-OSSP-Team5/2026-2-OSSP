@@ -1,4 +1,6 @@
-from dataclasses import dataclass
+import json
+import math
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 
 
@@ -31,9 +33,9 @@ SAFE_MARGIN_RATIO = 0.05
 TITLE_BODY_RATIO = 1.25
 
 # 제목·본문 자리 표시자 구분값은 PowerPoint PpPlaceholderType을 따른다.
-# 1 제목 / 3 가운데 제목 / 5 세로 제목, 2 본문 / 6 세로 본문.
+# 1 제목 / 3 가운데 제목 / 5 세로 제목, 2 본문 / 6 세로 본문 / 7 콘텐츠.
 TITLE_PLACEHOLDERS = frozenset({1, 3, 5})
-BODY_PLACEHOLDERS = frozenset({2, 6})
+BODY_PLACEHOLDERS = frozenset({2, 6, 7})
 
 
 @dataclass(frozen=True)
@@ -83,12 +85,37 @@ def density_threshold(purpose: Purpose) -> DensityThreshold:
 
 
 @dataclass(frozen=True)
+class ThresholdOverrides:
+    minimum_font: float | None = None
+    recommended_font: float | None = None
+    max_chars: int | None = None
+    max_lines: int | None = None
+    contrast_normal: float | None = None
+    contrast_large: float | None = None
+    margin_percent: float | None = None
+
+    def __post_init__(self):
+        for value in (self.minimum_font, self.recommended_font):
+            if value is not None and (not math.isfinite(value) or not 0 < value <= 400):
+                raise ValueError("글자 크기는 0보다 크고 400pt 이하여야 합니다.")
+        for value in (self.max_chars, self.max_lines):
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError("글자 수와 줄 수는 양의 정수여야 합니다.")
+        for value in (self.contrast_normal, self.contrast_large):
+            if value is not None and (not math.isfinite(value) or not 1 <= value <= 21):
+                raise ValueError("명암비는 1~21 사이여야 합니다.")
+        if self.margin_percent is not None and not 0 <= self.margin_percent < 50:
+            raise ValueError("안전 여백은 0% 이상 50% 미만이어야 합니다.")
+
+
+@dataclass(frozen=True)
 class AnalysisPolicy:
     purpose: Purpose = Purpose.PRESENTATION
     strength: Strength = Strength.STANDARD
     slides: tuple[int, ...] = ()
     locked_properties: frozenset[str] = frozenset()
     locked_shapes: frozenset[str] = frozenset()
+    thresholds: ThresholdOverrides = field(default_factory=ThresholdOverrides)
 
     def __post_init__(self):
         if not isinstance(self.purpose, Purpose) or not isinstance(self.strength, Strength):
@@ -97,6 +124,56 @@ class AnalysisPolicy:
             raise ValueError("Unknown locked property")
         if any(type(n) is not int or n < 1 for n in self.slides):
             raise ValueError("Slide numbers must be positive integers")
+
+        if self.font_limits.minimum_pt > self.font_limits.recommended_pt:
+            raise ValueError("최소 글자 크기는 권장 크기 이하여야 합니다.")
+        if self.large_contrast > self.normal_contrast:
+            raise ValueError("대형 글자 명암비는 일반 글자 명암비 이하여야 합니다.")
+
+    @property
+    def font_limits(self) -> FontSizeThreshold:
+        defaults = font_size_threshold(self.purpose)
+        return FontSizeThreshold(
+            self.thresholds.recommended_font or defaults.recommended_pt,
+            self.thresholds.minimum_font or defaults.minimum_pt,
+        )
+
+    @property
+    def density_limits(self) -> DensityThreshold:
+        defaults = density_threshold(self.purpose)
+        return DensityThreshold(
+            self.thresholds.max_chars or defaults.max_chars,
+            self.thresholds.max_lines or defaults.max_lines,
+        )
+
+    @property
+    def normal_contrast(self) -> float:
+        return self.thresholds.contrast_normal or CONTRAST_NORMAL
+
+    @property
+    def large_contrast(self) -> float:
+        return self.thresholds.contrast_large or CONTRAST_LARGE
+
+    @property
+    def margin_ratio(self) -> float:
+        percent = self.thresholds.margin_percent
+        return SAFE_MARGIN_RATIO if percent is None else percent / 100
+
+    @property
+    def cache_key(self) -> str:
+        return json.dumps(
+            {
+                "revision": 1,
+                "purpose": self.purpose,
+                "strength": self.strength,
+                "slides": sorted(set(self.slides)),
+                "locked_properties": sorted(self.locked_properties),
+                "locked_shapes": sorted(self.locked_shapes),
+                "thresholds": asdict(self.thresholds),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def allows_change(self, shape_key: str, property_name: str) -> bool:
         slide_number = int(shape_key.split(":")[0])

@@ -4,13 +4,7 @@ from collections import defaultdict
 from itertools import combinations
 
 from slideguard.domain.models import Box, DeckSnapshot, Finding, Severity, Shape
-from slideguard.domain.policy import (
-    GEOMETRY_TOLERANCE_PT,
-    SAFE_MARGIN_RATIO,
-    AnalysisPolicy,
-    Purpose,
-    density_threshold,
-)
+from slideguard.domain.policy import GEOMETRY_TOLERANCE_PT, AnalysisPolicy, DensityThreshold
 
 from .scope import target_shapes
 
@@ -30,7 +24,7 @@ class LayoutRule:
         shapes = target_shapes(deck, policy)
         findings: list[Finding] = []
         for shape in shapes:
-            findings.extend(_check_margin(deck, shape))
+            findings.extend(_check_margin(deck, shape, policy.margin_ratio))
             findings.extend(_check_overflow(shape))
 
         by_slide: dict[int, list[Shape]] = defaultdict(list)
@@ -39,7 +33,7 @@ class LayoutRule:
         for slide_number in sorted(by_slide):
             slide_shapes = sorted(by_slide[slide_number], key=lambda s: s.shape_id)
             findings.extend(_check_overlap(slide_shapes))
-            findings.extend(_check_density(slide_number, slide_shapes, policy.purpose))
+            findings.extend(_check_density(slide_number, slide_shapes, policy.density_limits))
         return findings
 
 
@@ -91,14 +85,14 @@ def _geometry_unknown(rule_id: str, shape: Shape, label: str) -> Finding:
 
 
 # --- 안전 여백 -----------------------------------------------------------------
-def _check_margin(deck: DeckSnapshot, shape: Shape) -> list[Finding]:
+def _check_margin(deck: DeckSnapshot, shape: Shape, margin_ratio: float) -> list[Finding]:
     if not _has_text(shape):
         return []
     box = _effective_box(shape)
     if box is None:
         return [_geometry_unknown("layout.margin", shape, "좌표를 확인할 수 없어 안전 여백")]
-    margin_x = deck.width_pt * SAFE_MARGIN_RATIO
-    margin_y = deck.height_pt * SAFE_MARGIN_RATIO
+    margin_x = deck.width_pt * margin_ratio
+    margin_y = deck.height_pt * margin_ratio
     sides = (
         ("왼쪽", box.x, margin_x),
         ("오른쪽", deck.width_pt - (box.x + box.width), margin_x),
@@ -119,7 +113,7 @@ def _check_margin(deck: DeckSnapshot, shape: Shape) -> list[Finding]:
         worst_name, worst_dist, worst_need = min(outside, key=lambda v: v[1])
     else:
         severity = "review"
-        message = "텍스트가 안전 여백(5%) 안쪽에 있지 않습니다"
+        message = f"텍스트가 안전 여백({margin_ratio:.0%}) 안쪽에 있지 않습니다"
         worst_name, worst_dist, worst_need = min(violations, key=lambda v: v[1] - v[2])
     return [
         _finding(
@@ -272,11 +266,10 @@ def _line_count(shape: Shape) -> tuple[int, bool]:
     return source, False
 
 
-def _check_density(slide_number: int, shapes: list[Shape], purpose: Purpose) -> list[Finding]:
+def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThreshold) -> list[Finding]:
     text_shapes = [s for s in shapes if _has_text(s)]
     if not text_shapes:
         return []
-    limits = density_threshold(purpose)
     chars_by_shape = {s.key: len("".join(_text_of(s).split())) for s in text_shapes}
     total_chars = sum(chars_by_shape.values())
     counts = [_line_count(s) for s in text_shapes]

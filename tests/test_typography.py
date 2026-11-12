@@ -187,13 +187,25 @@ def test_title_larger_but_below_ratio_is_review():
     assert findings[0].expected == 25.0
 
 
-def test_required_size_rounds_up_to_half_point():
-    # 18 * 1.25 = 22.5 — 0.5pt 단위라 그대로 쓴다.
-    findings = hierarchy_findings(run_rule(title(20), body(18)))
-    assert findings[0].expected == 22.5
-    # 19 * 1.25 = 23.75 → 24.0으로 올린다.
+def test_fractional_threshold_is_not_rounded_for_judgment():
     findings = hierarchy_findings(run_rule(title(20), body(19)))
-    assert findings[0].expected == 24.0
+    assert findings[0].expected == 23.75
+    assert hierarchy_findings(run_rule(title(26.25), body(21))) == []
+
+
+def test_content_placeholder_counts_as_body():
+    findings = hierarchy_findings(run_rule(title(20), body(20, kind=7)))
+    assert findings[0].expected == 25
+
+
+def test_plain_text_boxes_have_a_review_when_the_top_box_is_a_plausible_heading():
+    from dataclasses import replace
+
+    heading = replace(make_shape([TextRun("제목", 18)], shape_id=1), shape_type=17, box=Box(20, 20, 200, 40))
+    content = replace(make_shape([TextRun("본문", 20)], shape_id=2), shape_type=17, box=Box(20, 110, 400, 60))
+    findings = hierarchy_findings(run_rule(heading, content))
+    assert [finding.severity for finding in findings] == ["review"]
+    assert findings[0].rule_id == "typography.hierarchy.inferred"
 
 
 def test_center_title_placeholder_counts_as_title():

@@ -3,6 +3,7 @@ import math
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +54,7 @@ class SnapshotCollector:
         *,
         successful_hashes: SuccessfulAnalysisHashes | None = None,
         on_failure: CollectionFailureCallback | None = None,
+        on_collecting: Callable[[Path], None] | None = None,
         max_attempts: int = 3,
         retry_delay_seconds: float = 0.2,
     ):
@@ -65,6 +67,7 @@ class SnapshotCollector:
         self._on_snapshot = on_snapshot
         self._successful_hashes = successful_hashes
         self._on_failure = on_failure
+        self._on_collecting = on_collecting
         self._max_attempts = max_attempts
         self._retry_delay_seconds = retry_delay_seconds
         self._condition = threading.Condition()
@@ -259,6 +262,8 @@ class SnapshotCollector:
             stage = "read"
             if not self._current(job):
                 return
+            if self._on_collecting is not None:
+                self._on_collecting(job.path)
             deck = self._reader.read(job.path)
             if not self._current(job):
                 return

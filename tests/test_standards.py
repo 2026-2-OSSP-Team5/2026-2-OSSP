@@ -26,7 +26,7 @@ def test_every_criterion_matches_b_policy(purpose):
 def test_criteria_missing_in_b_are_not_invented():
     s = build_standards(Purpose.PRESENTATION)
     assert s.min_line_spacing.value is None
-    assert s.title_body_ratio.value is None
+    assert s.title_body_ratio.value == 1.25
 
 
 def test_every_basis_names_b_as_source():

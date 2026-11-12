@@ -263,7 +263,8 @@ class TeamBindings:
         rule_id = str(finding.rule_id)
         key = str(finding.shape_key)
         status = self.STATUS_NAMES.get(_enum_text(finding.severity), Status.UNKNOWN)
-        rule = self._team_rule(rule_id, status)
+        finding_id = str(getattr(finding, "id", ""))
+        rule = Rule.HIERARCHY if finding_id.endswith(":hierarchy") else self._team_rule(rule_id, status)
 
         address = parse_shape_key(key)
         if address is None:
@@ -288,6 +289,12 @@ class TeamBindings:
                 values["required_ratio"] = expected
             if shape is not None:
                 values.update(self._contrast_colors(shape, measured))
+        elif rule == Rule.HIERARCHY:
+            values["confirmed_hierarchy"] = rule_id == "typography"
+            if measured is not None:
+                values["title_size_pt"] = measured
+            if expected is not None:
+                values["required_pt"] = expected
         elif rule == Rule.FONT_SIZE:
             # B: measured = 글자 크기, expected = 기준 크기
             if measured is not None:
