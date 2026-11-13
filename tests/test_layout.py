@@ -235,16 +235,16 @@ def test_shapes_on_different_slides_are_not_compared():
 
 # --- 정보 밀도 ---------------------------------------------------------------
 def test_too_many_characters_is_review():
-    findings = only(run_rule(make_shape(text="가" * 301)), "layout.density")
+    findings = only(run_rule(make_shape(text="가" * 101)), "layout.density")
     assert len(findings) == 1
     assert findings[0].severity == "review"
-    assert findings[0].measured == 301
-    assert findings[0].expected == 300
+    assert findings[0].measured == 101
+    assert findings[0].expected == 100
 
 
 def test_character_count_at_limit_is_ok_and_whitespace_ignored():
-    text = ("가 " * 150).strip()  # 150자 + 공백
-    assert only(run_rule(make_shape(text=text + "나" * 150)), "layout.density") == []
+    text = ("가 " * 50).strip()  # 50자 + 공백
+    assert only(run_rule(make_shape(text=text + "나" * 50)), "layout.density") == []
 
 
 def test_too_many_lines_is_review():
@@ -274,18 +274,19 @@ def test_density_sums_all_shapes_on_the_slide():
 
 
 def test_density_is_counted_per_slide():
-    a = make_shape(text="가" * 200, slide_number=1)
-    b = make_shape(text="나" * 200, slide_number=2)
+    a = make_shape(text="가" * 60, slide_number=1)
+    b = make_shape(text="나" * 60, slide_number=2)
     assert only(run_rule(a, b), "layout.density") == []
 
 
 @pytest.mark.parametrize(
     ("purpose", "chars", "expected"),
     [
-        (Purpose.PRESENTATION, 350, 1),
-        (Purpose.LECTURE, 350, 0),
-        (Purpose.REPORT, 700, 0),
-        (Purpose.REPORT, 900, 1),
+        (Purpose.PRESENTATION, 110, 1),
+        (Purpose.LECTURE, 110, 0),
+        (Purpose.LECTURE, 160, 1),
+        (Purpose.REPORT, 250, 0),
+        (Purpose.REPORT, 310, 1),
     ],
 )
 def test_density_threshold_depends_on_purpose(purpose, chars, expected):
