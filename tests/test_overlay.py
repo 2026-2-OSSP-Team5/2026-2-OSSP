@@ -808,18 +808,14 @@ def test_copy_save_uses_selection_snapshot_from_button_click(application, tmp_pa
 
         def choose_output(*_args):
             controller.overlay.clear_proposals()
-            controller.overlay.proposal_items[report.proposals[2].id].setCheckState(
-                Qt.CheckState.Checked
-            )
+            controller.overlay.proposal_items[report.proposals[2].id].setCheckState(Qt.CheckState.Checked)
             return str(tmp_path / "saved.pptx"), ""
 
         monkeypatch.setattr(overlay.QFileDialog, "getSaveFileName", choose_output)
         monkeypatch.setattr(
             controller,
             "apply_to_output",
-            lambda output, *, report, proposal_ids: captured.append(
-                (output, report, proposal_ids)
-            ),
+            lambda output, *, report, proposal_ids: captured.append((output, report, proposal_ids)),
         )
 
         controller.apply_selected()

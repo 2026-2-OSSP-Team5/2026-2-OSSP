@@ -249,7 +249,9 @@ class LivePreviewWorker(QObject):
             if original is None:
                 original = self.preview_renderer(source, (self.slide_number,)).get(self.slide_number)
             if original is None:
-                raise RuntimeError("원본 슬라이드를 렌더링하지 못했습니다. PowerPoint에서 파일을 확인한 뒤 다시 시도해 주세요.")
+                raise RuntimeError(
+                    "원본 슬라이드를 렌더링하지 못했습니다. PowerPoint에서 파일을 확인한 뒤 다시 시도해 주세요."
+                )
 
             selected = [item for item in self.report.proposals if item.id in set(self.proposal_ids)]
             on_slide = [item for item in selected if _slide_number(item.shape_key) == self.slide_number]
@@ -284,9 +286,7 @@ class LivePreviewWorker(QObject):
                 )
             )
         except Exception as error:
-            self.finished.emit(
-                LivePreviewOutcome(**base, error=f"{type(error).__name__}: {error}")
-            )
+            self.finished.emit(LivePreviewOutcome(**base, error=f"{type(error).__name__}: {error}"))
 
 
 class PowerPointTracker:
@@ -870,9 +870,7 @@ class OverlayWidget(QWidget):
         self.apply_all_button.setEnabled(False)
         direct_actions.addWidget(self.apply_all_button)
         proposal_layout.addLayout(direct_actions)
-        self.apply_original_button = QPushButton(
-            "선택한 제안을 원본에 적용 (0)", objectName="primary"
-        )
+        self.apply_original_button = QPushButton("선택한 제안을 원본에 적용 (0)", objectName="primary")
         self.apply_original_button.setEnabled(False)
         self.apply_original_button.clicked.connect(self.apply_original_requested)
         proposal_layout.addWidget(self.apply_original_button)
@@ -1317,9 +1315,7 @@ class OverlayWidget(QWidget):
     def _update_apply_button(self):
         count = len(self.selected_proposal_ids())
         self.selected_count_label.setText(f"전체 선택 {count}건")
-        self.apply_button.setText(
-            "저장 중…" if self._apply_busy else f"선택한 제안을 사본에 저장 ({count})"
-        )
+        self.apply_button.setText("저장 중…" if self._apply_busy else f"선택한 제안을 사본에 저장 ({count})")
         ready = self._report is not None and not (
             self._analysis_busy or self._apply_busy or self._report_stale
         )

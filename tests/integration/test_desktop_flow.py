@@ -178,9 +178,11 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
         widget.proposals_list.setCurrentItem(widget.proposal_items[proposal.id])
         widget.apply_one_button.click()
         wait_for(
-            lambda: controller._last_copy_outcome is not None
-            and controller._last_copy_outcome.output_path == first_copy
-            and controller._apply_thread is None,
+            lambda: (
+                controller._last_copy_outcome is not None
+                and controller._last_copy_outcome.output_path == first_copy
+                and controller._apply_thread is None
+            ),
             "single proposal copy with reinspection",
         )
         one = controller._last_copy_outcome
@@ -190,9 +192,11 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
 
         widget.apply_all_button.click()
         wait_for(
-            lambda: controller._last_copy_outcome is not None
-            and controller._last_copy_outcome.output_path == all_copy
-            and controller._apply_thread is None,
+            lambda: (
+                controller._last_copy_outcome is not None
+                and controller._last_copy_outcome.output_path == all_copy
+                and controller._apply_thread is None
+            ),
             "all proposals copy with reinspection",
         )
         all_result = controller._last_copy_outcome
