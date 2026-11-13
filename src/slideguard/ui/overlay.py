@@ -5,6 +5,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from PySide6.QtCore import QObject, QPoint, QRect, QRectF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap, QRegion
@@ -72,10 +73,15 @@ QTableWidget::item:selected { background: #e7f0ff; color: #1f2937; border: 0; }
 QHeaderView::section { min-height: 28px; padding: 0 6px; border: 0;
                        border-bottom: 1px solid #e1e6ed; background: #f7f8fa;
                        color: #667085; font-weight: 600; }
-QFrame#detail, QFrame#proposal { background: #fbfcfe; border: 1px solid #e3e8ef; border-radius: 5px; }
+QFrame#detail, QFrame#proposal, QFrame#preview { background: #fbfcfe; border: 1px solid #e3e8ef; border-radius: 5px; }
 QLineEdit, QComboBox, QListWidget { min-height: 28px; border: 1px solid #d7dee8;
                                    border-radius: 4px; background: #ffffff; }
 QCheckBox#proposal { spacing: 7px; padding: 3px; }
+QTabWidget::pane { border: 1px solid #d7e3f4; background: #ffffff; }
+QTabBar::tab { min-height: 28px; padding: 0 14px; border: 1px solid #d7dee8;
+               border-bottom: 0; background: #f7f8fa; color: #667085; }
+QTabBar::tab:selected { background: #e7f0ff; color: #2468d8;
+                        border-color: #b9cdf2; font-weight: 700; }
 """
 
 
@@ -157,6 +163,7 @@ class PowerPointWindow:
     title: str
     monitor_rect: tuple[int, int, int, int] | None = None
     screen_rect: QRect | None = None
+    available_rect: QRect | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +191,102 @@ class CopyApplyOutcome:
     preview_error: str | None = None
     reinspection: AnalysisReport | None = None
     reinspection_error: str | None = None
+
+
+@dataclass(frozen=True)
+class LivePreviewOutcome:
+    token: int
+    source_path: Path
+    source_sha256: str
+    proposal_ids: tuple[str, ...]
+    slide_number: int
+    original: bytes | None = None
+    changed: bytes | None = None
+    no_changes: bool = False
+    rejected: tuple[str, ...] = ()
+    error: str | None = None
+
+
+class LivePreviewWorker(QObject):
+    finished = Signal(object)
+
+    def __init__(
+        self,
+        token: int,
+        report: AnalysisReport,
+        proposal_ids: tuple[str, ...],
+        slide_number: int,
+        policy,
+        *,
+        original: bytes | None = None,
+        patcher_builder=build_presentation_patcher,
+        preview_renderer=render_slide_previews,
+    ):
+        super().__init__()
+        self.token = token
+        self.report = report
+        self.proposal_ids = proposal_ids
+        self.slide_number = slide_number
+        self.policy = policy
+        self.original = original
+        self.patcher_builder = patcher_builder
+        self.preview_renderer = preview_renderer
+
+    @Slot()
+    def run(self):
+        source = Path(self.report.deck.source_path)
+        base = dict(
+            token=self.token,
+            source_path=source,
+            source_sha256=self.report.deck.source_sha256,
+            proposal_ids=self.proposal_ids,
+            slide_number=self.slide_number,
+        )
+        try:
+            if _sha256(source) != self.report.deck.source_sha256:
+                raise ValueError("검사 이후 원본이 변경되었습니다. 저장한 뒤 다시 검사해 주세요.")
+            original = self.original
+            if original is None:
+                original = self.preview_renderer(source, (self.slide_number,)).get(self.slide_number)
+            if original is None:
+                raise RuntimeError(
+                    "원본 슬라이드를 렌더링하지 못했습니다. PowerPoint에서 파일을 확인한 뒤 다시 시도해 주세요."
+                )
+
+            selected = [item for item in self.report.proposals if item.id in set(self.proposal_ids)]
+            on_slide = [item for item in selected if _slide_number(item.shape_key) == self.slide_number]
+            if not on_slide:
+                self.finished.emit(
+                    LivePreviewOutcome(**base, original=original, changed=original, no_changes=True)
+                )
+                return
+
+            with TemporaryDirectory(prefix="slideguard-live-preview-") as temporary:
+                output = Path(temporary) / "preview.pptx"
+                patcher = self.patcher_builder()
+                patcher.apply_to_copy(self.report, list(self.proposal_ids), output, self.policy)
+                result = patcher.last_result
+                if result is None or not output.is_file():
+                    raise RuntimeError("미리보기용 사본을 만들지 못했습니다.")
+                changed = self.preview_renderer(output, (self.slide_number,)).get(self.slide_number)
+                if changed is None:
+                    raise RuntimeError("변경 후 슬라이드를 렌더링하지 못했습니다.")
+                bindings = TeamBindings()
+                rejected = tuple(
+                    f"{bindings.to_team_proposal(item).id}: {reason}" for item, reason in result.rejected
+                )
+            if _sha256(source) != self.report.deck.source_sha256:
+                raise ValueError("미리보기 생성 중 원본이 변경되었습니다. 다시 검사해 주세요.")
+            self.finished.emit(
+                LivePreviewOutcome(
+                    **base,
+                    original=original,
+                    changed=changed,
+                    rejected=rejected,
+                )
+            )
+        except Exception as error:
+            self.finished.emit(LivePreviewOutcome(**base, error=f"{type(error).__name__}: {error}"))
 
 
 class PowerPointTracker:
@@ -219,6 +322,7 @@ class PowerPointTracker:
         monitor = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
         monitor_info = win32api.GetMonitorInfo(monitor)
         qt_rect = _qt_screen_rect(monitor_info["Device"], monitor_info["Monitor"])
+        available_rect = _to_qt_rect(monitor_info["Work"], monitor_info["Monitor"], qt_rect)
         rect = _to_qt_rect((left, top, right, bottom), monitor_info["Monitor"], qt_rect)
         return PowerPointWindow(
             hwnd=hwnd,
@@ -226,6 +330,7 @@ class PowerPointTracker:
             title=win32gui.GetWindowText(hwnd),
             monitor_rect=monitor_info["Monitor"],
             screen_rect=qt_rect,
+            available_rect=available_rect,
         )
 
     @staticmethod
@@ -330,16 +435,6 @@ class CopyApplyWorker(QObject):
                 slide = _slide_number(proposal.shape_key)
                 slide_changes.setdefault(slide, []).append(proposal)
 
-            slides = tuple(sorted(slide_changes))
-            original_previews: dict[int, bytes] = {}
-            copy_previews: dict[int, bytes] = {}
-            preview_error = None
-            try:
-                original_previews = self.preview_renderer(source, slides)
-                copy_previews = self.preview_renderer(self.output_path, slides)
-            except Exception as error:
-                preview_error = f"{type(error).__name__}: {error}"
-
             reinspection = None
             reinspection_error = None
             try:
@@ -355,9 +450,6 @@ class CopyApplyWorker(QObject):
                     rejected=rejected,
                     warnings=tuple(result.warnings),
                     slide_changes={slide: tuple(proposals) for slide, proposals in slide_changes.items()},
-                    original_previews=original_previews,
-                    copy_previews=copy_previews,
-                    preview_error=preview_error,
                     reinspection=reinspection,
                     reinspection_error=reinspection_error,
                 )
@@ -537,6 +629,78 @@ class ApplyResultDialog(QDialog):
             QMessageBox.warning(self, "사본 열기 실패", str(error))
 
 
+class PreviewImageLabel(QLabel):
+    """Keep the complete slide visible as the preview panel changes size."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._source_pixmap = QPixmap()
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setWordWrap(True)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+
+    def set_preview(self, payload: bytes | None):
+        source = QPixmap()
+        if not payload or not source.loadFromData(payload, "PNG"):
+            self.clear_preview("미리보기 이미지를 읽지 못했습니다.")
+            return
+        self.set_source_pixmap(source)
+
+    def set_source_pixmap(self, source: QPixmap):
+        self._source_pixmap = QPixmap(source)
+        self.setText("")
+        self._fit_preview()
+
+    def clear_preview(self, message: str):
+        self._source_pixmap = QPixmap()
+        self.setPixmap(QPixmap())
+        self.setText(message)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_preview()
+
+    def _fit_preview(self):
+        if self._source_pixmap.isNull():
+            return
+        available = self.contentsRect().size()
+        if available.width() <= 0 or available.height() <= 0:
+            return
+        self.setPixmap(
+            self._source_pixmap.scaled(
+                available,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+
+class PreviewCompareDialog(QDialog):
+    def __init__(self, slide_number: int, before: bytes, after: bytes, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"SlideGuard 크게 비교 · {slide_number}번 슬라이드")
+        self.resize(1180, 620)
+        self.setStyleSheet(OVERLAY_STYLE)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"{slide_number}번 슬라이드", objectName="title"))
+        images = QHBoxLayout()
+        for title, payload in (("적용 전", before), ("적용 후", after)):
+            column = QVBoxLayout()
+            column.addWidget(QLabel(title, objectName="title"))
+            image = PreviewImageLabel()
+            image.setMinimumSize(500, 360)
+            _set_preview_image(image, payload)
+            column.addWidget(image, 1)
+            images.addLayout(column, 1)
+        layout.addLayout(images, 1)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        close = QPushButton("닫기")
+        close.clicked.connect(self.accept)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+
+
 class OverlayWidget(QWidget):
     manual_requested = Signal()
     settings_requested = Signal()
@@ -546,6 +710,7 @@ class OverlayWidget(QWidget):
     workspace_requested = Signal()
     locate_requested = Signal(object)
     lock_requested = Signal(str)
+    preview_state_changed = Signal()
 
     def __init__(self):
         super().__init__()
@@ -553,6 +718,7 @@ class OverlayWidget(QWidget):
         self.setWindowFlags(
             Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setStyleSheet(OVERLAY_STYLE)
         self.collapsed = True
         self._target: PowerPointWindow | None = None
@@ -565,6 +731,10 @@ class OverlayWidget(QWidget):
         self._apply_busy = False
         self._report_stale = False
         self._finding: Finding | None = None
+        self._preview_before: bytes | None = None
+        self._preview_after: bytes | None = None
+        self._preview_slide: int | None = None
+        self._compare_dialog: PreviewCompareDialog | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -700,13 +870,97 @@ class OverlayWidget(QWidget):
         self.apply_all_button.setEnabled(False)
         direct_actions.addWidget(self.apply_all_button)
         proposal_layout.addLayout(direct_actions)
-        self.apply_original_button = QPushButton("원본에 적용 (백업 후 저장) (0)")
+        self.apply_original_button = QPushButton("선택한 제안을 원본에 적용 (0)", objectName="primary")
         self.apply_original_button.setEnabled(False)
         self.apply_original_button.clicked.connect(self.apply_original_requested)
         proposal_layout.addWidget(self.apply_original_button)
         body.addWidget(proposal, 4)
+
+        preview = QFrame(objectName="preview")
+        preview_layout = QVBoxLayout(preview)
+        preview_header = QHBoxLayout()
+        self.preview_title = QLabel("미리보기", objectName="title")
+        preview_header.addWidget(self.preview_title, 1)
+        self.large_compare_button = QPushButton("크게 비교")
+        self.large_compare_button.setEnabled(False)
+        self.large_compare_button.clicked.connect(self._show_large_compare)
+        preview_header.addWidget(self.large_compare_button)
+        preview_layout.addLayout(preview_header)
+        self.preview_tabs = QTabWidget()
+        self.preview_before_image = self._preview_page("적용 전")
+        self.preview_after_image = self._preview_page("적용 후")
+        preview_layout.addWidget(self.preview_tabs, 1)
+        self.preview_status = QLabel("검사 결과를 선택해 주세요.", objectName="muted")
+        self.preview_status.setWordWrap(True)
+        preview_layout.addWidget(self.preview_status)
+        body.addWidget(preview, 4)
         layout.addLayout(body, 1)
+
+        footer = QHBoxLayout()
+        self.apply_actions_layout = footer
+        self.selected_count_label = QLabel("전체 선택 0건", objectName="status")
+        footer.addWidget(self.selected_count_label)
+        footer.addStretch()
+        proposal_layout.removeWidget(self.apply_button)
+        proposal_layout.removeWidget(self.apply_original_button)
+        self.apply_button.setText("선택한 제안을 사본에 저장")
+        footer.addWidget(self.apply_button)
+        footer.addWidget(self.apply_original_button)
+        layout.addLayout(footer)
         return panel
+
+    def _preview_page(self, title: str) -> PreviewImageLabel:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        image = PreviewImageLabel("미리보기를 준비하고 있습니다.")
+        image.setObjectName("muted")
+        image.setMinimumSize(210, 135)
+        page_layout.addWidget(image, 1)
+        self.preview_tabs.addTab(page, title)
+        return image
+
+    def _show_large_compare(self):
+        if self._preview_slide is None or not self._preview_before or not self._preview_after:
+            return
+        self._compare_dialog = PreviewCompareDialog(
+            self._preview_slide, self._preview_before, self._preview_after, self
+        )
+        self._compare_dialog.finished.connect(lambda: setattr(self, "_compare_dialog", None))
+        self._compare_dialog.show()
+        self._compare_dialog.raise_()
+        self._compare_dialog.activateWindow()
+
+    def current_preview_slide(self) -> int | None:
+        if self._finding is None:
+            return None
+        return _slide_number(self._finding.shape_key)
+
+    def show_preview_loading(self, slide_number: int):
+        self._preview_slide = slide_number
+        self.preview_title.setText(f"{slide_number}번 슬라이드 미리보기")
+        self.preview_status.setText("갱신 중…")
+        self.large_compare_button.setEnabled(False)
+
+    def show_preview(self, slide_number: int, before: bytes, after: bytes, *, message: str = ""):
+        self._preview_slide = slide_number
+        self._preview_before = before
+        self._preview_after = after
+        self.preview_title.setText(f"{slide_number}번 슬라이드 미리보기")
+        _set_preview_image(self.preview_before_image, before)
+        _set_preview_image(self.preview_after_image, after)
+        self.preview_status.setText(message or "선택한 변경을 반영했습니다.")
+        self.large_compare_button.setEnabled(True)
+
+    def show_preview_message(self, message: str, slide_number: int | None = None):
+        self._preview_slide = slide_number
+        self._preview_before = self._preview_after = None
+        self.preview_title.setText(
+            f"{slide_number}번 슬라이드 미리보기" if slide_number is not None else "미리보기"
+        )
+        for image in (self.preview_before_image, self.preview_after_image):
+            image.clear_preview(message)
+        self.preview_status.setText(message)
+        self.large_compare_button.setEnabled(False)
 
     def set_collapsed(self, collapsed: bool):
         was_visible = self.isVisible()
@@ -715,6 +969,7 @@ class OverlayWidget(QWidget):
             # backing-store strip on Windows, which looks like a second overlay.
             self.hide()
         self.collapsed = collapsed
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, collapsed)
         self.stack.setCurrentWidget(self.collapsed_page if collapsed else self.expanded_page)
         self.setMinimumSize(0, 0)
         maximum = SHIELD_SIZE if collapsed else 16777215
@@ -730,6 +985,10 @@ class OverlayWidget(QWidget):
         if was_visible:
             self.show()
             self.update()
+            # Windows publishes the layout-derived native minimum size only
+            # after the window is shown. Recalculate once with that real size
+            # so it cannot shift the overlay above the available screen.
+            QTimer.singleShot(0, self._apply_geometry)
 
     def set_target(self, target: PowerPointWindow | None):
         self._target = target
@@ -781,18 +1040,33 @@ class OverlayWidget(QWidget):
             if self.geometry() != geometry:
                 self.setGeometry(geometry)
         else:
-            width = max(760, target.width() - 20)
-            if self._target.screen_rect is not None:
-                width = min(width, self._target.screen_rect.width())
-            height = max(340, self.expanded_page.minimumSizeHint().height())
-            geometry = QRect(target.left() + 10, target.top() + 32, width, height)
-            current = self.geometry()
-            if (
-                current.left() != geometry.left()
-                or current.top() != geometry.top()
-                or current.width() != geometry.width()
-                or current.height() < geometry.height()
-            ):
+            self.layout().activate()
+            self.expanded_page.layout().activate()
+            available = self._target.available_rect or self._target.screen_rect or target
+            width = min(max(760, target.width() - 20), available.width())
+            minimum_height = max(
+                340,
+                self.minimumSizeHint().height(),
+                self.stack.minimumSizeHint().height(),
+                self.expanded_page.minimumSizeHint().height(),
+                self.sizeHint().height(),
+                self.stack.sizeHint().height(),
+                self.expanded_page.sizeHint().height(),
+            )
+            for widget in (self, self.stack, self.expanded_page):
+                if widget.hasHeightForWidth():
+                    minimum_height = max(minimum_height, widget.heightForWidth(width))
+            height = min(minimum_height, available.height())
+            left = min(
+                max(target.left() + 10, available.left()),
+                available.left() + available.width() - width,
+            )
+            top = min(
+                max(target.top() + 32, available.top()),
+                available.top() + available.height() - height,
+            )
+            geometry = QRect(left, top, width, height)
+            if self.geometry() != geometry:
                 self.setGeometry(geometry)
 
     def show_detected(self, path: Path):
@@ -800,6 +1074,7 @@ class OverlayWidget(QWidget):
         self._report_stale = True
         self.count_badge.hide()
         self.set_analysis_busy(True)
+        self.preview_state_changed.emit()
 
     def show_failure(self, message: str):
         self.status_label.setText("검사 실패")
@@ -815,6 +1090,7 @@ class OverlayWidget(QWidget):
         self.proposal_text.setText(message)
         self.manual_button.setEnabled(not self._apply_busy)
         self._update_apply_button()
+        self.preview_state_changed.emit()
 
     def clear_report(self):
         self._report = self._finding = None
@@ -832,11 +1108,14 @@ class OverlayWidget(QWidget):
         self.detail_evidence.clear()
         self.location_label.clear()
         self.proposal_text.clear()
+        self.show_preview_message("검사 결과를 선택해 주세요.")
         self.set_analysis_busy(False)
+        self.preview_state_changed.emit()
 
     def show_report(self, report: AnalysisReport, skip_reasons: dict[str, str] | None = None):
         self._report = report
         self._finding = None
+        self.preview_tabs.setCurrentIndex(1)
         self._skip_reasons = dict(skip_reasons or {})
         self._report_stale = False
         self.set_analysis_busy(False)
@@ -904,6 +1183,8 @@ class OverlayWidget(QWidget):
         else:
             self.location_label.setText("위치 보기로 PowerPoint의 해당 슬라이드에 윤곽선을 표시합니다.")
 
+        self.preview_state_changed.emit()
+
     def _populate_proposals(self, report: AnalysisReport):
         self.proposals_list.blockSignals(True)
         self.proposals_list.clear()
@@ -960,6 +1241,7 @@ class OverlayWidget(QWidget):
                 self._syncing_proposals = False
         self._update_apply_button()
         self.proposals_list.viewport().update()
+        self.preview_state_changed.emit()
 
     def select_severity(self, severity: str):
         if self._report is None:
@@ -983,6 +1265,7 @@ class OverlayWidget(QWidget):
         finally:
             self._syncing_proposals = False
         self._update_apply_button()
+        self.preview_state_changed.emit()
 
     def _apply_current_proposal(self):
         current = self.proposals_list.currentItem()
@@ -999,6 +1282,7 @@ class OverlayWidget(QWidget):
         finally:
             self.proposals_list.blockSignals(False)
         self._update_apply_button()
+        self.preview_state_changed.emit()
         self.apply_requested.emit()
 
     def clear_proposals(self):
@@ -1009,6 +1293,7 @@ class OverlayWidget(QWidget):
         finally:
             self._syncing_proposals = False
         self._update_apply_button()
+        self.preview_state_changed.emit()
 
     def selected_proposal_ids(self) -> tuple[str, ...]:
         return tuple(
@@ -1029,12 +1314,13 @@ class OverlayWidget(QWidget):
 
     def _update_apply_button(self):
         count = len(self.selected_proposal_ids())
-        self.apply_button.setText("적용 중…" if self._apply_busy else f"선택한 제안을 사본에 적용 ({count})")
+        self.selected_count_label.setText(f"전체 선택 {count}건")
+        self.apply_button.setText("저장 중…" if self._apply_busy else f"선택한 제안을 사본에 저장 ({count})")
         ready = self._report is not None and not (
             self._analysis_busy or self._apply_busy or self._report_stale
         )
         self.apply_button.setEnabled(ready and count > 0)
-        self.apply_original_button.setText(f"원본에 적용 (백업 후 저장) ({count})")
+        self.apply_original_button.setText(f"선택한 제안을 원본에 적용 ({count})")
         self.apply_original_button.setEnabled(ready and count > 0)
         self.apply_one_button.setEnabled(ready and self.proposals_list.currentItem() is not None)
         self.apply_all_button.setEnabled(ready and bool(self.proposal_items))
@@ -1330,6 +1616,12 @@ class OverlayController(QObject):
         self._apply_thread: QThread | None = None
         self._apply_worker: CopyApplyWorker | OriginalApplyWorker | None = None
         self._result_dialog: ApplyResultDialog | None = None
+        self._last_copy_outcome: CopyApplyOutcome | None = None
+        self._preview_thread: QThread | None = None
+        self._preview_worker: LivePreviewWorker | None = None
+        self._preview_token = 0
+        self._preview_pending = False
+        self._original_preview_cache: dict[tuple[str, str, int], bytes] = {}
 
         self.overlay.manual_requested.connect(self.request_manual)
         self.overlay.settings_requested.connect(lambda: self.show_settings())
@@ -1339,6 +1631,7 @@ class OverlayController(QObject):
         self.overlay.workspace_requested.connect(self.workspace_requested)
         self.overlay.locate_requested.connect(self.locate_finding)
         self.overlay.lock_requested.connect(self.show_settings)
+        self.overlay.preview_state_changed.connect(self.schedule_preview)
         self.settings_dialog.settings_saved.connect(self.restart_collection)
         self.detected.connect(self._on_detected)
         self.completed.connect(self._on_completed)
@@ -1350,6 +1643,10 @@ class OverlayController(QObject):
         self.timer.setInterval(250)
         self.timer.timeout.connect(self.poll_powerpoint)
         self.timer.start()
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(300)
+        self.preview_timer.timeout.connect(self._start_preview)
         self.restart_collection()
 
     def restart_collection(self):
@@ -1407,6 +1704,7 @@ class OverlayController(QObject):
         if self.active_path == path:
             return
         self.active_path = path
+        self._original_preview_cache.clear()
         self._clear_highlight()
         self.overlay.clear_report()
         self._load_current_report()
@@ -1553,8 +1851,134 @@ class OverlayController(QObject):
             if report.policy_key is None or report.policy_key == build_analysis_policy(path).cache_key:
                 self.overlay.show_report(report, skip_reasons)
 
+    def schedule_preview(self):
+        self._preview_token += 1
+        self._preview_pending = False
+        self.preview_timer.stop()
+        report = self.overlay._report
+        slide = self.overlay.current_preview_slide()
+        if report is None or slide is None or self.overlay._report_stale:
+            return
+        source_key = str(Path(report.deck.source_path).resolve())
+        self._original_preview_cache = {
+            key: value
+            for key, value in self._original_preview_cache.items()
+            if key[0] == source_key and key[1] == report.deck.source_sha256
+        }
+        self.overlay.preview_status.setText("미리보기 갱신 대기 중…")
+        self.preview_timer.start()
+
+    def _start_preview(self):
+        report = self.overlay._report
+        slide = self.overlay.current_preview_slide()
+        if report is None or slide is None or self.overlay._report_stale:
+            return
+        if self._preview_thread is not None:
+            self._preview_pending = True
+            return
+
+        proposal_ids = self.overlay.selected_proposal_ids()
+        selected_set = set(proposal_ids)
+        selected = [item for item in report.proposals if item.id in selected_set]
+        conflicts = _selection_conflicts(report, selected)
+        if conflicts:
+            self.overlay.show_preview_message(
+                "상충하는 제안을 함께 적용할 수 없습니다.\n" + "\n".join(conflicts), slide
+            )
+            return
+
+        source = Path(report.deck.source_path)
+        try:
+            if _sha256(source) != report.deck.source_sha256:
+                raise ValueError
+            policy = build_analysis_policy(source)
+            if report.policy_key is not None and report.policy_key != policy.cache_key:
+                self.overlay.show_preview_message(
+                    "검사 설정이 바뀌었습니다. 다시 검사한 뒤 미리보기를 확인해 주세요.", slide
+                )
+                return
+        except (OSError, ValueError):
+            self.overlay.mark_report_stale(
+                "검사 이후 원본이 변경되었습니다. PowerPoint에서 저장한 뒤 다시 검사해 주세요."
+            )
+            self.overlay.show_preview_message(
+                "검사 이후 원본이 변경되었습니다. 저장한 뒤 다시 검사해 주세요.", slide
+            )
+            return
+
+        token = self._preview_token
+        cache_key = (str(source.resolve()), report.deck.source_sha256, slide)
+        self.overlay.show_preview_loading(slide)
+        self._preview_thread = QThread(self)
+        self._preview_worker = LivePreviewWorker(
+            token,
+            report,
+            proposal_ids,
+            slide,
+            policy,
+            original=self._original_preview_cache.get(cache_key),
+            patcher_builder=self.patcher_builder,
+            preview_renderer=self.preview_renderer,
+        )
+        self._preview_worker.moveToThread(self._preview_thread)
+        self._preview_thread.started.connect(self._preview_worker.run)
+        self._preview_worker.finished.connect(self._on_preview_finished)
+        self._preview_worker.finished.connect(self._preview_thread.quit)
+        self._preview_thread.finished.connect(self._preview_worker.deleteLater)
+        self._preview_thread.finished.connect(self._preview_thread_finished)
+        self._preview_thread.start()
+
+    def _on_preview_finished(self, outcome: LivePreviewOutcome):
+        if outcome.original is not None:
+            key = (str(outcome.source_path.resolve()), outcome.source_sha256, outcome.slide_number)
+            self._original_preview_cache[key] = outcome.original
+
+        report = self.overlay._report
+        if (
+            outcome.token != self._preview_token
+            or report is None
+            or report.deck.source_sha256 != outcome.source_sha256
+            or not _same_path(Path(report.deck.source_path), outcome.source_path)
+            or self.overlay.current_preview_slide() != outcome.slide_number
+            or self.overlay.selected_proposal_ids() != outcome.proposal_ids
+        ):
+            return
+        if outcome.error:
+            self.overlay.show_preview_message(
+                "미리보기 갱신에 실패했습니다. PowerPoint에서 원본을 저장·확인한 뒤 다시 시도해 주세요.\n"
+                + outcome.error,
+                outcome.slide_number,
+            )
+            return
+        if outcome.original is None or outcome.changed is None:
+            self.overlay.show_preview_message(
+                "미리보기 이미지를 만들지 못했습니다. 다시 시도해 주세요.", outcome.slide_number
+            )
+            return
+        messages = []
+        if outcome.no_changes:
+            messages.append("이 슬라이드에 선택한 변경 없음")
+        if outcome.rejected:
+            messages.append("적용하지 못한 제안: " + "; ".join(outcome.rejected))
+        self.overlay.show_preview(
+            outcome.slide_number,
+            outcome.original,
+            outcome.changed,
+            message="\n".join(messages),
+        )
+
+    def _preview_thread_finished(self):
+        if self._preview_thread is not None:
+            self._preview_thread.deleteLater()
+        self._preview_thread = None
+        self._preview_worker = None
+        if self._preview_pending:
+            self._preview_pending = False
+            QTimer.singleShot(0, self._start_preview)
+
     def apply_selected(self):
-        report = self._ready_to_apply("사본 적용 불가")
+        proposal_ids = self.overlay.selected_proposal_ids()
+        report = self._ready_to_apply("사본 적용 불가", proposal_ids)
         if report is None:
             return
         source = Path(report.deck.source_path)
@@ -1571,7 +1995,7 @@ class OverlayController(QObject):
         if output.suffix.lower() != ".pptx":
             output = output.with_suffix(".pptx")
         if self.overlay._report is report:
-            self.apply_to_output(output)
+            self.apply_to_output(output, report=report, proposal_ids=proposal_ids)
 
     def apply_selected_to_original(self):
         """선택한 제안을 원본에 적용 (백업을 먼저 만들고 원본에 저장)."""
@@ -1649,10 +2073,13 @@ class OverlayController(QObject):
             except (AttributeError, OSError) as error:
                 QMessageBox.warning(self.overlay, "폴더 열기 실패", str(error))
 
-    def _ready_to_apply(self, blocked_title: str) -> AnalysisReport | None:
+    def _ready_to_apply(
+        self, blocked_title: str, proposal_ids: tuple[str, ...] | None = None
+    ) -> AnalysisReport | None:
         """사본·원본 적용 공통 확인: 선택 충돌, 편집 중인 문서, 저장 여부, 파일 변경."""
         report = self.overlay._report
-        proposal_ids = self.overlay.selected_proposal_ids()
+        if proposal_ids is None:
+            proposal_ids = self.overlay.selected_proposal_ids()
         if report is None or not proposal_ids or self._apply_thread is not None or self.overlay._report_stale:
             return None
         source = Path(report.deck.source_path)
@@ -1700,9 +2127,16 @@ class OverlayController(QObject):
             return None
         return report
 
-    def apply_to_output(self, output: Path):
-        report = self.overlay._report
-        proposal_ids = self.overlay.selected_proposal_ids()
+    def apply_to_output(
+        self,
+        output: Path,
+        *,
+        report: AnalysisReport | None = None,
+        proposal_ids: tuple[str, ...] | None = None,
+    ):
+        report = report or self.overlay._report
+        if proposal_ids is None:
+            proposal_ids = self.overlay.selected_proposal_ids()
         if report is None or not proposal_ids:
             return
         source = Path(report.deck.source_path)
@@ -1743,15 +2177,33 @@ class OverlayController(QObject):
         self._apply_thread.start()
 
     def _on_apply_succeeded(self, outcome: CopyApplyOutcome):
+        self._last_copy_outcome = outcome
         self.overlay.set_apply_busy(False)
         self.overlay.status_label.setText(
             f"사본 적용 완료 · 성공 {len(outcome.applied_ids)}건 · 실패 {len(outcome.rejected)}건"
         )
-        self._result_dialog = ApplyResultDialog(outcome, self.overlay)
-        self._result_dialog.finished.connect(lambda: setattr(self, "_result_dialog", None))
-        self._result_dialog.show()
-        self._result_dialog.raise_()
-        self._result_dialog.activateWindow()
+        lines = [
+            "선택한 제안을 사본에 저장했습니다.",
+            f"성공 {len(outcome.applied_ids)}건 · 적용하지 못함 {len(outcome.rejected)}건",
+            "",
+            str(outcome.output_path),
+        ]
+        if outcome.reinspection_error:
+            lines.extend(("", "저장된 사본의 재검사는 완료하지 못했습니다."))
+        box = QMessageBox(
+            QMessageBox.Icon.Information,
+            "사본 저장 완료",
+            "\n".join(lines),
+            parent=self.overlay,
+        )
+        open_copy = box.addButton("사본 열기", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is open_copy:
+            try:
+                os.startfile(outcome.output_path)
+            except OSError as error:
+                QMessageBox.warning(self.overlay, "사본 열기 실패", str(error))
 
     def _on_apply_failed(self, message: str):
         self.overlay.set_apply_busy(False)
@@ -1777,16 +2229,28 @@ class OverlayController(QObject):
 
     def stop(self):
         self.timer.stop()
+        self.preview_timer.stop()
+        self._preview_token += 1
         self._clear_highlight()
+        self.overlay.hide()
+        self.settings_dialog.hide()
+        if self._result_dialog is not None:
+            self._result_dialog.hide()
         if self.collection is not None:
-            self.collection.stop()
+            self.collection.stop(wait=False)
             self.collection = None
         if self._apply_thread is not None:
             self._apply_thread.quit()
             self._apply_thread.wait()
+        if self._preview_thread is not None:
+            self._preview_thread.quit()
+            self._preview_thread.wait()
 
 
 def start_overlay(app: QApplication) -> OverlayController:
+    existing = getattr(app, "_slideguard_overlay_controller", None)
+    if existing is not None:
+        return existing
     app.setQuitOnLastWindowClosed(False)
     controller = OverlayController()
     app.aboutToQuit.connect(controller.stop)
@@ -1803,6 +2267,29 @@ def comparison_text(report: AnalysisReport) -> str:
         f" · 유지 {comparison.unchanged}건"
     )
     return text + (f" · 비교 불가 {comparison.indeterminate}건" if comparison.indeterminate else "")
+
+
+def _set_preview_image(label: QLabel, payload: bytes | None):
+    if isinstance(label, PreviewImageLabel):
+        label.set_preview(payload)
+        return
+    if not payload:
+        label.setPixmap(QPixmap())
+        label.setText("미리보기를 만들지 못했습니다.")
+        return
+    pixmap = QPixmap()
+    if not pixmap.loadFromData(payload, "PNG"):
+        label.setPixmap(QPixmap())
+        label.setText("미리보기 이미지를 읽지 못했습니다.")
+        return
+    label.setText("")
+    label.setPixmap(
+        pixmap.scaled(
+            label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    )
 
 
 def _sha256(path: Path) -> str:

@@ -24,6 +24,17 @@ from slideguard.domain.models import DeckSnapshot
 from slideguard.domain.policy import AnalysisPolicy
 
 
+def test_pipeline_shutdown_can_invalidate_workers_without_waiting():
+    calls = []
+    monitor = SimpleNamespace(stop=lambda *, wait=True: calls.append(("monitor", wait)))
+    collector = SimpleNamespace(stop=lambda *, wait=True: calls.append(("collector", wait)))
+    pipeline = bootstrap.SnapshotCollection(monitor, collector)
+
+    pipeline.stop(wait=False)
+
+    assert calls == [("collector", False), ("monitor", False)]
+
+
 def revision(path, text="first"):
     return SavedRevision(path, sha256(text.encode()).hexdigest(), len(text))
 

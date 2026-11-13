@@ -3,7 +3,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QSignalBlocker, QSize, Qt, QThread, Signal
+from PySide6.QtCore import QLockFile, QSignalBlocker, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -1244,11 +1244,20 @@ def main() -> int:
     if instance_lock is None:
         return 0
     app._slideguard_instance_lock = instance_lock
-    from slideguard.ui.overlay import start_overlay
 
     window = MainWindow()
-    window.connect_overlay(start_overlay(app))
     window.show()
+    window.raise_()
+    window.activateWindow()
+    app._slideguard_main_window = window
+
+    def start_overlay_after_desktop_is_visible():
+        from slideguard.ui.overlay import start_overlay
+
+        controller = start_overlay(app)
+        window.connect_overlay(controller)
+
+    QTimer.singleShot(0, start_overlay_after_desktop_is_visible)
     return app.exec()
 
 

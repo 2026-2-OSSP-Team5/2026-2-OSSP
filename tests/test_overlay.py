@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -164,6 +165,26 @@ def test_only_one_desktop_instance_can_hold_the_user_lock(tmp_path):
     next_instance.unlock()
 
 
+def test_start_overlay_reuses_the_existing_controller(monkeypatch):
+    connections = []
+    controller = SimpleNamespace(stop=lambda: None)
+    application = SimpleNamespace(
+        setQuitOnLastWindowClosed=lambda value: connections.append(("quit", value)),
+        aboutToQuit=SimpleNamespace(connect=lambda callback: connections.append(("connect", callback))),
+    )
+    creations = []
+    monkeypatch.setattr(
+        overlay,
+        "OverlayController",
+        lambda: creations.append(True) or controller,
+    )
+
+    assert overlay.start_overlay(application) is controller
+    assert overlay.start_overlay(application) is controller
+    assert creations == [True]
+    assert connections == [("quit", False), ("connect", controller.stop)]
+
+
 def test_exit_button_emits_exit_request(application):
     widget = overlay.OverlayWidget()
     requests = []
@@ -191,6 +212,7 @@ def test_collapsing_visible_overlay_keeps_one_visible_window(application, monkey
 
         assert widget.isVisible() is True
         assert widget.collapsed is False
+        assert widget.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating) is False
         assert widget.mask().isEmpty() is True
         assert widget.geometry().left() == 10
         assert widget.geometry().top() == 32
@@ -205,12 +227,39 @@ def test_collapsing_visible_overlay_keeps_one_visible_window(application, monkey
         widget.close()
 
 
+def test_expanded_overlay_uses_real_minimum_height_and_stays_on_screen(application):
+    widget = overlay.OverlayWidget()
+    available = QRect(0, 0, 1920, 1040)
+    target = overlay.PowerPointWindow(
+        1,
+        QRect(374, 626, 1146, 440),
+        "deck.pptx - PowerPoint",
+        screen_rect=QRect(0, 0, 1920, 1080),
+        available_rect=available,
+    )
+    try:
+        widget.set_target(target)
+        widget.set_collapsed(False)
+        application.processEvents()
+
+        geometry = widget.geometry()
+        assert geometry.height() >= widget.minimumSizeHint().height()
+        assert geometry.left() >= available.left()
+        assert geometry.top() >= available.top()
+        assert geometry.right() <= available.right()
+        assert geometry.bottom() <= available.bottom()
+    finally:
+        widget.close()
+
+
 def test_floating_shield_paint_is_centered_in_its_round_window(application):
     widget = overlay.OverlayWidget()
     try:
         widget.set_target(overlay.PowerPointWindow(1, QRect(10, 20, 1200, 800), "deck.pptx - PowerPoint"))
         application.processEvents()
         button = widget.shield_button
+        assert widget.geometry().top() == 78
+        assert widget.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating) is True
         assert button.geometry() == widget.rect()
         assert widget.count_badge.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         rendered = button.grab().toImage()
@@ -322,6 +371,93 @@ def test_proposal_selection_by_severity_and_bundle(application, tmp_path):
         widget.close()
 
 
+def test_preview_image_always_fits_the_small_panel(application):
+    label = overlay.PreviewImageLabel()
+    source = QPixmap(1600, 900)
+    source.fill(QColor("white"))
+    label.resize(210, 135)
+    label.set_source_pixmap(source)
+    label.show()
+    application.processEvents()
+    try:
+        shown = label.pixmap()
+        assert shown is not None
+        assert shown.width() <= label.contentsRect().width()
+        assert shown.height() <= label.contentsRect().height()
+        assert shown.width() / shown.height() == pytest.approx(16 / 9, rel=0.02)
+        assert label.sizePolicy().horizontalPolicy() == overlay.QSizePolicy.Policy.Ignored
+    finally:
+        label.close()
+
+
+def test_completed_report_defaults_preview_to_after_tab(application, tmp_path):
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(b"deck")
+    widget = overlay.OverlayWidget()
+    try:
+        widget.preview_tabs.setCurrentIndex(0)
+        widget.show_report(_proposal_report(source, overlay._sha256(source)))
+
+        assert widget.preview_tabs.tabText(widget.preview_tabs.currentIndex()) == "적용 후"
+        assert "QTabBar::tab:selected" in widget.styleSheet()
+        assert "#e7f0ff" in widget.styleSheet()
+    finally:
+        widget.close()
+
+
+def test_copy_and_original_apply_buttons_share_footer_and_style(application):
+    widget = overlay.OverlayWidget()
+    try:
+        copy_index = widget.apply_actions_layout.indexOf(widget.apply_button)
+        original_index = widget.apply_actions_layout.indexOf(widget.apply_original_button)
+
+        assert copy_index >= 0
+        assert original_index == copy_index + 1
+        assert widget.apply_button.objectName() == "primary"
+        assert widget.apply_original_button.objectName() == "primary"
+    finally:
+        widget.close()
+
+
+def test_copy_apply_success_uses_compact_result_popup(application, tmp_path, monkeypatch):
+    settings = _SettingsRepository(tmp_path)
+    collection = _Collection()
+    shown = []
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: settings)
+    monkeypatch.setattr(
+        overlay.QMessageBox,
+        "exec",
+        lambda box: shown.append((box.windowTitle(), box.text())),
+    )
+    controller = overlay.OverlayController(
+        tracker=_Tracker(None),
+        path_provider=lambda: None,
+        collection_builder=lambda *_args, **_kwargs: collection,
+    )
+    outcome = overlay.CopyApplyOutcome(
+        output_path=tmp_path / "copy.pptx",
+        selected_ids=("proposal",),
+        applied_ids=("proposal",),
+        rejected=(),
+        warnings=(),
+        slide_changes={},
+    )
+    try:
+        controller._on_apply_succeeded(outcome)
+
+        assert shown == [
+            (
+                "사본 저장 완료",
+                f"선택한 제안을 사본에 저장했습니다.\n성공 1건 · 적용하지 못함 0건\n\n{outcome.output_path}",
+            )
+        ]
+        assert controller._result_dialog is None
+    finally:
+        controller.stop()
+        controller.settings_dialog.close()
+        controller.overlay.close()
+
+
 def test_current_b_finding_is_connected_to_c_proposal_planner(tmp_path):
     source = tmp_path / "deck.pptx"
     source.write_bytes(b"deck")
@@ -412,7 +548,7 @@ class _Collection:
     def start(self):
         self.started = True
 
-    def stop(self):
+    def stop(self, *, wait=True):
         self.stopped = True
 
 
@@ -591,6 +727,139 @@ def test_copy_worker_applies_only_checked_proposals_and_preserves_original(tmp_p
     assert outcomes[0].slide_changes == {1: (report.proposals[2],)}
     assert source.read_bytes() == b"original bytes"
     assert output.read_bytes() == b"original bytes"
+
+
+def test_live_preview_worker_reuses_original_when_current_slide_has_no_selected_changes(tmp_path):
+    source = tmp_path / "source.pptx"
+    source.write_bytes(b"original bytes")
+    report = _proposal_report(source, overlay._sha256(source))
+    outcomes = []
+    worker = overlay.LivePreviewWorker(
+        7,
+        report,
+        (),
+        1,
+        AnalysisPolicy(),
+        patcher_builder=lambda: pytest.fail("patcher must not run without slide changes"),
+        preview_renderer=lambda _path, _slides: {1: b"original preview"},
+    )
+    worker.finished.connect(outcomes.append)
+
+    worker.run()
+
+    assert len(outcomes) == 1
+    assert outcomes[0].no_changes is True
+    assert outcomes[0].original == b"original preview"
+    assert outcomes[0].changed == b"original preview"
+
+
+def test_live_preview_worker_applies_selection_to_temporary_copy(tmp_path, monkeypatch):
+    source = tmp_path / "source.pptx"
+    source.write_bytes(b"original bytes")
+    report = _proposal_report(source, overlay._sha256(source))
+    selected = (report.proposals[2].id,)
+    rendered_paths = []
+    outcomes = []
+
+    def render(path, _slides):
+        rendered_paths.append(Path(path))
+        return {1: b"original" if Path(path) == source else b"changed"}
+
+    worker = overlay.LivePreviewWorker(
+        8,
+        report,
+        selected,
+        1,
+        AnalysisPolicy(),
+        patcher_builder=_SuccessfulPatcher,
+        preview_renderer=render,
+    )
+    worker.finished.connect(outcomes.append)
+
+    worker.run()
+
+    assert outcomes[0].error is None
+    assert outcomes[0].proposal_ids == selected
+    assert outcomes[0].original == b"original"
+    assert outcomes[0].changed == b"changed"
+    assert rendered_paths[1].name == "preview.pptx"
+    assert not rendered_paths[1].exists()
+
+
+def test_copy_save_uses_selection_snapshot_from_button_click(application, tmp_path, monkeypatch):
+    source = tmp_path / "source.pptx"
+    source.write_bytes(b"original bytes")
+    report = _proposal_report(source, overlay._sha256(source))
+    settings = _SettingsRepository(tmp_path)
+    collection = _Collection()
+    captured = []
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: settings)
+    controller = overlay.OverlayController(
+        tracker=_Tracker(None),
+        path_provider=lambda: source,
+        state_provider=lambda: overlay.PresentationState(source, True),
+        collection_builder=lambda *_args, **_kwargs: collection,
+    )
+    try:
+        controller.overlay.show_report(report)
+        first = report.proposals[0].id
+        controller.overlay.proposal_items[first].setCheckState(Qt.CheckState.Checked)
+        snapshot = controller.overlay.selected_proposal_ids()
+
+        def choose_output(*_args):
+            controller.overlay.clear_proposals()
+            controller.overlay.proposal_items[report.proposals[2].id].setCheckState(Qt.CheckState.Checked)
+            return str(tmp_path / "saved.pptx"), ""
+
+        monkeypatch.setattr(overlay.QFileDialog, "getSaveFileName", choose_output)
+        monkeypatch.setattr(
+            controller,
+            "apply_to_output",
+            lambda output, *, report, proposal_ids: captured.append((output, report, proposal_ids)),
+        )
+
+        controller.apply_selected()
+
+        assert captured == [(tmp_path / "saved.pptx", report, snapshot)]
+    finally:
+        controller.stop()
+        controller.settings_dialog.close()
+        controller.overlay.close()
+
+
+def test_stale_live_preview_result_cannot_replace_current_ui(application, tmp_path, monkeypatch):
+    source = tmp_path / "source.pptx"
+    source.write_bytes(b"original bytes")
+    report = _proposal_report(source, overlay._sha256(source))
+    settings = _SettingsRepository(tmp_path)
+    collection = _Collection()
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: settings)
+    controller = overlay.OverlayController(
+        tracker=_Tracker(None),
+        path_provider=lambda: source,
+        collection_builder=lambda *_args, **_kwargs: collection,
+    )
+    try:
+        controller.overlay.show_report(report)
+        controller._preview_token = 12
+        controller.overlay.preview_status.setText("latest state")
+        controller._on_preview_finished(
+            overlay.LivePreviewOutcome(
+                token=11,
+                source_path=source,
+                source_sha256=report.deck.source_sha256,
+                proposal_ids=(),
+                slide_number=1,
+                original=b"old original",
+                changed=b"old changed",
+            )
+        )
+
+        assert controller.overlay.preview_status.text() == "latest state"
+    finally:
+        controller.stop()
+        controller.settings_dialog.close()
+        controller.overlay.close()
 
 
 def test_unsaved_active_presentation_blocks_copy_apply(application, tmp_path, monkeypatch):

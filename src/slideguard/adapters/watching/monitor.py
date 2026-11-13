@@ -299,13 +299,14 @@ class SavedFileMonitor:
                     self._pending.pop(path)
             LOGGER.warning("SAVE_UNREADABLE | file=%s | retry on next change", path)
 
-    def stop(self) -> None:
+    def stop(self, *, wait: bool = True) -> None:
         self._stopped.set()
         with self._condition:
             self._condition.notify_all()
         if self._observer is not None:
             self._observer.stop()
-            self._observer.join()
-        if self._worker is not None and self._worker is not threading.current_thread():
+            if wait:
+                self._observer.join()
+        if wait and self._worker is not None and self._worker is not threading.current_thread():
             self._worker.join()
         LOGGER.info("WATCH_STOPPED | directory=%s", self.path)
