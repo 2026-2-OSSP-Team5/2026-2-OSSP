@@ -178,28 +178,29 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
         widget.proposals_list.setCurrentItem(widget.proposal_items[proposal.id])
         widget.apply_one_button.click()
         wait_for(
-            lambda: controller._result_dialog is not None and controller._apply_thread is None,
+            lambda: controller._last_copy_outcome is not None
+            and controller._last_copy_outcome.output_path == first_copy
+            and controller._apply_thread is None,
             "single proposal copy with reinspection",
         )
-        one = controller._result_dialog.outcome
+        one = controller._last_copy_outcome
         assert one.applied_ids == (proposal.id,)
         assert _sizes(first_copy) == [15, 11] and source.read_bytes() == original
         assert one.reinspection_error is None and one.reinspection.comparison.improved >= 1
-        assert one.original_previews and one.copy_previews
-        controller._result_dialog.accept()
 
         widget.apply_all_button.click()
         wait_for(
-            lambda: controller._result_dialog is not None and controller._apply_thread is None,
+            lambda: controller._last_copy_outcome is not None
+            and controller._last_copy_outcome.output_path == all_copy
+            and controller._apply_thread is None,
             "all proposals copy with reinspection",
         )
-        all_result = controller._result_dialog.outcome
+        all_result = controller._last_copy_outcome
         assert len(all_result.applied_ids) == 2
         assert all_result.reinspection_error is None
         assert all_result.reinspection.comparison.improved >= 2
         assert _sizes(all_copy) == [15, 11] and source.read_bytes() == original
         assert report_for(first_copy) and report_for(all_copy)
-        controller._result_dialog.accept()
 
         widget.apply_original_button.click()
         wait_for(

@@ -98,14 +98,15 @@ class SnapshotCollection:
                 error.add_note(f"Collection startup cleanup failed: {cleanup_error}")
             raise
 
-    def stop(self) -> None:
+    def stop(self, *, wait: bool = True) -> None:
         # Invalidate in-flight output immediately, then stop the producer before
         # waiting for synchronous COM cleanup. Late monitor events are ignored.
         self.collector.stop(wait=False)
         try:
-            self.monitor.stop()
+            self.monitor.stop(wait=wait)
         finally:
-            self.collector.stop()
+            if wait:
+                self.collector.stop()
 
 
 def build_snapshot_collection(
