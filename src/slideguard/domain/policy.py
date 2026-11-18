@@ -72,11 +72,17 @@ class DensityThreshold:
 
 
 # 발표용 줄 수는 평가 기준표의 6x6 법칙(한 슬라이드 6줄 이내)을 따른다.
-# TODO: 글자 수와 강의·보고용 줄 수는 근거 자료가 없어 임시값으로 둔다. 팀 합의 후 확정한다.
+# 발표용 글자 수는 6x6의 "한 줄 6단어"를 한국어로 환산한 값이다. 같은 글꼴·같은
+# 크기에서 영어 단어와 한국어 어절의 실제 자폭을 재어 환산했고(슬라이드 117장),
+# 환산 과정과 측정값은 tests/test_policy_thresholds.py 에 적어 두었다.
+# 글꼴에 따라 자폭이 달라지므로 기본값이며, 사용자가 ThresholdOverrides로 조정한다.
+# TODO: 강의·보고용은 근거 자료도 팀 합의도 없어 발표용의 배수로 둔 제안값이다.
+# 교수님 면담(2026-11-10)에서 용도별 기준은 연구가 없어 팀이 정할 수밖에 없다고
+# 하셨다. 회의에서 확정한다.
 DENSITY_THRESHOLDS: dict[Purpose, DensityThreshold] = {
-    Purpose.PRESENTATION: DensityThreshold(max_chars=300, max_lines=6),
-    Purpose.LECTURE: DensityThreshold(max_chars=400, max_lines=15),
-    Purpose.REPORT: DensityThreshold(max_chars=800, max_lines=30),
+    Purpose.PRESENTATION: DensityThreshold(max_chars=100, max_lines=6),
+    Purpose.LECTURE: DensityThreshold(max_chars=150, max_lines=9),  # 발표용 x 1.5
+    Purpose.REPORT: DensityThreshold(max_chars=300, max_lines=18),  # 발표용 x 3
 }
 
 
