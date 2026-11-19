@@ -475,6 +475,7 @@ class CopyApplyWorker(QThread):
                 )
             )
         except Exception as error:
+            LOGGER.exception("COPY_APPLY_FAILED | file=%s", Path(self.report.deck.source_path).name)
             self.failed.emit(f"{type(error).__name__}: {error}")
 
 
@@ -533,6 +534,7 @@ class OriginalApplyWorker(QThread):
                 )
             )
         except Exception as error:
+            LOGGER.exception("ORIGINAL_APPLY_FAILED | file=%s", Path(self.report.deck.source_path).name)
             self.failed.emit(f"{type(error).__name__}: {error}")
 
 
