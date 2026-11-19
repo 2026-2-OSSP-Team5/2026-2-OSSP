@@ -40,6 +40,7 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
 ):
     import pythoncom
     import win32com.client
+    import win32con
     import win32gui
 
     workspace = tmp_path / "workspace"
@@ -119,12 +120,49 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
 
         win32gui.EnumWindows(find_frame, None)
         assert frames, "PowerPoint document did not create a native frame"
-        with monkeypatch.context() as focus:
-            focus.setattr(win32gui, "GetForegroundWindow", lambda: frames[0])
-            controller.poll_powerpoint()
+        foreground = frames[0]
+        monkeypatch.setattr(win32gui, "GetForegroundWindow", lambda: foreground)
+        controller.poll_powerpoint()
         controller.timer.stop()
         assert widget.isVisible() and widget.collapsed
         assert widget.geometry().top() > widget._target.rect.top()
+        shield_hwnd = int(widget.winId())
+        position_flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+
+        def shield_is_above_powerpoint():
+            hwnd = win32gui.GetWindow(frames[0], win32con.GW_HWNDPREV)
+            while hwnd and hwnd != shield_hwnd:
+                hwnd = win32gui.GetWindow(hwnd, win32con.GW_HWNDPREV)
+            return hwnd == shield_hwnd
+
+        win32gui.SetWindowPos(shield_hwnd, frames[0], 0, 0, 0, 0, position_flags)
+        assert not shield_is_above_powerpoint()
+        controller.poll_powerpoint()
+        assert shield_is_above_powerpoint(), "PowerPoint is covering the shield"
+
+        try:
+            win32gui.SetWindowPos(frames[0], win32con.HWND_TOPMOST, 0, 0, 0, 0, position_flags)
+            win32gui.SetWindowPos(shield_hwnd, win32con.HWND_BOTTOM, 0, 0, 0, 0, position_flags)
+            assert not shield_is_above_powerpoint()
+            controller.poll_powerpoint()
+            assert shield_is_above_powerpoint(), "A raised PowerPoint frame is covering the shield"
+
+            foreground = shield_hwnd
+            widget.shield_button.click()
+            controller.poll_powerpoint()
+            assert shield_is_above_powerpoint() and not widget.collapsed
+            widget.set_collapsed(True)
+
+            foreground = int(window.winId())
+            controller.poll_powerpoint()
+            assert not win32gui.IsWindowVisible(shield_hwnd)
+            assert not (win32gui.GetWindowLong(shield_hwnd, win32con.GWL_EXSTYLE) & win32con.WS_EX_TOPMOST)
+        finally:
+            win32gui.SetWindowPos(frames[0], win32con.HWND_NOTOPMOST, 0, 0, 0, 0, position_flags)
+
+        foreground = frames[0]
+        controller.poll_powerpoint()
+        assert shield_is_above_powerpoint()
         initial_position = widget.pos()
         shield = widget.shield_button
         center = shield.rect().center()
@@ -134,8 +172,25 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
         assert widget.collapsed and widget.pos() != initial_position
         assert widget._target.rect.contains(widget.geometry())
 
-        window.settings_button.click()
+        controller.show_settings()
         settings = controller.settings_dialog
+        settings.threshold_fields["minimum_font"].setText("18")
+        foreground = int(settings.winId())
+        controller.poll_powerpoint()
+        assert settings.isVisible()
+        for tracked in (widget, settings):
+            style = win32gui.GetWindowLong(int(tracked.winId()), win32con.GWL_EXSTYLE)
+            assert not (style & win32con.WS_EX_TOPMOST)
+        foreground = int(window.winId())
+        controller.poll_powerpoint()
+        assert not settings.isVisible() and not widget.isVisible()
+        foreground = frames[0]
+        controller.poll_powerpoint()
+        assert settings.isVisible() and settings.threshold_fields["minimum_font"].text() == "18"
+        settings.reject()
+
+        window.settings_button.click()
+        assert settings.parentWidget() is window
         settings.folder_edit.setText(str(workspace))
         settings.recursive.setChecked(True)
         settings.strength.setCurrentIndex(settings.strength.findData("strong"))
@@ -167,12 +222,34 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
 
         widget.shield_button.click()
         row = next(i for i, f in enumerate(baseline.findings) if f.id.endswith(":hierarchy"))
-        widget.findings_table.setCurrentCell(row, 0)
+        active_document().Windows.Item(1).View.GotoSlide(2)
+        table = widget.findings_table
+        QTest.mouseClick(
+            table.viewport(), Qt.MouseButton.LeftButton, pos=table.visualItemRect(table.item(row, 0)).center()
+        )
+        assert active_document().Windows.Item(1).View.Slide.SlideIndex == 1
+        assert not widget.collapsed
         active_document().Windows.Item(1).View.GotoSlide(2)
         widget.locate_button.click()
         assert active_document().Windows.Item(1).View.Slide.SlideIndex == 1
         assert controller.outline.isVisible() and widget.collapsed, widget.location_label.text()
         assert widget._target.rect.contains(controller.outline.geometry().center())
+
+        for _ in range(6):
+            QTest.mouseClick(shield, Qt.MouseButton.LeftButton, pos=shield.rect().center())
+            assert not widget.collapsed
+            widget.select_warning_button.click()
+            assert widget.select_warning_button.property("selected") is True
+            wait_for(
+                lambda: (
+                    controller._preview_thread is None
+                    and not controller.preview_timer.isActive()
+                    and not widget.preview_after_image._source_pixmap.isNull()
+                ),
+                "reopened toolbar renders proposal preview",
+            )
+            widget.locate_button.click()
+            assert widget.collapsed and controller.outline.isVisible(), widget.location_label.text()
 
         widget.shield_button.click()
         widget.proposals_list.setCurrentItem(widget.proposal_items[proposal.id])

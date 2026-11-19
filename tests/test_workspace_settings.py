@@ -109,6 +109,31 @@ def test_window_restores_workspace_and_lists_files_without_analysis(tmp_path, mo
         window.close()
 
 
+def test_open_button_launches_selected_pptx_and_handles_a_removed_file(tmp_path, monkeypatch, application):
+    path = tmp_path / "한글 발표.pptx"
+    path.touch()
+    settings = FakeSettingsRepository(WorkspaceSettings(tmp_path, False))
+    opened, warnings = [], []
+    monkeypatch.setattr(desktop, "build_workspace_settings_repository", lambda: settings)
+    monkeypatch.setattr(desktop, "build_report_repository", FakeReportRepository)
+    monkeypatch.setattr(desktop.os, "startfile", opened.append, raising=False)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
+
+    window = desktop.MainWindow()
+    try:
+        assert window.open_file_button.isHidden()
+        window.file_table.setCurrentCell(0, 0)
+        assert not window.open_file_button.isHidden()
+        window.open_file_button.click()
+        path.unlink()
+        window.open_file_button.click()
+
+        assert opened == [path]
+        assert warnings[0][1] == "PPTX 열기 실패"
+    finally:
+        window.close()
+
+
 def test_window_saves_folder_and_option_changes(tmp_path, monkeypatch, application):
     workspace = tmp_path / "presentations"
     workspace.mkdir()
@@ -431,6 +456,7 @@ def test_unselected_file_and_history_rows_are_readable_with_a_dark_system_palett
     dark_palette.setColor(QPalette.ColorRole.Text, QColor("white"))
     dark_palette.setColor(QPalette.ColorRole.WindowText, QColor("white"))
     dark_palette.setColor(QPalette.ColorRole.Base, QColor("#202020"))
+    dark_palette.setColor(QPalette.ColorRole.Window, QColor("#202020"))
     application.setPalette(dark_palette)
     window = desktop.MainWindow()
     try:
@@ -451,6 +477,13 @@ def test_unselected_file_and_history_rows_are_readable_with_a_dark_system_palett
                 for x in range(image.width())
                 for y in range(image.height())
             ), table.objectName()
+
+        window.show_report(report)
+        application.processEvents()
+        tabs = window.report_tabs
+        rendered = tabs.grab().toImage()
+        empty_tab_strip = rendered.pixelColor(rendered.width() - 12, tabs.tabBar().height() // 2)
+        assert empty_tab_strip.value() > 220
     finally:
         window.close()
         application.setPalette(original_palette)

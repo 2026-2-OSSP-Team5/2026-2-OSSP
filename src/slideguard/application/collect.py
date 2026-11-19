@@ -28,8 +28,10 @@ class _Job:
     path: Path
     expected: SavedRevision | None = None
     initial: bool = False
+    manual: bool = False
     attempt: int = 0
     ready_at: float = 0
+    queued_at: float = 0
 
 
 @dataclass
@@ -98,7 +100,7 @@ class SnapshotCollector:
                 previous = self._latest.get(path)
                 if previous is not None and not previous.initial and previous.expected == event:
                     return
-                self._enqueue(_Job(path, expected=event))
+                self._enqueue(_Job(path, expected=event, manual=previous is not None and previous.manual))
             self._condition.notify_all()
 
     def request(self, path: Path) -> None:
@@ -112,10 +114,11 @@ class SnapshotCollector:
                 return
             if self._scan is not None:
                 self._touched.add(path)
-            self._enqueue(_Job(path))
+            self._enqueue(_Job(path, manual=True))
 
     def _enqueue(self, job: _Job) -> None:
         # Called with the condition held. Replacing the identity invalidates active work.
+        job.queued_at = time.monotonic()
         self._latest[job.path] = job
         self._pending[job.path] = job
         self._condition.notify_all()
@@ -171,6 +174,13 @@ class SnapshotCollector:
         with self._condition:
             while not self._closed:
                 now = time.monotonic()
+                manual = next(
+                    (job for job in self._pending.values() if job.manual and job.ready_at <= now), None
+                )
+                if manual is not None:
+                    self._pending.pop(manual.path)
+                    self._processing = True
+                    return manual
                 if self._scan is not None and self._scan.ready_at <= now:
                     self._processing = True
                     return self._scan
@@ -237,7 +247,7 @@ class SnapshotCollector:
             if not self._current(job):
                 return False
             if job.expected is not None and job.expected != revision:
-                self._enqueue(_Job(job.path, expected=revision, initial=job.initial))
+                self._enqueue(_Job(job.path, expected=revision, initial=job.initial, manual=job.manual))
                 return False
             job.expected = revision
             return True
@@ -264,7 +274,18 @@ class SnapshotCollector:
                 return
             if self._on_collecting is not None:
                 self._on_collecting(job.path)
+            started = time.monotonic()
+            LOGGER.info(
+                "SNAPSHOT_STARTED | file=%s | manual=%s | attempt=%d | queue_ms=%.0f",
+                job.path.name,
+                job.manual,
+                job.attempt,
+                (started - job.queued_at) * 1000,
+            )
             deck = self._reader.read(job.path)
+            LOGGER.info(
+                "SNAPSHOT_READ | file=%s | read_ms=%.0f", job.path.name, (time.monotonic() - started) * 1000
+            )
             if not self._current(job):
                 return
             stage = "version"
