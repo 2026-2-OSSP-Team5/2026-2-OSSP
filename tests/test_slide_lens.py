@@ -388,6 +388,20 @@ def test_input_activity_asks_once_per_input_after_a_short_pause():
     assert InputActivity(lambda: None).due("x")  # Windows가 아니면 제한 없음
 
 
+def test_keys_and_wheel_answer_at_once_but_mouse_moves_wait():
+    state = {"info": (1, 5.0), "cursor": (10, 10)}
+    activity = InputActivity(lambda: state["info"], settle=0.2, cursor=lambda: state["cursor"])
+    assert activity.due("lens", quick=True)
+    state["info"] = (2, 0.02)  # PageDown: 커서는 그대로
+    assert activity.due("lens", quick=True)  # 기다리지 않고 바로
+    state["info"], state["cursor"] = (3, 0.02), (40, 60)  # 마우스를 움직이는 중
+    assert not activity.due("lens", quick=True)
+    state["info"] = (3, 0.25)  # 움직임이 멈춤
+    assert activity.due("lens", quick=True)
+    state["info"] = (4, 0.02)  # 타자 중(quick 아님)에는 멈출 때까지 기다림
+    assert not activity.due("lens")
+
+
 def test_idle_user_means_no_more_powerpoint_queries(controller, application):
     probes = []
     reader = controller.slide_view_reader

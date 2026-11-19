@@ -950,26 +950,36 @@ class InputActivity:
     """PowerPoint에 COM으로 묻는 일을 "사용자가 무언가 한 뒤"로 줄인다.
 
     다른 프로그램이 COM으로 계속 물으면 PowerPoint는 그때마다 바쁜 커서(돌아가는 커서)를 띄운다.
-    슬라이드·선택·저장 상태는 사용자가 마우스·키보드를 써야만 바뀌므로,
-    마지막 입력 뒤 settle초 동안 조용해졌을 때 한 번만 묻는다 (입력 중에는 묻지 않음).
+    슬라이드·선택·저장 상태는 사용자가 마우스·키보드를 써야만 바뀌므로 입력이 있을 때만 묻는다.
 
-    due(이름)  이번에 물어도 되면 True. 이름별로 따로 센다 (렌즈, 문서 경로, 위치 표시 등)
-    reader     (마지막 입력 시각 표식, 입력 뒤 지난 초) 또는 None. None이면(Windows 아님) 항상 True
+    due(이름)              입력 뒤 settle초 동안 조용해졌을 때 한 번 True (입력 중에는 묻지 않음)
+    due(이름, quick=True)  마우스 커서가 그대로인 입력(PageDown·화살표·휠·제자리 클릭)이면
+                           기다리지 않고 바로 True. 슬라이드를 넘기는 동작이 대부분 여기에 해당해
+                           넘기자마자 렌즈가 바뀐다. 커서가 움직이는 중이면 settle만큼 기다린다.
+    reader                 (마지막 입력 시각 표식, 입력 뒤 지난 초) 또는 None. None이면(Windows 아님) 항상 True
+    cursor                 마우스 커서 위치 또는 None
     """
 
-    SETTLE = 0.3
+    SETTLE = 0.2
 
-    def __init__(self, reader=None, settle: float = SETTLE):
+    def __init__(self, reader=None, settle: float = SETTLE, cursor=None):
         self.reader = reader or last_input
+        self.cursor = cursor or cursor_position
         self.settle = settle
         self._seen: dict[str, object] = {}
+        self._cursor: dict[str, object] = {}
 
-    def due(self, consumer: str) -> bool:
+    def due(self, consumer: str, *, quick: bool = False) -> bool:
         info = self.reader()
         if info is None:
             return True
         stamp, idle = info
-        if self._seen.get(consumer) == stamp or idle < self.settle:
+        cursor = self.cursor() if quick else None
+        still = cursor is not None and cursor == self._cursor.get(consumer)
+        self._cursor[consumer] = cursor
+        if self._seen.get(consumer) == stamp:
+            return False
+        if idle < self.settle and not still:
             return False
         self._seen[consumer] = stamp
         return True
@@ -980,6 +990,18 @@ class InputActivity:
             self._seen.clear()
         else:
             self._seen.pop(consumer, None)
+
+
+def cursor_position():
+    """마우스 커서 화면 좌표. Windows가 아니거나 실패하면 None."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import win32api
+
+        return tuple(win32api.GetCursorPos())
+    except Exception:  # noqa: BLE001
+        return None
 
 
 _LAST_INPUT_INFO = None

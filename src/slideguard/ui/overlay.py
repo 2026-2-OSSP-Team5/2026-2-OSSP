@@ -2465,9 +2465,8 @@ class OverlayController(QObject):
 
     # ---------------------------------------------------------- 슬라이드 렌즈
 
-    LENS_INTERVAL = (
-        0.5  # PowerPoint에 현재 슬라이드·위치를 묻는 최소 간격(초). 묻는 일은 작업 스레드에서 한다
-    )
+    # PowerPoint에 현재 슬라이드·위치를 묻는 최소 간격(초). 묻는 일은 작업 스레드에서 한다
+    LENS_INTERVAL = 0.2
 
     def set_lens_enabled(self, enabled: bool):
         self.lens_enabled = bool(enabled)
@@ -2503,8 +2502,12 @@ class OverlayController(QObject):
         if self._lens_probe is not None or monotonic() - self._lens_checked < self.LENS_INTERVAL:
             return
         window = (target.hwnd, QRect(target.rect))
-        # 창이 바뀌었거나 움직였거나, 사용자가 무언가 한 뒤 잠깐 멈췄을 때만 묻는다
-        if not (self._lens_force or window != self._lens_window or self.activity.due("lens")):
+        # 창이 바뀌었거나 움직였거나, 사용자 입력이 있었을 때만 묻는다.
+        # 렌즈가 보이는 중이면 키보드·휠·제자리 클릭에 바로 반응한다 (슬라이드 넘김을 빨리 따라가도록).
+        # 사용자가 직접 고치는 중(저장 안 함)이면 타자마다 묻지 않도록 입력이 멈출 때까지 기다린다.
+        view = self._lens_view
+        quick = view is None or view.saved or self._live_hash is not None
+        if not (self._lens_force or window != self._lens_window or self.activity.due("lens", quick=quick)):
             return
         self._lens_force = False
         self._lens_window = window
