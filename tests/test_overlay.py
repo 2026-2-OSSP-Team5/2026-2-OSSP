@@ -30,6 +30,14 @@ def application():
     return QApplication.instance() or QApplication([])
 
 
+@pytest.fixture(autouse=True)
+def isolated_startup_settings(monkeypatch):
+    monkeypatch.setattr(overlay.startup, "is_enabled", lambda: False)
+    monkeypatch.setattr(
+        overlay.startup, "set_enabled", lambda _value: pytest.fail("Unexpected Windows startup registration")
+    )
+
+
 def _report(path: Path, source_sha256: str) -> AnalysisReport:
     return AnalysisReport(
         deck=DeckSnapshot(
@@ -942,3 +950,21 @@ def test_changed_saved_file_marks_report_stale_and_reenables_manual_check(applic
         controller.stop()
         controller.settings_dialog.close()
         controller.overlay.close()
+
+
+@pytest.mark.parametrize("initial", [False, True])
+def test_settings_save_changes_logon_registration(application, tmp_path, monkeypatch, initial):
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: _SettingsRepository(tmp_path))
+    monkeypatch.setattr(overlay.startup, "is_enabled", lambda: initial)
+    registrations = []
+    monkeypatch.setattr(overlay.startup, "set_enabled", registrations.append)
+    dialog = overlay.SettingsDialog(path_provider=lambda: None)
+    try:
+        assert dialog.start_on_login.isChecked() is initial
+        dialog.start_on_login.setChecked(not initial)
+        assert not registrations
+        dialog.save()
+        assert registrations == [not initial]
+        assert dialog.result() == dialog.DialogCode.Accepted
+    finally:
+        dialog.close()

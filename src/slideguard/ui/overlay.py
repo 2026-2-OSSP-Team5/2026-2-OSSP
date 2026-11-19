@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -34,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from slideguard.adapters import startup
 from slideguard.adapters.watching.paths import accepts_path, presentation_paths
 from slideguard.application.ports import FileRemoved
 from slideguard.bootstrap import (
@@ -50,6 +53,8 @@ from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Findin
 from slideguard.domain.policy import AnalysisPolicy, Purpose, Strength, ThresholdOverrides
 from slideguard.planning.bindings import TeamBindings
 from slideguard.ui.preview import render_slide_previews
+
+LOGGER = logging.getLogger("slideguard.overlay")
 
 OVERLAY_STYLE = """
 QWidget { font-family: "Malgun Gothic"; color: #202938; font-size: 11px; }
@@ -1371,6 +1376,17 @@ class SettingsDialog(QDialog):
         self.files = QListWidget()
         layout.addWidget(self.files, 1)
 
+        self.start_on_login = QCheckBox("Windows 로그인 시 자동 실행")
+        self.start_on_login.setEnabled(sys.platform == "win32")
+        layout.addWidget(self.start_on_login)
+        startup_hint = QLabel(
+            "창 없이 대기하다 추적 폴더의 PPTX를 열면 우상단에 방패를 표시합니다.\n"
+            "창을 닫아도 대기하며, 완전히 끝내려면 트레이 메뉴에서 종료하세요.",
+            objectName="muted",
+        )
+        startup_hint.setWordWrap(True)
+        layout.addWidget(startup_hint)
+
         policy_page = QWidget()
         self.tabs = tabs
         tabs.addTab(policy_page, "검사 기준·수정 범위")
@@ -1441,6 +1457,16 @@ class SettingsDialog(QDialog):
 
     def load(self, lock_shape: str | None = None, *, capture_document: bool = True):
         self.document = self.path_provider() if capture_document else None
+        self.start_on_login.setEnabled(sys.platform == "win32")
+        self.start_on_login.setToolTip("")
+        try:
+            self._startup_enabled = startup.is_enabled()
+        except OSError:
+            LOGGER.warning("STARTUP_SETTINGS_UNAVAILABLE", exc_info=True)
+            self._startup_enabled = False
+            self.start_on_login.setEnabled(False)
+            self.start_on_login.setToolTip("Windows 자동 실행 설정을 읽을 수 없습니다.")
+        self.start_on_login.setChecked(self._startup_enabled)
         settings = build_workspace_settings_repository().load()
         if settings is not None:
             self.folder_edit.setText(str(settings.workspace))
@@ -1536,6 +1562,15 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "설정 저장 실패", str(error))
             return
         self.settings_saved.emit()
+        if self.start_on_login.isChecked() or self._startup_enabled:
+            try:
+                startup.set_enabled(self.start_on_login.isChecked())
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(
+                    self, "자동 실행 설정 실패", f"작업 폴더와 검사 기준은 저장했습니다.\n{error}"
+                )
+                return
+            self._startup_enabled = self.start_on_login.isChecked()
         self.accept()
 
 
@@ -2215,7 +2250,15 @@ class OverlayController(QObject):
         self._apply_thread = None
         self._apply_worker = None
 
-    def show_settings(self, lock_shape: str | None = None):
+    def show_settings(self, lock_shape: str | None = None, *, parent: QWidget | None = None):
+        if parent is None:
+            if self.overlay._target is None:
+                return
+            parent = self.overlay
+        self._settings_suspended_for = None
+        if self.settings_dialog.parentWidget() is not parent:
+            self.settings_dialog.hide()
+            self.settings_dialog.setParent(parent, Qt.WindowType.Dialog)
         self.settings_dialog.load(lock_shape)
         self.settings_dialog.show()
         self.settings_dialog.raise_()

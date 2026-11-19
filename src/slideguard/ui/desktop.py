@@ -1,7 +1,13 @@
 import hashlib
+import logging
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+# The logon command uses an absolute script path, independent of the working directory.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from PySide6.QtCore import QLockFile, QSignalBlocker, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
@@ -37,6 +43,8 @@ from slideguard.bootstrap import (
     build_workspace_settings_repository,
     report_database_path,
 )
+
+LOGGER = logging.getLogger("slideguard.desktop")
 
 APP_STYLE = """
 QMainWindow, QWidget#appRoot {
@@ -260,6 +268,7 @@ class MainWindow(QMainWindow):
         self.current_report = None
         self.viewing_history = False
         self.controller = None
+        self.keep_running_on_close = False
         self.file_states: dict[Path, str] = {}
         self._file_hashes: dict[Path, tuple[tuple[int, int, int], str]] = {}
         self._awaiting_file: Path | None = None
@@ -821,7 +830,7 @@ class MainWindow(QMainWindow):
         self.controller = controller
         self.workspace_saved.connect(controller.restart_collection)
         self.settings_button.setEnabled(True)
-        self.settings_button.clicked.connect(lambda: controller.show_settings())
+        self.settings_button.clicked.connect(lambda: controller.show_settings(parent=self))
         controller.settings_dialog.settings_saved.connect(self._reload_workspace)
         controller.file_activity.connect(self._on_file_activity)
         controller.completed.connect(self._on_collection_report)
@@ -1177,6 +1186,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "검사 진행 중", "검사가 끝난 뒤 창을 닫아주세요.")
             event.ignore()
             return
+        if self.keep_running_on_close:
+            self.hide()
+            event.ignore()
+            return
         super().closeEvent(event)
         self.closing.emit()
 
@@ -1238,26 +1251,67 @@ def _acquire_instance_lock(lock_path: Path) -> QLockFile | None:
     return lock if lock.tryLock(0) else None
 
 
-def main() -> int:
+def main(*, background: bool | None = None) -> int:
+    from slideguard.ui.resident import activate_running_instance
+
+    if background is None:
+        background = "--background" in sys.argv[1:]
     app = QApplication.instance() or QApplication(sys.argv)
     instance_lock = _acquire_instance_lock(report_database_path().with_name("slideguard-instance.lock"))
     if instance_lock is None:
+        if not background:
+            activate_running_instance(report_database_path())
         return 0
     app._slideguard_instance_lock = instance_lock
 
-    window = MainWindow()
-    window.show()
-    window.raise_()
-    window.activateWindow()
-    app._slideguard_main_window = window
+    logger = logging.getLogger("slideguard")
+    previous_level = logger.level
+    handler = None
+    try:
+        log_path = report_database_path().with_name("slideguard.log")
+        handler = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+    except OSError:
+        LOGGER.warning("DESKTOP_LOG_UNAVAILABLE", exc_info=True)
 
-    def start_overlay_after_desktop_is_visible():
+    try:
+        LOGGER.info("DESKTOP_STARTED")
+        return _run_desktop(app, background=background)
+    finally:
+        LOGGER.info("DESKTOP_STOPPED")
+        if handler is not None:
+            logger.removeHandler(handler)
+            handler.close()
+            logger.setLevel(previous_level)
+
+
+def _run_desktop(app: QApplication, *, background: bool = False) -> int:
+    from slideguard.ui.resident import create_tray, listen_for_activation
+
+    window = MainWindow()
+    if not background:
+        window.show()
+        window.raise_()
+        window.activateWindow()
+    app._slideguard_main_window = window
+    app._slideguard_activation_server = listen_for_activation(
+        app, report_database_path(), window._raise_window
+    )
+
+    def start_desktop_services():
         from slideguard.ui.overlay import start_overlay
 
         controller = start_overlay(app)
         window.connect_overlay(controller)
+        tray = create_tray(app, window, controller)
+        app._slideguard_tray = tray
+        window.keep_running_on_close = tray is not None
+        if background and tray is None:
+            window._raise_window()
 
-    QTimer.singleShot(0, start_overlay_after_desktop_is_visible)
+    QTimer.singleShot(0, start_desktop_services)
     return app.exec()
 
 
