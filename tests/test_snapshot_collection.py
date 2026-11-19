@@ -151,6 +151,30 @@ def test_queued_saves_coalesce_and_all_ports_run_serially_off_caller(tmp_path, m
     assert len(ids) == 1 and threading.get_ident() not in ids
 
 
+def test_manual_request_runs_before_pending_automatic_checks(tmp_path, make_collector):
+    first, second, manual = (revision(tmp_path / f"{name}.pptx") for name in ("first", "second", "manual"))
+    case = make_collector(Source(first, second, manual))
+    entered, release = make_collector.gate()
+
+    def read(path, deck):
+        if path == first.source_path:
+            entered.set()
+            assert release.wait(5)
+        return deck
+
+    case.reader.on_read = read
+    case.collector.start()
+    assert entered.wait(5)
+    case.collector.request(manual.source_path)
+    changed = revision(manual.source_path, "new save")
+    case.source.versions[manual.source_path] = changed
+    case.collector.on_event(changed)
+    release.set()
+
+    assert case.collector.wait_idle(5)
+    assert case.output == [snapshot(first), snapshot(changed), snapshot(second)]
+
+
 @pytest.mark.parametrize("action", ["save", "remove", "remove-recreate", "request", "stop"])
 def test_inflight_generations_drop_obsolete_results_and_callbacks_stay_fast(tmp_path, make_collector, action):
     path = tmp_path / "deck.pptx"

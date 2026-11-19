@@ -5,8 +5,8 @@ from slideguard.domain.models import Box, TextSpan
 from .measurements import optional
 
 
-def text_spans(item, shape):
-    if not shape.text or shape.rendered_box is None:
+def text_spans(item, shape, *, measure_bounds: bool = True):
+    if not shape.text or (measure_bounds and shape.rendered_box is None):
         return ()
     source = optional(lambda: item.TextFrame.TextRange, "Text range", [])
     spans = []
@@ -18,11 +18,13 @@ def text_spans(item, shape):
         for index in range(1, min(count, 1024) + 1):
             entry = optional(lambda member=member, index=index: getattr(source, member)(index, 1), member, [])
             text = optional(lambda entry=entry: entry.Text, f"{member} text", [])
-            values = tuple(
-                optional(lambda name=name, entry=entry: getattr(entry, name), name, [])
-                for name in ("BoundLeft", "BoundTop", "BoundWidth", "BoundHeight")
-            )
-            box = Box(*values) if all(type(value) in (float, int) for value in values) else None
+            box = None
+            if measure_bounds:
+                values = tuple(
+                    optional(lambda name=name, entry=entry: getattr(entry, name), name, [])
+                    for name in ("BoundLeft", "BoundTop", "BoundWidth", "BoundHeight")
+                )
+                box = Box(*values) if all(type(value) in (float, int) for value in values) else None
             if isinstance(text, str):
                 spans.append(TextSpan(kind, index, text, box))
     return tuple(spans)

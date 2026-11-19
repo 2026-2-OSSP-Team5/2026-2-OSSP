@@ -1,5 +1,6 @@
 import shutil
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,14 @@ from slideguard.ui import desktop, overlay
 @pytest.fixture(scope="module")
 def application():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def isolated_startup_settings(monkeypatch):
+    monkeypatch.setattr(overlay.startup, "is_enabled", lambda: False)
+    monkeypatch.setattr(
+        overlay.startup, "set_enabled", lambda _value: pytest.fail("Unexpected Windows startup registration")
+    )
 
 
 def _report(path: Path, source_sha256: str) -> AnalysisReport:
@@ -337,19 +346,26 @@ def test_proposal_selection_by_severity_and_bundle(application, tmp_path):
     widget = overlay.OverlayWidget()
     try:
         widget.show_report(report, {report.findings[2].id: "측정값이 없어 제안을 만들지 않았습니다."})
-        widget.select_severity("warning")
+        warning, review = widget.select_warning_button, widget.select_review_button
+        assert warning.property("selected") is False and review.property("selected") is False
+        warning.click()
 
         assert set(widget.selected_proposal_ids()) == {
             "font.size@1:2#bundle-a",
             "shape.height@1:2#bundle-a",
         }
         assert widget.apply_button.text().endswith("(2)")
+        assert warning.property("selected") is True and review.property("selected") is False
 
         widget.proposal_items["font.size@1:2#bundle-a"].setCheckState(Qt.CheckState.Unchecked)
         assert widget.selected_proposal_ids() == ()
+        assert warning.property("selected") is False
 
-        widget.select_severity("review")
+        review.click()
         assert widget.selected_proposal_ids() == ("shape.position@1:3",)
+        assert review.property("selected") is True
+        warning.click()
+        assert review.property("selected") is True and warning.property("selected") is True
         first_item = widget.proposals_list.item(0)
         assert widget.proposals_list.itemWidget(first_item) is None
         assert (
@@ -357,6 +373,7 @@ def test_proposal_selection_by_severity_and_bundle(application, tmp_path):
         )
         widget.clear_proposals()
         assert widget.apply_button.isEnabled() is False
+        assert warning.property("selected") is False and review.property("selected") is False
 
         widget.select_severity("warning")
         assert widget.apply_button.isEnabled() is True
@@ -429,9 +446,10 @@ def test_copy_apply_success_uses_compact_result_popup(application, tmp_path, mon
         "exec",
         lambda box: shown.append((box.windowTitle(), box.text())),
     )
+    tracker = _Tracker(overlay.PowerPointWindow(1, QRect(0, 0, 1200, 800), "deck.pptx - PowerPoint"))
     controller = overlay.OverlayController(
-        tracker=_Tracker(None),
-        path_provider=lambda: None,
+        tracker=tracker,
+        path_provider=lambda: tmp_path / "deck.pptx",
         collection_builder=lambda *_args, **_kwargs: collection,
     )
     outcome = overlay.CopyApplyOutcome(
@@ -443,6 +461,7 @@ def test_copy_apply_success_uses_compact_result_popup(application, tmp_path, mon
         slide_changes={},
     )
     try:
+        controller.poll_powerpoint()
         controller._on_apply_succeeded(outcome)
 
         assert shown == [
@@ -452,6 +471,11 @@ def test_copy_apply_success_uses_compact_result_popup(application, tmp_path, mon
             )
         ]
         assert controller._result_dialog is None
+        tracker.target = None
+        controller.poll_powerpoint()
+        shown.clear()
+        controller._on_apply_succeeded(outcome)
+        assert not shown
     finally:
         controller.stop()
         controller.settings_dialog.close()
@@ -560,6 +584,89 @@ class _Tracker:
         return self.target
 
 
+@pytest.mark.parametrize("recursive", [False, True])
+def test_shield_follows_only_presentations_in_tracked_scope(application, tmp_path, monkeypatch, recursive):
+    settings = _SettingsRepository(tmp_path)
+    settings.settings = WorkspaceSettings(tmp_path, recursive)
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: settings)
+    monkeypatch.setattr(
+        overlay, "build_report_repository", lambda: SimpleNamespace(find_successful=lambda *_args: None)
+    )
+    tracker = _Tracker(None)
+    current = {"path": None}
+    controller = overlay.OverlayController(
+        tracker=tracker,
+        path_provider=lambda: current["path"],
+        collection_builder=lambda *_args, **_kwargs: _Collection(),
+    )
+    try:
+        cases = [
+            (tmp_path / "deck.pptx", True),
+            (tmp_path.parent / "outside.pptx", False),
+            (None, False),
+            (tmp_path / "sub" / "nested.pptx", recursive),
+            (tmp_path / "deck.pptx", True),
+        ]
+        for index, (path, visible) in enumerate(cases):
+            tracker.target = overlay.PowerPointWindow(index + 1, QRect(0, 0, 1200, 800), str(path))
+            current["path"] = path
+            controller.poll_powerpoint()
+            assert controller.overlay.isVisible() is visible
+        tracker.target = None
+        controller.poll_powerpoint()
+        assert not controller.overlay.isVisible()
+    finally:
+        controller.stop()
+        controller.settings_dialog.close()
+        controller.overlay.close()
+
+
+@pytest.mark.parametrize("initial", [False, True])
+def test_settings_save_changes_logon_registration(application, tmp_path, monkeypatch, initial):
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: _SettingsRepository(tmp_path))
+    monkeypatch.setattr(overlay.startup, "is_enabled", lambda: initial)
+    registrations = []
+    monkeypatch.setattr(overlay.startup, "set_enabled", registrations.append)
+    dialog = overlay.SettingsDialog(path_provider=lambda: None)
+    try:
+        assert dialog.start_on_login.isChecked() is initial
+        dialog.start_on_login.setChecked(not initial)
+        assert not registrations
+        dialog.save()
+        assert registrations == [not initial]
+        assert dialog.result() == dialog.DialogCode.Accepted
+    finally:
+        dialog.close()
+
+
+def test_same_title_save_as_updates_shield_scope(application, tmp_path, monkeypatch):
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: _SettingsRepository(tmp_path))
+    monkeypatch.setattr(
+        overlay, "build_report_repository", lambda: SimpleNamespace(find_successful=lambda *_args: None)
+    )
+    current = {"path": tmp_path / "deck.pptx", "time": 1.0}
+    monkeypatch.setattr(overlay, "monotonic", lambda: current["time"])
+    target = overlay.PowerPointWindow(1, QRect(0, 0, 1200, 800), "deck.pptx - PowerPoint")
+    controller = overlay.OverlayController(
+        tracker=_Tracker(target),
+        path_provider=lambda: current["path"],
+        collection_builder=lambda *_args, **_kwargs: _Collection(),
+    )
+    try:
+        controller.poll_powerpoint()
+        assert controller.overlay.isVisible()
+        current.update(path=tmp_path.parent / "deck.pptx", time=2.1)
+        controller.poll_powerpoint()
+        assert not controller.overlay.isVisible()
+        current.update(path=tmp_path / "deck.pptx", time=3.2)
+        controller.poll_powerpoint()
+        assert controller.overlay.isVisible()
+    finally:
+        controller.stop()
+        controller.settings_dialog.close()
+        controller.overlay.close()
+
+
 def test_manual_and_saved_analysis_share_collection_and_stale_result_is_rejected(
     application, tmp_path, monkeypatch
 ):
@@ -666,7 +773,9 @@ def test_settings_dialog_stays_above_overlay_and_tracker_does_not_reshow_visible
     dialog = overlay.SettingsDialog(widget)
     target = overlay.PowerPointWindow(1, QRect(0, 0, 1200, 800), "deck.pptx - PowerPoint")
     try:
-        assert dialog.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+        assert dialog.parentWidget() is widget
+        assert not (dialog.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+        assert not (widget.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
 
         widget.set_target(target)
         application.processEvents()
@@ -681,6 +790,71 @@ def test_settings_dialog_stays_above_overlay_and_tracker_does_not_reshow_visible
         assert geometry_calls == []
     finally:
         dialog.close()
+        widget.close()
+
+
+def test_powerpoint_settings_hide_outside_powerpoint_and_restore_draft(application, tmp_path, monkeypatch):
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: _SettingsRepository(tmp_path))
+    target = overlay.PowerPointWindow(1, QRect(0, 0, 1200, 800), "deck.pptx - PowerPoint")
+    tracker = _Tracker(target)
+    controller = overlay.OverlayController(
+        tracker=tracker,
+        path_provider=lambda: tmp_path / "deck.pptx",
+        collection_builder=lambda *_args, **_kwargs: _Collection(),
+    )
+    dialog = controller.settings_dialog
+    try:
+        controller.poll_powerpoint()
+        controller.show_settings()
+        dialog.threshold_fields["minimum_font"].setText("18")
+        assert dialog.isVisible()
+
+        tracker.target = None
+        controller.poll_powerpoint()
+        assert not controller.overlay.isVisible()
+        assert not dialog.isVisible()
+
+        tracker.target = target
+        controller.poll_powerpoint()
+        assert controller.overlay.isVisible()
+        assert dialog.isVisible()
+        assert dialog.threshold_fields["minimum_font"].text() == "18"
+    finally:
+        controller.stop()
+        dialog.close()
+        controller.overlay.close()
+
+
+def test_clicking_finding_navigates_without_a_box_or_collapsing(application, tmp_path, monkeypatch):
+    path = tmp_path / "deck.pptx"
+    target = overlay.PowerPointWindow(1, QRect(0, 0, 1200, 800), "deck.pptx - PowerPoint")
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: _SettingsRepository(tmp_path))
+    calls = []
+    controller = overlay.OverlayController(
+        tracker=_Tracker(target),
+        path_provider=lambda: path,
+        collection_builder=lambda *_args, **_kwargs: _Collection(),
+        slide_navigator=lambda *args: calls.append(args) or True,
+    )
+    widget = controller.overlay
+    try:
+        controller.poll_powerpoint()
+        widget.set_collapsed(False)
+        widget.show_report(_report(path, "hash"))
+        assert not calls
+
+        table = widget.findings_table
+        QTest.mouseClick(
+            table.viewport(), Qt.MouseButton.LeftButton, pos=table.visualItemRect(table.item(0, 0)).center()
+        )
+        assert calls == [(path, 1)]
+        assert not widget.collapsed
+
+        widget.mark_report_stale("검사 필요")
+        table.cellClicked.emit(0, 0)
+        assert calls == [(path, 1)]
+    finally:
+        controller.stop()
         widget.close()
 
 
@@ -743,7 +917,7 @@ def test_live_preview_worker_reuses_original_when_current_slide_has_no_selected_
         patcher_builder=lambda: pytest.fail("patcher must not run without slide changes"),
         preview_renderer=lambda _path, _slides: {1: b"original preview"},
     )
-    worker.finished.connect(outcomes.append)
+    worker.completed.connect(outcomes.append)
 
     worker.run()
 
@@ -774,7 +948,7 @@ def test_live_preview_worker_applies_selection_to_temporary_copy(tmp_path, monke
         patcher_builder=_SuccessfulPatcher,
         preview_renderer=render,
     )
-    worker.finished.connect(outcomes.append)
+    worker.completed.connect(outcomes.append)
 
     worker.run()
 
@@ -860,6 +1034,59 @@ def test_stale_live_preview_result_cannot_replace_current_ui(application, tmp_pa
         controller.stop()
         controller.settings_dialog.close()
         controller.overlay.close()
+
+
+def test_preview_finishes_safely_across_repeated_toolbar_reopens(application, tmp_path, monkeypatch):
+    source = tmp_path / "source.pptx"
+    source.write_bytes(b"deck")
+    report = _proposal_report(source, overlay._sha256(source))
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: _SettingsRepository(tmp_path))
+    entered, release = Event(), Event()
+
+    def render(_path, slides):
+        entered.set()
+        assert release.wait(3)
+        return {slides[0]: b"preview"}
+
+    target = overlay.PowerPointWindow(1, QRect(0, 0, 1600, 920), "deck.pptx - PowerPoint")
+    controller = overlay.OverlayController(
+        tracker=_Tracker(target),
+        path_provider=lambda: source,
+        preview_renderer=render,
+        collection_builder=lambda *_args, **_kwargs: _Collection(),
+    )
+    widget = controller.overlay
+    try:
+        controller.poll_powerpoint()
+        controller.timer.stop()
+        widget.show_report(report)
+        assert not controller.preview_timer.isActive()
+
+        for _ in range(12):
+            controller._original_preview_cache.clear()
+            entered.clear()
+            release.clear()
+            widget.shield_button.click()
+            assert not widget.collapsed and controller.preview_timer.isActive()
+            controller.preview_timer.stop()
+            controller._start_preview()
+            assert entered.wait(3)
+            assert controller._preview_thread.thread() is controller.thread()
+
+            widget.collapse_button.click()
+            assert widget.collapsed and not controller.preview_timer.isActive()
+            release.set()
+            for _ in range(100):
+                application.processEvents()
+                if controller._preview_thread is None:
+                    break
+                QTest.qWait(10)
+            assert controller._preview_thread is None
+            assert not controller.preview_timer.isActive()
+    finally:
+        release.set()
+        controller.stop()
+        widget.close()
 
 
 def test_unsaved_active_presentation_blocks_copy_apply(application, tmp_path, monkeypatch):

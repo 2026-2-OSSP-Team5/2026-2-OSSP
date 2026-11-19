@@ -152,7 +152,7 @@ def read_range(text_range, notes: list[str], *, modern: bool = True) -> TextMeas
     return TextMeasurement(text, _runs(text_range, text, notes, modern=modern))
 
 
-def read_text(shape, notes: list[str], *, layout_shape=None) -> TextMeasurement:
+def read_text(shape, notes: list[str], *, layout_shape=None, measure_bounds: bool = True) -> TextMeasurement:
     frame = read_optional(lambda: shape.TextFrame, "Shape text frame", notes)
     text_range = read_optional(lambda: frame.TextRange, "Shape text range", notes)
     text = read_optional(lambda: text_range.Text, "Shape text", notes)
@@ -168,5 +168,5 @@ def read_text(shape, notes: list[str], *, layout_shape=None) -> TextMeasurement:
         runs = _runs(modern_range, text, notes, modern=True)
     else:
         runs = _runs(text_range, text, notes)
-    bounds = _bounds(layout_shape or shape, frame, text_range, notes)
+    bounds = _bounds(layout_shape or shape, frame, text_range, notes) if measure_bounds else None
     return TextMeasurement(text, runs, bounds)

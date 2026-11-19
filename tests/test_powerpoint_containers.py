@@ -4,7 +4,9 @@ import pytest
 
 from slideguard.adapters.powerpoint.properties import read_optional
 from slideguard.adapters.powerpoint.session import _plain_snapshot
+from slideguard.checks.layout import LayoutRule
 from slideguard.domain.models import Box, ObjectLocator
+from slideguard.domain.policy import AnalysisPolicy
 from tests.test_powerpoint_text import (
     Collection,
     Properties,
@@ -65,6 +67,20 @@ def test_table_cells_use_row_column_addresses_and_deduplicate_merged_positions()
     assert value.box is not None and value.runs[0].color is not None
 
 
+@pytest.mark.parametrize("hidden,expected", [(0, True), (-1, False)])
+def test_table_cell_visibility_is_inherited_when_office_omits_cell_visibility(hidden, expected):
+    cell = shape([run("Cell")])
+    cell.Visible = AttributeError("Table cell visibility is not exposed")
+    table = shape(shape_type=19, shape_id=50)
+    table.Table = Properties(
+        Rows=Properties(Count=1), Columns=Properties(Count=1), Cell=lambda *_args: Properties(Shape=cell)
+    )
+    slide = make_slide([table])
+    slide.SlideShowTransition = Properties(Hidden=hidden)
+    result = extract(slide).shapes[1]
+    assert result.visible is True and result.effective_visible is expected
+
+
 def test_table_inside_placeholder_is_traversed_without_claiming_its_text_is_unsupported():
     item = shape(shape_type=14, shape_id=50)
     item.PlaceholderFormat.ContainedType = 19
@@ -75,6 +91,31 @@ def test_table_inside_placeholder_is_traversed_without_claiming_its_text_is_unsu
     result = extract(make_slide([item])).shapes
     assert result[1].text == "자리 표시자 표" and result[1].locator.kind == "table_cell"
     assert not any("not traversed" in note for note in result[0].notes)
+
+
+def test_table_cell_local_text_bounds_never_become_slide_coordinates():
+    cell = shape([run("Cell")])
+    cell.Left, cell.Top, cell.Width, cell.Height = 310.0, 300.0, 267.0, 42.0
+    cell.TextFrame.TextRange.BoundLeft = 22.57
+    cell.TextFrame.TextRange.BoundTop = -10.8
+    cell.TextFrame.TextRange.BoundWidth = 228.6
+    cell.TextFrame.TextRange.BoundHeight = 21.6
+    local_line = Properties(Text="Cell", BoundTop=AssertionError("Cell-local geometry must not be read"))
+    cell.TextFrame.TextRange.Lines = lambda *args: Properties(Count=1) if not args else local_line
+    cell.TextFrame.TextRange.Paragraphs = cell.TextFrame.TextRange.Lines
+    table = shape(shape_type=19, shape_id=50)
+    table.Table = Properties(
+        Rows=Properties(Count=1), Columns=Properties(Count=1), Cell=lambda *_args: Properties(Shape=cell)
+    )
+
+    deck = extract(make_slide([table]))
+    measured = deck.shapes[1]
+    assert measured.box == Box(310, 300, 267, 42)
+    assert measured.rendered_box is None
+    assert len(measured.spans) == 2
+    assert all(span.text == "Cell" and span.box is None for span in measured.spans)
+    findings = LayoutRule().evaluate(deck, AnalysisPolicy())
+    assert not any(f.severity == "warning" and f.shape_key == measured.key for f in findings)
 
 
 def chart_element(text, left=5):

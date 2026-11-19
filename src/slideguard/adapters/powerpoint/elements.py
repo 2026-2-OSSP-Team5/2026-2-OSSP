@@ -56,7 +56,11 @@ def table_cells(item, parent: Shape, *, layout_verified: bool):
                 continue
             if box is not None:
                 seen.add(box)
-            measurement = read_text(cell, notes, layout_shape=item)
+            # Office can return the same cell-local BoundTop/BoundLeft for every
+            # row/column, even after export. Only the cell shape box is in slide
+            # coordinates. Text geometry is measured later by the render probe.
+            measurement = read_text(cell, notes, measure_bounds=False)
+            notes.append("Table cell COM text bounds are not verified slide-space coordinates")
             if not layout_verified:
                 box = None
                 measurement = replace(measurement, rendered_box=None)
@@ -69,7 +73,14 @@ def table_cells(item, parent: Shape, *, layout_verified: bool):
             )
             color, transparency = paint(cell, notes)
             yield replace(
-                result, fill_color=color, fill_transparency=transparency, spans=text_spans(cell, result)
+                result,
+                # Table cells do not expose Shape.Visible consistently. Their
+                # visibility follows the table and its enclosing groups.
+                visible=parent.visible,
+                effective_visible=parent.effective_visible,
+                fill_color=color,
+                fill_transparency=transparency,
+                spans=text_spans(cell, result, measure_bounds=False),
             )
 
 

@@ -1,7 +1,15 @@
 import hashlib
+import logging
+import os
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from time import monotonic
+
+# The logon command uses an absolute script path, independent of the working directory.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from PySide6.QtCore import QLockFile, QSignalBlocker, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
@@ -37,6 +45,8 @@ from slideguard.bootstrap import (
     build_workspace_settings_repository,
     report_database_path,
 )
+
+LOGGER = logging.getLogger("slideguard.desktop")
 
 APP_STYLE = """
 QMainWindow, QWidget#appRoot {
@@ -131,6 +141,8 @@ QTableWidget {
     outline: 0;
 }
 QTableWidget::item { color: #1f2937; padding: 7px; border: 0; }
+QTabWidget, QTabBar, QTabWidget::pane { background: #ffffff; }
+QTabWidget::pane { border: 0; }
 QTabBar::tab {
     background: #f3f5f8;
     color: #4b5565;
@@ -234,17 +246,26 @@ class AnalysisWorker(QThread):
         self.path = path
 
     def run(self):
+        started = monotonic()
         try:
             analyzer = build_analyzer(build_powerpoint_reader(render=True))
             report = analyzer.execute(self.path, build_analysis_policy(self.path))
         except Exception as error:
+            LOGGER.exception("ANALYSIS_FAILED | file=%s", self.path.name)
             self.failed.emit(f"{type(error).__name__}: {error}")
             return
 
+        LOGGER.info(
+            "ANALYSIS_FINISHED | file=%s | findings=%d | duration_ms=%.0f",
+            self.path.name,
+            len(report.findings),
+            (monotonic() - started) * 1000,
+        )
         self.succeeded.emit(report)
         try:
             build_report_repository().save(report)
         except Exception as error:
+            LOGGER.exception("REPORT_SAVE_FAILED | file=%s", self.path.name)
             self.storage_failed.emit(f"{type(error).__name__}: {error}")
 
 
@@ -260,7 +281,9 @@ class MainWindow(QMainWindow):
         self.current_report = None
         self.viewing_history = False
         self.controller = None
+        self.keep_running_on_close = False
         self.file_states: dict[Path, str] = {}
+        self._file_items: dict[Path, QTableWidgetItem] = {}
         self._file_hashes: dict[Path, tuple[tuple[int, int, int], str]] = {}
         self._awaiting_file: Path | None = None
 
@@ -423,7 +446,15 @@ class MainWindow(QMainWindow):
         self.selected_file_label.setWordWrap(True)
         self.selected_file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.file_meta_label = QLabel("왼쪽 목록에서 검사할 파일을 선택하세요.", objectName="fileMeta")
-        file_column.addWidget(self.selected_file_label)
+        file_header = QHBoxLayout()
+        file_header.addWidget(self.selected_file_label)
+        self.open_file_button = QPushButton("열기")
+        self.open_file_button.setToolTip("선택한 PPTX 파일 열기")
+        self.open_file_button.clicked.connect(self.open_selected_file)
+        self.open_file_button.hide()
+        file_header.addWidget(self.open_file_button)
+        file_header.addStretch(1)
+        file_column.addLayout(file_header)
         file_column.addWidget(self.file_meta_label)
         top.addLayout(file_column, 1)
 
@@ -642,6 +673,7 @@ class MainWindow(QMainWindow):
         else:
             self.selected_file_label.setText("PPTX 파일을 선택하세요")
             self.file_meta_label.setText("왼쪽 목록에서 검사할 파일을 선택하세요.")
+            self.open_file_button.hide()
             self.analyze_button.setEnabled(False)
             self.show_pre_analysis()
 
@@ -683,6 +715,7 @@ class MainWindow(QMainWindow):
         self.selected_file = None
         self.selected_file_label.setText("PPTX 파일을 선택하세요")
         self.file_meta_label.setText("왼쪽 목록에서 검사할 파일을 선택하세요.")
+        self.open_file_button.hide()
         self.analyze_button.setEnabled(False)
         self.show_pre_analysis()
         self.save_workspace_settings()
@@ -749,6 +782,7 @@ class MainWindow(QMainWindow):
     def refresh_files(self):
         blocker = QSignalBlocker(self.file_table)
         previous = self.selected_file
+        self._file_items.clear()
         self.file_table.setRowCount(0)
         self.file_count_label.setText("0개")
         if self.workspace is None:
@@ -769,21 +803,11 @@ class MainWindow(QMainWindow):
 
         self.file_table.setRowCount(len(files))
         for row, path in enumerate(files):
-            relative_folder = path.parent.relative_to(self.workspace)
-            folder_text = str(relative_folder) if str(relative_folder) != "." else "현재 폴더"
-            try:
-                stat = path.stat()
-                size_mb = stat.st_size / (1024 * 1024)
-                state = self.file_states.get(path)
-                if state is None:
-                    state = self._file_state(path, stat, settings, repository)
-                metadata = f"{folder_text} · {size_mb:.1f} MB · {state}"
-            except (OSError, ValueError):
-                metadata = f"{folder_text} · 저장본 확인 필요"
-            name_item = QTableWidgetItem(f"{path.name}\n{metadata}")
+            name_item = QTableWidgetItem(self._file_item_text(path, settings, repository))
             name_item.setData(Qt.ItemDataRole.UserRole, str(path))
             name_item.setToolTip(str(path))
             self.file_table.setItem(row, 0, name_item)
+            self._file_items[path] = name_item
             self.file_table.setRowHeight(row, 62)
             if path == previous:
                 self.file_table.selectRow(row)
@@ -791,6 +815,7 @@ class MainWindow(QMainWindow):
             self.selected_file = None
             self.analyze_button.setEnabled(False)
             if not self.viewing_history:
+                self.open_file_button.hide()
                 self.selected_file_label.setText("PPTX 파일을 선택하세요")
                 self.file_meta_label.clear()
                 self.show_pre_analysis()
@@ -799,8 +824,19 @@ class MainWindow(QMainWindow):
         self.file_count_label.setText(f"{len(files)}개")
         self.statusBar().showMessage(f"PPTX 파일 {len(files)}개")
 
+    def _file_item_text(self, path: Path, settings=None, repository=None) -> str:
+        relative_folder = path.parent.relative_to(self.workspace)
+        folder_text = str(relative_folder) if relative_folder.parts else "현재 폴더"
+        try:
+            stat = path.stat()
+            size_mb = stat.st_size / (1024 * 1024)
+            state = self.file_states.get(path) or self._file_state(path, stat, settings, repository)
+            return f"{path.name}\n{folder_text} · {size_mb:.1f} MB · {state}"
+        except (OSError, ValueError):
+            return f"{path.name}\n{folder_text} · 저장본 확인 필요"
+
     def _file_state(self, path, stat, settings, repository) -> str:
-        if repository is None:
+        if settings is None or repository is None:
             return "미검사"
         key = settings.policy_for(path).cache_key
         saved = repository.last_successful_sha256(path, key)
@@ -821,7 +857,7 @@ class MainWindow(QMainWindow):
         self.controller = controller
         self.workspace_saved.connect(controller.restart_collection)
         self.settings_button.setEnabled(True)
-        self.settings_button.clicked.connect(lambda: controller.show_settings())
+        self.settings_button.clicked.connect(lambda: controller.show_settings(parent=self))
         controller.settings_dialog.settings_saved.connect(self._reload_workspace)
         controller.file_activity.connect(self._on_file_activity)
         controller.completed.connect(self._on_collection_report)
@@ -849,8 +885,14 @@ class MainWindow(QMainWindow):
             self.file_states.pop(path, None)
         else:
             self.file_states[path] = status
-        self._file_hashes.pop(path, None)
-        self.refresh_files()
+        item = self._file_items.get(path)
+        if item is None or status == "제거":
+            self.refresh_files()
+        elif status == "검사 완료":
+            settings = build_workspace_settings_repository().load()
+            item.setText(self._file_item_text(path, settings, build_report_repository()))
+        else:
+            item.setText(self._file_item_text(path))
         if self._awaiting_file == path and status == "검사 실패":
             self._awaiting_file = None
             self.analyze_button.setEnabled(True)
@@ -883,6 +925,7 @@ class MainWindow(QMainWindow):
         self.selected_file = Path(item.data(Qt.ItemDataRole.UserRole))
         self.selected_file_label.setText(self.selected_file.name)
         self.selected_file_label.setToolTip(str(self.selected_file))
+        self.open_file_button.show()
         try:
             size_mb = self.selected_file.stat().st_size / (1024 * 1024)
             self.file_meta_label.setText(f"PPTX · {size_mb:.1f} MB")
@@ -909,8 +952,24 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError):
                 return
 
+    def open_selected_file(self):
+        path = Path(self.current_report.deck.source_path) if self.viewing_history else self.selected_file
+        if path is None:
+            return
+        try:
+            if not path.is_file():
+                raise FileNotFoundError(f"파일을 찾을 수 없습니다.\n{path}")
+            os.startfile(path)
+        except (AttributeError, OSError) as error:
+            LOGGER.warning("PRESENTATION_OPEN_FAILED | file=%s | reason=%s", path.name, error)
+            QMessageBox.warning(self, "PPTX 열기 실패", str(error))
+        else:
+            LOGGER.info("PRESENTATION_OPEN_REQUESTED | file=%s", path.name)
+
     def start_analysis(self):
-        if self.worker is not None:
+        if self.worker is not None or (
+            self._awaiting_file is not None and self._awaiting_file == self.selected_file
+        ):
             return
         path = self.selected_file
         if path is None:
@@ -922,14 +981,16 @@ class MainWindow(QMainWindow):
             return
 
         self.selected_file = path
+        LOGGER.info("DESKTOP_ANALYSIS_REQUESTED | file=%s", path.name)
         self.progress_file_label.setText(f"검사 중 · {path.name}")
         self.inspection_stack.setCurrentWidget(self.progress_page)
         self.statusBar().showMessage("검사 중")
         if self.controller is not None:
-            if self.controller.request_path(path):
-                self._awaiting_file = path
-                self.analyze_button.setEnabled(False)
-            else:
+            self._awaiting_file = path
+            self.analyze_button.setEnabled(False)
+            if not self.controller.request_path(path):
+                self._awaiting_file = None
+                self.analyze_button.setEnabled(True)
                 self.show_analysis_error("작업 폴더 감시를 시작한 뒤 다시 시도하세요.")
             return
         self._set_busy(True)
@@ -956,6 +1017,8 @@ class MainWindow(QMainWindow):
         deck = report.deck
         source_name = Path(deck.source_path).name
         self.selected_file_label.setText(source_name)
+        self.selected_file_label.setToolTip(deck.source_path)
+        self.open_file_button.show()
         self.file_meta_label.setText(
             f"{deck.slide_count}개 슬라이드 · 실행 규칙 {len(report.executed_rules)}개"
         )
@@ -1159,6 +1222,7 @@ class MainWindow(QMainWindow):
         self.file_meta_label.setText("왼쪽 목록에서 저장된 검사 결과를 선택하세요.")
         self.history_banner.hide()
         self.analyze_button.hide()
+        self.open_file_button.hide()
         self.result_table.setRowCount(0)
         self.detail_values.clear()
         self.detail_reason.clear()
@@ -1175,6 +1239,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.worker is not None:
             QMessageBox.information(self, "검사 진행 중", "검사가 끝난 뒤 창을 닫아주세요.")
+            event.ignore()
+            return
+        if self.keep_running_on_close:
+            self.hide()
             event.ignore()
             return
         super().closeEvent(event)
@@ -1238,26 +1306,67 @@ def _acquire_instance_lock(lock_path: Path) -> QLockFile | None:
     return lock if lock.tryLock(0) else None
 
 
-def main() -> int:
+def main(*, background: bool | None = None) -> int:
+    from slideguard.ui.resident import activate_running_instance
+
+    if background is None:
+        background = "--background" in sys.argv[1:]
     app = QApplication.instance() or QApplication(sys.argv)
     instance_lock = _acquire_instance_lock(report_database_path().with_name("slideguard-instance.lock"))
     if instance_lock is None:
+        if not background:
+            activate_running_instance(report_database_path())
         return 0
     app._slideguard_instance_lock = instance_lock
 
-    window = MainWindow()
-    window.show()
-    window.raise_()
-    window.activateWindow()
-    app._slideguard_main_window = window
+    logger = logging.getLogger("slideguard")
+    previous_level = logger.level
+    handler = None
+    try:
+        log_path = report_database_path().with_name("slideguard.log")
+        handler = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+    except OSError:
+        LOGGER.warning("DESKTOP_LOG_UNAVAILABLE", exc_info=True)
 
-    def start_overlay_after_desktop_is_visible():
+    try:
+        LOGGER.info("DESKTOP_STARTED")
+        return _run_desktop(app, background=background)
+    finally:
+        LOGGER.info("DESKTOP_STOPPED")
+        if handler is not None:
+            logger.removeHandler(handler)
+            handler.close()
+            logger.setLevel(previous_level)
+
+
+def _run_desktop(app: QApplication, *, background: bool = False) -> int:
+    from slideguard.ui.resident import create_tray, listen_for_activation
+
+    window = MainWindow()
+    if not background:
+        window.show()
+        window.raise_()
+        window.activateWindow()
+    app._slideguard_main_window = window
+    app._slideguard_activation_server = listen_for_activation(
+        app, report_database_path(), window._raise_window
+    )
+
+    def start_desktop_services():
         from slideguard.ui.overlay import start_overlay
 
         controller = start_overlay(app)
         window.connect_overlay(controller)
+        tray = create_tray(app, window, controller)
+        app._slideguard_tray = tray
+        window.keep_running_on_close = tray is not None
+        if background and tray is None:
+            window._raise_window()
 
-    QTimer.singleShot(0, start_overlay_after_desktop_is_visible)
+    QTimer.singleShot(0, start_desktop_services)
     return app.exec()
 
 

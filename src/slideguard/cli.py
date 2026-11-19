@@ -41,7 +41,10 @@ def main(argv=None) -> int:
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor", help="Show Python and library installation status")
-    commands.add_parser("gui", help="Open the desktop window")
+    gui = commands.add_parser("gui", help="Open the desktop window")
+    gui.add_argument(
+        "--background", action="store_true", help="Start in the system tray without opening a window"
+    )
     inspect = commands.add_parser("inspect", help="Extract saved PPTX object metadata; rules not enabled")
     inspect.add_argument("file", type=Path)
     extract = commands.add_parser("extract", help="Extract a saved PPTX snapshot with desktop PowerPoint")
@@ -70,7 +73,7 @@ def main(argv=None) -> int:
     if args.command == "gui":
         from .ui.desktop import main as desktop_main
 
-        return desktop_main()
+        return desktop_main(background=args.background)
     if args.command == "watch":
         from .watch_cli import watch_directory
 

@@ -110,6 +110,15 @@ class Shape:
     background_samples: tuple[tuple[float, float, int, int, int], ...] = ()
 
     @property
+    def text_bounds(self) -> Box | None:
+        """Slide-space text geometry, including snapshots saved by older readers."""
+        if self.locator is not None and self.locator.kind == "table_cell":
+            # Legacy Office cell Bound* values are cell-local. Only a rendered
+            # pixel measurement verifies their position on the slide.
+            return self.visible_text_box
+        return self.rendered_box
+
+    @property
     def key(self) -> str:
         if self.locator is not None:
             address = self.locator
