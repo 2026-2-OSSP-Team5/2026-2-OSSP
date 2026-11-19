@@ -15,6 +15,7 @@ Thumbs.db
 Desktop.ini
 ~$*
 *.spec
+!SlideGuard.spec
 
 # User documents, reports and local databases
 input/
