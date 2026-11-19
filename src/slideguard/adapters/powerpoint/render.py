@@ -42,7 +42,11 @@ def _sample(shape, image, sx, sy):
 def render_evidence(presentation, snapshot, target):
     by_slide = {}
     for shape in snapshot.shapes:
-        if shape.effective_visible is True and shape.locator and shape.locator.kind == "shape":
+        if (
+            shape.effective_visible is True
+            and shape.locator
+            and shape.locator.kind in {"shape", "table_cell"}
+        ):
             by_slide.setdefault(shape.slide_number, []).append(shape)
     updated = {}
     height = min(2048, max(1, round(1280 * snapshot.height_pt / snapshot.width_pt)))

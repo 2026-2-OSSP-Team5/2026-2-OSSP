@@ -34,7 +34,7 @@ def measure_shape(result, item, *, ancestor_visible=True):
             for name in ("AutoSize", "WordWrap", "Orientation", "VerticalAnchor")
             if type(value := optional(lambda name=name: getattr(frame, name), name, notes)) in (int, bool)
         )
-        if result.box is not None and result.rendered_box is not None and None not in margins:
+        if result.box is not None and None not in margins:
             left, top, right, bottom = margins
             box = result.box
             if box.width >= left + right and box.height >= top + bottom:

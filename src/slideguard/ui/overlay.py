@@ -1183,7 +1183,7 @@ class OverlayWidget(QWidget):
                 else:
                     reason = "이 결과에 안전하게 적용할 수 있는 수정 제안이 없습니다."
             self.proposal_text.setText(reason)
-        if finding.box is None:
+        if finding_location_box(self._report, finding) is None:
             self.location_label.setText("화면 위치를 확정할 데이터가 없어 슬라이드 번호만 표시합니다.")
         else:
             self.location_label.setText("위치 보기로 PowerPoint의 해당 슬라이드에 윤곽선을 표시합니다.")
@@ -1329,7 +1329,11 @@ class OverlayWidget(QWidget):
         self.apply_original_button.setEnabled(ready and count > 0)
         self.apply_one_button.setEnabled(ready and self.proposals_list.currentItem() is not None)
         self.apply_all_button.setEnabled(ready and bool(self.proposal_items))
-        self.locate_button.setEnabled(ready and self._finding is not None and self._finding.box is not None)
+        self.locate_button.setEnabled(
+            ready
+            and self._finding is not None
+            and finding_location_box(self._report, self._finding) is not None
+        )
         self.lock_button.setEnabled(
             ready
             and self._finding is not None
@@ -1767,16 +1771,17 @@ class OverlayController(QObject):
     def locate_finding(self, finding: Finding | None):
         report = self.overlay._report
         target = self.overlay._target
-        if (
-            finding is None
-            or finding.box is None
-            or report is None
-            or target is None
-            or self.overlay._report_stale
-        ):
+        if finding is None or report is None or target is None or self.overlay._report_stale:
+            return
+        box = finding_location_box(report, finding)
+        if box is None:
+            self._clear_highlight()
+            self.overlay.location_label.setText(
+                "이 객체의 슬라이드 위치를 확인할 수 없습니다. 다시 검사해 주세요."
+            )
             return
         path = Path(report.deck.source_path)
-        self._highlight = (path, _slide_number(finding.shape_key), finding.box)
+        self._highlight = (path, _slide_number(finding.shape_key), box)
         if self._show_outline(target, navigate=True):
             self.overlay.set_collapsed(True)
         else:
@@ -2299,6 +2304,16 @@ def start_overlay(app: QApplication) -> OverlayController:
     app.aboutToQuit.connect(controller.stop)
     app._slideguard_overlay_controller = controller
     return controller
+
+
+def finding_location_box(report: AnalysisReport, finding: Finding) -> Box | None:
+    shape = next((item for item in report.deck.shapes if item.key == finding.shape_key), None)
+    if shape is not None and shape.locator is not None and shape.locator.kind == "table_cell":
+        if finding.rule_id == "layout.overlap":
+            # An old intersection cannot be recovered from just one cell's box.
+            return finding.box if shape.text_bounds is not None else None
+        return shape.text_bounds or shape.box
+    return finding.box
 
 
 def comparison_text(report: AnalysisReport) -> str:

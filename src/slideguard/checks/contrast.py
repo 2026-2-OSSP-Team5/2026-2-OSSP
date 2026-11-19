@@ -69,7 +69,7 @@ class ContrastRule:
                         measured=measured,
                         expected=expected,
                         evidence=evidence,
-                        box=shape.rendered_box or shape.box,
+                        box=shape.text_bounds or shape.box,
                     )
                 )
         return findings

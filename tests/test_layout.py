@@ -1,7 +1,9 @@
+from dataclasses import replace
+
 import pytest
 
 from slideguard.checks.layout import LayoutRule
-from slideguard.domain.models import Box, DeckSnapshot, Shape, TextRun, TextSpan
+from slideguard.domain.models import Box, DeckSnapshot, ObjectLocator, Shape, TextRun, TextSpan
 from slideguard.domain.policy import AnalysisPolicy, Purpose
 
 # 슬라이드 960x540pt → 안전 여백: 좌우 48pt, 상하 27pt
@@ -53,6 +55,16 @@ def run_rule(*shapes, policy=None):
 
 def only(findings, rule_id):
     return [f for f in findings if f.rule_id == rule_id]
+
+
+@pytest.mark.parametrize("locator", [ObjectLocator((7,), "table_cell", (1, 1)), ObjectLocator((7, 8))])
+def test_container_does_not_overlap_its_own_content_but_external_shapes_still_do(locator):
+    container = replace(make_shape(text="", shape_id=7), locator=ObjectLocator((7,)))
+    child = replace(make_shape(shape_id=8), locator=locator)
+    external = replace(make_shape(text="", shape_id=9), locator=ObjectLocator((9,)))
+
+    assert not only(run_rule(container, child), "layout.overlap")
+    assert len(only(run_rule(container, child, external), "layout.overlap")) == 1
 
 
 # --- 안전 여백 ---------------------------------------------------------------

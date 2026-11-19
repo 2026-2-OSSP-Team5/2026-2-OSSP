@@ -58,35 +58,74 @@ def _geometry(item):
     return item.Left, item.Top, item.Width, item.Height
 
 
-def _text_pixels(slide, positions, render, sx, sy):
+def _text_pixels(slide, positions, render, sx, sy, *, cell_indices=()):
     notes = []
     duplicate = optional(lambda: slide.Duplicate().Item(1), "Temporary probe slide", notes)
     if duplicate is None:
         return None
     try:
         item = _item(duplicate, positions)
+        container = item
+        if cell_indices:
+            row, column = cell_indices
+            item = container.Table.Cell(row, column).Shape
         frame = optional(lambda: item.TextFrame, "Probe text frame", notes)
         # Clearing text is safe as a comparison only with a fixed shape size.
         if optional(lambda: frame.AutoSize, "Probe text frame AutoSize", notes) != 0:
             return None
-        geometry = _geometry(item)
+
+        def geometry():
+            if cell_indices:
+                table = container.Table
+                return (
+                    _geometry(item),
+                    _geometry(container),
+                    tuple(table.Rows.Item(index).Height for index in range(1, table.Rows.Count + 1)),
+                    tuple(table.Columns.Item(index).Width for index in range(1, table.Columns.Count + 1)),
+                )
+            return _geometry(item)
+
+        before_geometry = geometry()
         before = render(duplicate)
         if before is None:
             return None
         optional(lambda: setattr(frame.TextRange, "Text", ""), "Clear text in probe slide", notes)
-        if notes or _geometry(item) != geometry:
+        if notes or geometry() != before_geometry:
             return None
-        return _pixel_box(before, render(duplicate), sx, sy)
+        after = render(duplicate)
+        if geometry() != before_geometry:
+            return None
+        return _pixel_box(before, after, sx, sy)
     finally:
         duplicate.Delete()
 
 
 def measure_pixels(shape, slide, before, render, sx, sy):
-    if shape.effective_visible is not True or not shape.locator or shape.locator.kind != "shape":
+    if (
+        shape.effective_visible is not True
+        or not shape.locator
+        or shape.locator.kind not in {"shape", "table_cell"}
+    ):
         return shape
     positions = _positions(slide, shape.locator.shape_path)
     if not positions:
         return shape
+    if shape.locator.kind == "table_cell":
+        if shape.box is None or not shape.text.strip():
+            return shape
+        text_box = _text_pixels(slide, positions, render, sx, sy, cell_indices=shape.locator.indices)
+        measurement = Measurement(
+            "text_bounds",
+            "measured" if text_box else "unavailable",
+            "Slide PNG difference after clearing only this cell on a fixed-geometry probe table",
+        )
+        return replace(
+            shape,
+            rendered_box=text_box,
+            visible_text_box=text_box,
+            measurements=tuple(item for item in shape.measurements if item.field != "text_bounds")
+            + (measurement,),
+        )
     item = _item(slide, positions)
     probe_notes = []
     if optional(lambda: item.Visible, "Probe shape visibility", probe_notes) != -1:

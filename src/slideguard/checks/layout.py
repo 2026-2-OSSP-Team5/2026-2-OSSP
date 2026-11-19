@@ -52,7 +52,7 @@ def _effective_box(shape: Shape) -> Box | None:
     상위 그룹의 회전·반전 등으로 슬라이드 좌표를 확인할 수 없으면 reader가 둘 다
     ``None``으로 남긴다. 그때는 좌표 기반 판정을 하지 않는다.
     """
-    return shape.rendered_box or shape.box
+    return shape.text_bounds or shape.box
 
 
 def _finding(
@@ -134,7 +134,7 @@ def _check_overflow(shape: Shape) -> list[Finding]:
     """렌더링 좌표와 도형 상자가 모두 있어야 판정한다. 없으면 판정 불가로 남긴다."""
     if not _has_text(shape):
         return []
-    rendered = shape.rendered_box
+    rendered = shape.text_bounds
     box = shape.box
     if rendered is None or box is None:
         missing = "렌더링된 글자 영역" if rendered is None else "도형 상자"
@@ -195,12 +195,26 @@ def _behind(back: Shape, front: Shape) -> bool | None:
     return back.z_order < front.z_order
 
 
+def _owns_content(container: Shape, content: Shape) -> bool:
+    outer, inner = container.locator, content.locator
+    return (
+        outer is not None
+        and inner is not None
+        and outer.kind == "shape"
+        and outer != inner
+        and inner.shape_path[: len(outer.shape_path)] == outer.shape_path
+    )
+
+
 def _check_overlap(shapes: list[Shape]) -> list[Finding]:
     findings: list[Finding] = []
     for shape in shapes:
         if _has_text(shape) and _effective_box(shape) is None:
             findings.append(_geometry_unknown("layout.overlap", shape, "좌표를 확인할 수 없어 겹침"))
     for a, b in combinations(shapes, 2):
+        # A table/group encloses its own cells/children by construction.
+        if _owns_content(a, b) or _owns_content(b, a):
+            continue
         a_text, b_text = _has_text(a), _has_text(b)
         if not (a_text or b_text):
             continue  # 장식 도형끼리의 겹침은 보지 않는다
