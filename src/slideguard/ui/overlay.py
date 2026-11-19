@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from slideguard.adapters import startup
+from slideguard.adapters.powerpoint.live_edit import LiveEditor, LiveEditUnavailable
 from slideguard.adapters.watching.paths import accepts_path, presentation_paths
 from slideguard.application.ports import FileRemoved
 from slideguard.bootstrap import (
@@ -54,7 +55,7 @@ from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Findin
 from slideguard.domain.policy import AnalysisPolicy, Purpose, Strength, ThresholdOverrides
 from slideguard.planning.bindings import TeamBindings
 from slideguard.ui.preview import render_slide_previews
-from slideguard.ui.slide_lens import SlideLens, SlideView, SlideViewProbe, build_marks
+from slideguard.ui.slide_lens import InputActivity, SlideLens, SlideView, SlideViewProbe, build_marks
 
 LOGGER = logging.getLogger("slideguard.overlay")
 
@@ -307,6 +308,32 @@ class LivePreviewWorker(QThread):
             )
         except Exception as error:
             self.completed.emit(LivePreviewOutcome(**base, error=f"{type(error).__name__}: {error}"))
+
+
+class LiveEditTask(QThread):
+    """렌즈 체크에 따라 열린 문서에 수정 후보를 적용하거나 되돌린다 (COM은 UI 스레드 밖에서)."""
+
+    done = Signal(object)  # LiveResult 또는 사용자에게 보여 줄 문장
+
+    def __init__(
+        self, editor: LiveEditor, report: AnalysisReport, proposal_ids: tuple[str, ...], checked: bool
+    ):
+        super().__init__()
+        self.editor, self.report, self.proposal_ids, self.checked = editor, report, proposal_ids, checked
+        self.key = ""  # 결과 안내를 붙일 배지
+
+    def run(self):
+        try:
+            if self.checked:
+                result = self.editor.apply(self.report, self.proposal_ids)
+            else:
+                result = self.editor.revert(self.proposal_ids)
+            self.done.emit(result)
+        except LiveEditUnavailable as error:
+            self.done.emit(str(error))
+        except Exception as error:  # noqa: BLE001
+            LOGGER.exception("LIVE_EDIT_FAILED")
+            self.done.emit(f"바로 적용하지 못했습니다: {type(error).__name__}")
 
 
 class PowerPointTracker:
@@ -1668,6 +1695,8 @@ class OverlayController(QObject):
         outline_locator=None,
         slide_navigator=None,
         slide_view_reader=None,
+        live_editor=None,
+        input_activity=None,
     ):
         super().__init__()
         self.overlay = OverlayWidget()
@@ -1685,6 +1714,16 @@ class OverlayController(QObject):
         self._lens_view: SlideView | None = None
         self._lens_target: PowerPointWindow | None = None
         self._lens_checked = 0.0
+        self._lens_window: tuple[int, QRect] | None = None  # 마지막으로 위치를 물은 PowerPoint 창
+        self._lens_force = True  # 입력이 없어도 다음 번에 한 번 묻기
+        # 렌즈 배지의 체크박스: 열린 문서에 바로 적용 / 되돌리기
+        self.live_editor = live_editor or LiveEditor()
+        self._live_task: LiveEditTask | None = None
+        self._live_hash: str | None = None  # 적용할 때의 검사 결과 (저장 후 재검사되면 기억을 지움)
+        self.lens.option_toggled.connect(self.toggle_live_edit)
+        # PowerPoint에 COM으로 묻는 일은 사용자 입력 뒤에만 (가만히 있을 때 바쁜 커서가 계속 돌지 않게)
+        self.activity = input_activity or InputActivity()
+        self._outline_window: QRect | None = None
         self.tracker = tracker or PowerPointTracker()
         self.path_provider = path_provider
         self.state_provider = state_provider
@@ -1775,16 +1814,16 @@ class OverlayController(QObject):
         dialogs = [dialog for dialog in self.overlay.findChildren(QDialog) if dialog.isVisible()]
         owned = {int(dialog.winId()) for dialog in dialogs}
         owned.add(int(self.overlay.winId()))
+        owned.update(self.lens.window_ids())
         target = self.tracker.poll(owned)
         if target is None:
             self._last_powerpoint_window = None
         else:
             window = (target.hwnd, target.title)
             now = monotonic()
-            if (
-                window != self._last_powerpoint_window
-                or self.active_path is None
-                or now - self._last_path_check >= 1.0
+            # 창이 바뀌면 바로, 그 밖에는 사용자 입력이 있었을 때만 (최소 1초 간격) 문서 경로를 다시 묻는다
+            if window != self._last_powerpoint_window or (
+                now - self._last_path_check >= 1.0 and self.activity.due("path")
             ):
                 self._last_powerpoint_window = window
                 self._last_path_check = now
@@ -1819,7 +1858,10 @@ class OverlayController(QObject):
         if not self.overlay.collapsed:
             self._clear_highlight()
         elif self._highlight is not None and self._preview_thread is None:
-            self._show_outline(target, navigate=False)
+            # 위치 표시도 창이 움직였거나 사용자 입력이 있었을 때만 PowerPoint에 다시 묻는다
+            if target.rect != self._outline_window or self.activity.due("outline"):
+                self._outline_window = QRect(target.rect)
+                self._show_outline(target, navigate=False)
 
     def _set_active_path(self, path: Path | None):
         if self.active_path == path:
@@ -1900,6 +1942,7 @@ class OverlayController(QObject):
 
     def _clear_highlight(self):
         self._highlight = None
+        self._outline_window = None
         self.outline.hide()
 
     def request_manual(self):
@@ -2420,7 +2463,9 @@ class OverlayController(QObject):
 
     # ---------------------------------------------------------- 슬라이드 렌즈
 
-    LENS_INTERVAL = 0.5  # PowerPoint에 현재 슬라이드·위치를 묻는 간격(초). 묻는 일은 작업 스레드에서 한다
+    LENS_INTERVAL = (
+        0.5  # PowerPoint에 현재 슬라이드·위치를 묻는 최소 간격(초). 묻는 일은 작업 스레드에서 한다
+    )
 
     def set_lens_enabled(self, enabled: bool):
         self.lens_enabled = bool(enabled)
@@ -2428,6 +2473,7 @@ class OverlayController(QObject):
             self._hide_lens()
         elif self._lens_target is not None:
             self._lens_checked = 0.0
+            self._lens_force = True
             self._update_lens(self._lens_target)
 
     def _lens_report(self) -> AnalysisReport | None:
@@ -2436,18 +2482,30 @@ class OverlayController(QObject):
             return None
         if not _same_path(Path(report.deck.source_path), self.active_path):
             return None
+        if self._live_hash is not None and report.deck.source_sha256 != self._live_hash:
+            # 저장 → 재검사로 결과가 바뀜: 적용한 값은 이제 문서의 일부이므로 기억만 지운다
+            self.live_editor.forget()
+            self._live_hash = None
+            self.lens.clear_notes()
         return report
 
     def _update_lens(self, target: PowerPointWindow | None):
         self._lens_target = target
         if target is None or not self.lens_enabled or self._stopping or self._lens_report() is None:
             self._hide_lens()
+            self._lens_window = None
             return
         if target.monitor_rect is None or target.screen_rect is None:
             self._hide_lens()
             return
         if self._lens_probe is not None or monotonic() - self._lens_checked < self.LENS_INTERVAL:
             return
+        window = (target.hwnd, QRect(target.rect))
+        # 창이 바뀌었거나 움직였거나, 사용자가 무언가 한 뒤 잠깐 멈췄을 때만 묻는다
+        if not (self._lens_force or window != self._lens_window or self.activity.due("lens")):
+            return
+        self._lens_force = False
+        self._lens_window = window
         self._lens_checked = monotonic()
         probe = SlideViewProbe(self.active_path, target.hwnd, self.slide_view_reader)
         probe.completed.connect(self._on_lens_view, Qt.ConnectionType.QueuedConnection)
@@ -2478,23 +2536,92 @@ class OverlayController(QObject):
         ):
             self._hide_lens()
             return
+        if not view.saved and self._live_hash is None:
+            # 사용자가 직접 고치고 아직 저장하지 않음: 검사 결과 위치가 맞지 않을 수 있어 숨긴다
+            self._hide_lens()
+            return
         client = _to_qt_rect(view.client_pixels, target.monitor_rect, target.screen_rect)
         slide_rect = _to_qt_rect(view.slide_pixels, target.monitor_rect, target.screen_rect)
         if client.width() < 50 or client.height() < 50 or slide_rect.width() < 50:
             self._hide_lens()
             return
         marks = build_marks(
-            report, view.slide, self.overlay.selected_proposal_ids(), locate=finding_location_box
+            report,
+            view.slide,
+            self.overlay.selected_proposal_ids(),
+            applied_ids=self.live_editor.applied_ids,
+            locate=finding_location_box,
         )
         self.lens.set_scene(client, slide_rect, view.slide_size_pt, marks)
         if not self.lens.isVisible():
             self.lens.show()
         _raise_over_powerpoint(self.lens, target)  # PowerPoint 바로 위, SlideGuard 패널 아래
+        for handle in self.lens.handles.values():
+            if handle.isVisible():
+                _raise_over_powerpoint(handle, target)
 
     def _hide_lens(self):
         if self.lens.isVisible():
             self.lens.hide()
             _restore_normal_stacking(self.lens)
+
+    # ---------------------------------------------------------- 렌즈 체크: 바로 적용 / 되돌리기
+
+    def toggle_live_edit(self, proposal_ids, checked: bool):
+        report = self._lens_report()
+        ids = tuple(str(item) for item in proposal_ids)
+        if report is None or not ids or self._live_task is not None:
+            return
+        key = next((item.shape_key for item in report.proposals if item.id == ids[0]), "")
+        if checked:
+            wanted = set(self.live_editor.applied_ids) | set(ids)
+            conflicts = _selection_conflicts(report, [item for item in report.proposals if item.id in wanted])
+            if conflicts:
+                self.lens.set_note(
+                    key, "이미 적용한 다른 수정과 함께 적용할 수 없습니다. 먼저 그 수정을 해제하세요."
+                )
+                return
+        self.lens.set_note(key, "")
+        task = LiveEditTask(self.live_editor, report, ids, checked)
+        task.key = key
+        task.done.connect(self._on_live_done, Qt.ConnectionType.QueuedConnection)
+        task.finished.connect(self._live_task_finished, Qt.ConnectionType.QueuedConnection)
+        self._live_task = task
+        self.lens.set_busy(True)
+        task.start()
+
+    def _on_live_done(self, outcome):
+        task = self._live_task
+        if task is None:
+            return
+        self._live_done(outcome, task.key, task.report)
+
+    def _live_done(self, outcome, key: str, report: AnalysisReport):
+        self.lens.set_busy(False)
+        if isinstance(outcome, str):
+            self.lens.set_note(key, outcome)
+        else:
+            if outcome.rejected:
+                self.lens.set_note(key, outcome.rejected[0][1])
+            elif outcome.skipped:
+                self.lens.set_note(key, f"직접 바꾼 값 {outcome.skipped}개는 그대로 두었습니다.")
+            if self.live_editor.applied_ids:
+                self._live_hash = report.deck.source_sha256
+            LOGGER.info(
+                "LIVE_EDIT | file=%s | applied=%s | rejected=%d | skipped=%d",
+                Path(report.deck.source_path).name,
+                ",".join(outcome.applied),
+                len(outcome.rejected),
+                outcome.skipped,
+            )
+        self._lens_force = True  # 바뀐 문서 상태(저장 안 됨 등)를 다시 읽는다
+        self._redraw_lens()
+
+    def _live_task_finished(self):
+        task, self._live_task = self._live_task, None
+        if task is not None:
+            task.wait()
+            task.deleteLater()
 
     def stop(self):
         self._stopping = True
@@ -2516,6 +2643,9 @@ class OverlayController(QObject):
         if self._lens_probe is not None:
             self._lens_probe.wait(2000)
             self._lens_probe = None
+        if self._live_task is not None:
+            self._live_task.wait(5000)
+            self._live_task = None
 
 
 def start_overlay(app: QApplication) -> OverlayController:

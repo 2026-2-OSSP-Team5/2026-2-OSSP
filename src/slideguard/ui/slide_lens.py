@@ -9,17 +9,22 @@
   SlideView          PowerPoint가 지금 보여 주는 슬라이드 번호와 화면 위치
   place_badges()     배지가 서로 겹치지 않게 자리 잡기                   (화면과 무관, 테스트 가능)
   paint_lens()       QPainter로 그리기 (위젯·이미지 어디에나)
-  SlideLens          클릭이 통과하는 투명 창. PowerPoint 바로 위, SlideGuard 패널 아래에 뜬다
+  SlideLens          테두리·요약을 그리는 투명 창 (클릭이 PowerPoint로 통과)
+  BadgeHandle        배지 하나짜리 작은 창. 마우스를 올리면 수정 후보 체크 목록이 펼쳐진다
+                     (체크 → 열린 문서에 바로 적용, 해제 → 원래대로. 실제 적용은 live_edit.LiveEditor)
   SlideViewProbe     PowerPoint에 현재 슬라이드·위치를 묻는 작업 스레드 (UI가 멈추지 않게)
+  InputActivity      사용자가 마우스·키보드를 쓴 뒤 잠깐 멈췄을 때만 PowerPoint에 묻게 하는 장치
+                     (가만히 있을 때 계속 물으면 PowerPoint가 바쁜 커서를 계속 띄움)
 """
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRect, QRectF, QSizeF, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QPointF, QRect, QRectF, QSizeF, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
 
 from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Finding
@@ -65,6 +70,16 @@ PROPERTY_TITLES = {
 
 
 @dataclass(frozen=True)
+class LensOption:
+    """배지를 펼치면 보이는 체크 항목 하나 (함께 적용해야 하는 묶음은 한 항목)."""
+
+    key: str
+    proposal_ids: tuple[str, ...]
+    label: str  # 예: "글자 크기 12pt → 14pt"
+    checked: bool = False  # 지금 문서에 적용되어 있는지
+
+
+@dataclass(frozen=True)
 class LensMark:
     """슬라이드 위 표시 하나 (개체 하나에 하나)."""
 
@@ -77,6 +92,9 @@ class LensMark:
     more: int = 0  # 같은 개체의 다른 문제 수
     before: str = ""  # change일 때 이전 값
     after: str = ""  # change일 때 이후 값
+    message: str = ""  # 펼쳤을 때 보여 줄 판정 설명
+    options: tuple[LensOption, ...] = ()  # 펼쳤을 때 보여 줄 수정 후보 체크 항목
+    applied: bool = False  # 수정 후보가 문서에 실제로 적용되어 있음 (아니면 선택만 한 상태)
 
 
 @dataclass(frozen=True)
@@ -88,6 +106,7 @@ class SlideView:
     slide_pixels: tuple[int, int, int, int]  # 슬라이드 (left, top, right, bottom)
     client_pixels: tuple[int, int, int, int]  # PowerPoint 창 안쪽 영역
     slide_size_pt: tuple[float, float]  # 슬라이드 크기 (가로, 세로)
+    saved: bool = True  # PowerPoint에 저장하지 않은 편집이 없는지
 
 
 # ------------------------------------------------------------------ 검사 결과 → 표시
@@ -98,28 +117,37 @@ def build_marks(
     slide: int,
     selected_ids: tuple[str, ...] | set[str] = (),
     *,
+    applied_ids: tuple[str, ...] | set[str] = (),
     locate=None,
 ) -> list[LensMark]:
-    """slide 번호의 검사 결과를 개체별 표시로 묶는다. locate(report, finding) → Box | None."""
+    """slide 번호의 검사 결과를 개체별 표시로 묶는다. locate(report, finding) → Box | None.
+
+    selected_ids: 패널에서 선택한 수정 후보 (점선으로 변경 예정 표시)
+    applied_ids:  렌즈 체크로 문서에 이미 적용한 수정 후보 (실선으로 변경 표시)
+    """
     locate = locate or (lambda _report, finding: finding.box)
     findings: dict[str, list[Finding]] = {}
     for finding in report.findings:
         if _slide_of(finding.shape_key) == slide:
             findings.setdefault(finding.shape_key, []).append(finding)
-    selected = {str(item) for item in selected_ids}
-    changes: dict[str, list[ChangeProposal]] = {}
+    proposals: dict[str, list[ChangeProposal]] = {}
     for proposal in report.proposals:
-        if proposal.id in selected and _slide_of(proposal.shape_key) == slide:
-            changes.setdefault(proposal.shape_key, []).append(proposal)
+        if _slide_of(proposal.shape_key) == slide:
+            proposals.setdefault(proposal.shape_key, []).append(proposal)
+    selected = {str(item) for item in selected_ids}
+    applied = {str(item) for item in applied_ids}
 
     marks = []
-    for key in sorted(set(findings) | set(changes), key=_key_order):
+    for key in sorted(set(findings) | set(proposals), key=_key_order):
         items = sorted(findings.get(key, []), key=lambda item: SEVERITY_ORDER.get(item.severity, 9))
         box = next((located for item in items if (located := locate(report, item)) is not None), None)
-        if box is None and key in changes:
+        if box is None:
             box = _shape_box(report, key)
-        if key in changes:
-            first = changes[key][0]
+        options = _options(report, proposals.get(key, []), applied)
+        active = [item for item in proposals.get(key, []) if item.id in applied or item.id in selected]
+        message = items[0].message if items else ""
+        if active:
+            first = active[0]
             marks.append(
                 LensMark(
                     key,
@@ -127,18 +155,57 @@ def build_marks(
                     "change",
                     PROPERTY_TITLES.get(first.property, first.property),
                     "",
-                    more=len(changes[key]) - 1,
+                    more=len(active) - 1,
                     before=_short(first.before, first.property),
                     after=_short(first.after, first.property),
+                    message=message,
+                    options=options,
+                    applied=any(item.id in applied for item in active),
                 )
             )
             continue
+        if not items:
+            continue  # 판정 없이 후보만 남은 개체는 표시하지 않음
         worst = items[0]
         value, target = metric_text(worst)
         marks.append(
-            LensMark(key, box, worst.severity, rule_title(worst), value, target, more=len(items) - 1)
+            LensMark(
+                key,
+                box,
+                worst.severity,
+                rule_title(worst),
+                value,
+                target,
+                more=len(items) - 1,
+                message=message,
+                options=options,
+            )
         )
     return marks
+
+
+def _options(
+    report: AnalysisReport, proposals: list[ChangeProposal], applied: set[str]
+) -> tuple[LensOption, ...]:
+    """한 개체의 수정 후보를 체크 항목으로. 같은 묶음(id의 #뒤)은 함께 켜고 끈다."""
+    groups: dict[str, list[ChangeProposal]] = {}
+    for proposal in proposals:
+        group = str(proposal.id).split("#", 1)[1] if "#" in str(proposal.id) else str(proposal.id)
+        groups.setdefault(group, [])
+    for proposal in report.proposals:  # 묶음은 다른 개체의 후보까지 함께 (모두 선택하거나 모두 해제)
+        group = str(proposal.id).split("#", 1)[1] if "#" in str(proposal.id) else str(proposal.id)
+        if group in groups:
+            groups[group].append(proposal)
+    options = []
+    for group, members in groups.items():
+        label = " + ".join(
+            f"{PROPERTY_TITLES.get(item.property, item.property)} {_short(item.before, item.property)} → "
+            f"{_short(item.after, item.property)}"
+            for item in members
+        )
+        ids = tuple(item.id for item in members)
+        options.append(LensOption(group, ids, label, checked=all(item in applied for item in ids)))
+    return tuple(options)
 
 
 def rule_title(finding: Finding) -> str:
@@ -261,18 +328,38 @@ def badge_size(mark: LensMark, font: QFont) -> QSizeF:
     return QSizeF(width, BADGE_HEIGHT)
 
 
-def paint_lens(painter: QPainter, slide_rect: QRectF, slide_size_pt, marks: list[LensMark], bounds: QRectF):
-    """slide_rect 위치에 보이는 슬라이드 위로 표시를 그린다."""
+def paint_lens(
+    painter: QPainter,
+    slide_rect: QRectF,
+    slide_size_pt,
+    marks: list[LensMark],
+    bounds: QRectF,
+    *,
+    badges: bool = True,
+):
+    """slide_rect 위치에 보이는 슬라이드 위로 표시를 그린다. badges=False면 테두리·요약만."""
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     font = badge_font()
     shown = [mark for mark in marks if mark.box is not None]
     frames = [map_box(mark.box, slide_rect, slide_size_pt) for mark in shown]
     for mark, frame in zip(shown, frames, strict=True):
         _paint_frame(painter, frame, mark)
-    sizes = [badge_size(mark, font) for mark in shown]
-    for mark, rect in zip(shown, place_badges(frames, sizes, bounds), strict=True):
-        _paint_badge(painter, rect, mark, font)
+    if badges:
+        sizes = [badge_size(mark, font) for mark in shown]
+        for mark, rect in zip(shown, place_badges(frames, sizes, bounds), strict=True):
+            _paint_badge(painter, rect, mark, font)
     _paint_summary(painter, slide_rect, marks, font, bounds)
+
+
+def badge_rects(
+    slide_rect: QRectF, slide_size_pt, marks: list[LensMark], bounds: QRectF
+) -> list[tuple[LensMark, QRectF]]:
+    """배지를 그릴 자리 (그리기와 손잡이 창이 같은 자리를 쓰도록)."""
+    font = badge_font()
+    shown = [mark for mark in marks if mark.box is not None]
+    frames = [map_box(mark.box, slide_rect, slide_size_pt) for mark in shown]
+    sizes = [badge_size(mark, font) for mark in shown]
+    return list(zip(shown, place_badges(frames, sizes, bounds), strict=True))
 
 
 def _paint_frame(painter: QPainter, frame: QRectF, mark: LensMark):
@@ -283,7 +370,7 @@ def _paint_frame(painter: QPainter, frame: QRectF, mark: LensMark):
     path.addRoundedRect(frame.adjusted(-3, -3, 3, 3), 6, 6)
     painter.fillPath(path, fill)
     pen = QPen(color, 2)
-    if mark.kind == "change":
+    if mark.kind == "change" and not mark.applied:  # 선택만 한 후보는 점선, 적용된 후보는 실선
         pen.setStyle(Qt.PenStyle.DashLine)
     painter.setPen(pen)
     painter.drawPath(path)
@@ -292,16 +379,17 @@ def _paint_frame(painter: QPainter, frame: QRectF, mark: LensMark):
         painter.fillRect(gutter, color)
 
 
-def _paint_badge(painter: QPainter, rect: QRectF, mark: LensMark, font: QFont):
+def _paint_badge(painter: QPainter, rect: QRectF, mark: LensMark, font: QFont, *, framed: bool = True):
     chip_text, accent = STYLE[mark.kind]
     accent = QColor(accent)
-    path = QPainterPath()
-    path.addRoundedRect(rect, 6, 6)
-    painter.fillPath(path, BADGE_BACKGROUND)
-    border = QColor(accent)
-    border.setAlpha(170)
-    painter.setPen(QPen(border, 1))
-    painter.drawPath(path)
+    if framed:
+        path = QPainterPath()
+        path.addRoundedRect(rect, 6, 6)
+        painter.fillPath(path, BADGE_BACKGROUND)
+        border = QColor(accent)
+        border.setAlpha(170)
+        painter.setPen(QPen(border, 1))
+        painter.drawPath(path)
 
     bold = QFont(font)
     bold.setBold(True)
@@ -400,9 +488,15 @@ def _paint_summary(painter: QPainter, slide_rect: QRectF, marks: list[LensMark],
 
 
 class SlideLens(QWidget):
-    """클릭이 PowerPoint로 그대로 통과하는 투명 창."""
+    """테두리·요약을 그리는 투명 창 (클릭은 PowerPoint로 통과).
 
-    def __init__(self):
+    interactive=True면 배지는 BadgeHandle 창들이 따로 그리고, 마우스를 올리면 체크 목록이 펼쳐진다.
+    체크를 바꾸면 option_toggled(제안 ID 묶음, 켜기 여부)를 보낸다.
+    """
+
+    option_toggled = Signal(object, bool)
+
+    def __init__(self, *, interactive: bool = True):
         super().__init__(
             None,
             Qt.WindowType.Tool
@@ -412,30 +506,374 @@ class SlideLens(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.interactive = interactive
         self._slide_rect = QRectF()
         self._slide_size = (960.0, 540.0)
         self._marks: list[LensMark] = []
+        self._handles: dict[str, BadgeHandle] = {}
+        self._busy = False
+        self._notes: dict[str, str] = {}
 
     @property
     def marks(self) -> list[LensMark]:
         return list(self._marks)
 
+    @property
+    def handles(self) -> dict[str, BadgeHandle]:
+        return dict(self._handles)
+
+    def window_ids(self) -> set[int]:
+        """SlideGuard가 띄운 창 목록 (PowerPoint 앞 창 판정에서 우리 창으로 취급)."""
+        ids = {int(self.winId())} if self.isVisible() else set()
+        ids.update(int(handle.winId()) for handle in self._handles.values() if handle.isVisible())
+        return ids
+
     def set_scene(self, geometry: QRect, slide_rect: QRect, slide_size_pt, marks: list[LensMark]):
         """geometry: 창 위치(PowerPoint 안쪽 영역), slide_rect: 그 안에서 슬라이드가 보이는 위치(화면 좌표)."""
         local = QRectF(slide_rect.translated(-geometry.topLeft()))
-        if self.geometry() == geometry and local == self._slide_rect and list(marks) == self._marks:
+        if (
+            self.geometry() == geometry
+            and local == self._slide_rect
+            and slide_size_pt == self._slide_size
+            and list(marks) == self._marks
+        ):
             return  # 바뀐 게 없으면 다시 그리지 않는다
         if self.geometry() != geometry:
             self.setGeometry(geometry)
         self._slide_rect = local
         self._slide_size = slide_size_pt
         self._marks = list(marks)
+        self._place_handles(geometry)
         self.update()
+
+    def set_busy(self, busy: bool):
+        self._busy = bool(busy)
+        for handle in self._handles.values():
+            handle.set_busy(self._busy)
+
+    def set_note(self, key: str, text: str):
+        """한 배지에 짧은 안내(적용하지 못한 이유 등)를 붙인다. 빈 문자열이면 지운다."""
+        if text:
+            self._notes[key] = text
+        else:
+            self._notes.pop(key, None)
+        if key in self._handles:
+            self._handles[key].set_note(text)
+
+    def clear_notes(self):
+        self._notes.clear()
+        for handle in self._handles.values():
+            handle.set_note("")
+
+    def _place_handles(self, geometry: QRect):
+        if not self.interactive:
+            return
+        bounds = QRectF(QRectF(0, 0, geometry.width(), geometry.height())).intersected(
+            self._slide_rect.adjusted(-4, -30, 4, 4)
+        )
+        wanted = badge_rects(self._slide_rect, self._slide_size, self._marks, bounds)
+        keep = set()
+        for mark, rect in wanted:
+            keep.add(mark.key)
+            handle = self._handles.get(mark.key)
+            if handle is None:
+                handle = BadgeHandle(self)
+                handle.toggled.connect(self.option_toggled)
+                self._handles[mark.key] = handle
+            handle.set_mark(mark, rect.toAlignedRect().translated(geometry.topLeft()))
+            handle.set_busy(self._busy)
+            handle.set_note(self._notes.get(mark.key, ""))
+            if self.isVisible() and not handle.isVisible():
+                handle.show()
+        for key in set(self._handles) - keep:
+            handle = self._handles.pop(key)
+            handle.hide()
+            handle.deleteLater()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        for handle in self._handles.values():
+            handle.show()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        for handle in self._handles.values():
+            handle.hide()
+
+    def close(self):
+        for handle in self._handles.values():
+            handle.close()
+        return super().close()
 
     def paintEvent(self, _event):
         painter = QPainter(self)
         bounds = QRectF(self.rect()).intersected(self._slide_rect.adjusted(-4, -30, 4, 4))
-        paint_lens(painter, self._slide_rect, self._slide_size, self._marks, bounds)
+        paint_lens(
+            painter, self._slide_rect, self._slide_size, self._marks, bounds, badges=not self.interactive
+        )
+
+
+CARD_WIDTH = 320
+ROW_HEIGHT = 28
+CHECK_SIZE = 14
+CHECK_ON = QColor("#2E90FA")
+
+
+class BadgeHandle(QWidget):
+    """배지 하나짜리 작은 창. 마우스를 올리면 판정 설명과 수정 후보 체크 목록이 펼쳐진다.
+
+    포커스를 가져가지 않으므로(클릭해도 PowerPoint가 앞 창으로 남음) 편집 흐름을 끊지 않는다.
+    """
+
+    toggled = Signal(object, bool)  # (제안 ID 묶음, 켜기 여부)
+
+    def __init__(self, owner: QWidget | None = None):
+        super().__init__(
+            owner,
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowDoesNotAcceptFocus,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setMouseTracking(True)
+        self.mark: LensMark | None = None
+        self.anchor = QRect()  # 접혀 있을 때 배지 자리 (화면 좌표)
+        self.expanded = False
+        self.busy = False
+        self.note = ""
+        self._hover_row = -1
+        self._collapse_timer = QTimer(self)
+        self._collapse_timer.setSingleShot(True)
+        self._collapse_timer.setInterval(350)
+        self._collapse_timer.timeout.connect(self.collapse)
+
+    # ------------------------------------------------------------ 상태
+    def set_mark(self, mark: LensMark, anchor: QRect):
+        changed = mark != self.mark or anchor != self.anchor
+        self.mark, self.anchor = mark, QRect(anchor)
+        if changed:
+            self._apply_geometry()
+            self.update()
+
+    def set_busy(self, busy: bool):
+        if busy != self.busy:
+            self.busy = busy
+            self._apply_geometry()
+            self.update()
+
+    def set_note(self, text: str):
+        if text != self.note:
+            self.note = text
+            self._apply_geometry()
+            self.update()
+
+    def expand(self):
+        self._collapse_timer.stop()
+        if not self.expanded:
+            self.expanded = True
+            self._apply_geometry()
+            self.update()
+
+    def collapse(self):
+        if self.expanded and not self.busy:
+            self.expanded = False
+            self._hover_row = -1
+            self._apply_geometry()
+            self.update()
+
+    # ------------------------------------------------------------ 배치
+    def _layout(self) -> dict:
+        """펼친 카드 안의 자리들 (그리기와 클릭 판정이 같은 값을 쓴다)."""
+        font = badge_font()
+        small = QFont(font)
+        small.setPointSizeF(9.0)
+        width = max(float(self.anchor.width()), CARD_WIDTH)
+        inner = width - 24
+        y = BADGE_HEIGHT + 8.0
+        message = None
+        if self.mark is not None and self.mark.message:
+            lines = min(3, max(1, _wrapped_lines(self.mark.message, font, inner)))
+            message = QRectF(12, y, inner, lines * QFontMetricsF(font).lineSpacing())
+            y = message.bottom() + 8
+        rows = []
+        options = self.mark.options if self.mark is not None else ()
+        for _option in options:
+            rows.append(QRectF(6, y, width - 12, ROW_HEIGHT))
+            y += ROW_HEIGHT
+        empty = None
+        if not options:
+            empty = QRectF(12, y, inner, ROW_HEIGHT)
+            y += ROW_HEIGHT
+        note = None
+        if self.busy or self.note:
+            note = QRectF(12, y + 2, inner, QFontMetricsF(small).lineSpacing() * 2)
+            y = note.bottom()
+        hint = QRectF(12, y + 6, inner, QFontMetricsF(small).lineSpacing())
+        return {
+            "size": QSizeF(width, hint.bottom() + 10),
+            "message": message,
+            "rows": rows,
+            "empty": empty,
+            "note": note,
+            "hint": hint,
+            "font": font,
+            "small": small,
+        }
+
+    def _apply_geometry(self):
+        if self.anchor.isEmpty():
+            return
+        if not self.expanded:
+            self.setGeometry(self.anchor)
+            return
+        size = self._layout()["size"].toSize()
+        rect = QRect(self.anchor.topLeft(), size)
+        screen = QGuiApplication.screenAt(self.anchor.center()) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            if rect.bottom() > area.bottom():  # 아래가 모자라면 배지 아래쪽을 기준으로 위로 펼친다
+                rect.moveBottom(self.anchor.bottom())
+            if rect.right() > area.right():
+                rect.moveRight(area.right())
+            if rect.top() < area.top():
+                rect.moveTop(area.top())
+            if rect.left() < area.left():
+                rect.moveLeft(area.left())
+        self.setGeometry(rect)
+
+    # ------------------------------------------------------------ 마우스
+    def enterEvent(self, event):
+        self.expand()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_row = -1
+        self._collapse_timer.start()
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):
+        row = self._row_at(event.position()) if self.expanded else -1
+        if row != self._hover_row:
+            self._hover_row = row
+            self.setCursor(Qt.CursorShape.PointingHandCursor if row >= 0 else Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if not self.expanded:
+            self.expand()
+            return
+        row = self._row_at(event.position())
+        if row < 0 or self.busy or self.mark is None:
+            return
+        option = self.mark.options[row]
+        self.toggled.emit(option.proposal_ids, not option.checked)
+
+    def _row_at(self, point: QPointF) -> int:
+        if not self.expanded:
+            return -1
+        for index, rect in enumerate(self._layout()["rows"]):
+            if rect.contains(point):
+                return index
+        return -1
+
+    # ------------------------------------------------------------ 그리기
+    def paintEvent(self, _event):
+        if self.mark is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = badge_font()
+        badge = QRectF(0, 0, self.anchor.width(), self.anchor.height())
+        if not self.expanded:
+            _paint_badge(painter, badge, self.mark, font)
+            return
+        layout = self._layout()
+        card = QRectF(0.5, 0.5, layout["size"].width() - 1, layout["size"].height() - 1)
+        accent = QColor(STYLE[self.mark.kind][1])
+        path = QPainterPath()
+        path.addRoundedRect(card, 8, 8)
+        painter.fillPath(path, QColor(18, 20, 26, 246))
+        painter.setPen(QPen(accent, 1.2))
+        painter.drawPath(path)
+        _paint_badge(painter, badge, self.mark, font, framed=False)
+        divider = QColor(accent)
+        divider.setAlpha(70)
+        painter.setPen(QPen(divider, 1))
+        painter.drawLine(QPointF(8, BADGE_HEIGHT + 2), QPointF(card.right() - 8, BADGE_HEIGHT + 2))
+
+        if layout["message"] is not None:
+            painter.setFont(font)
+            painter.setPen(TEXT_SUB)
+            painter.drawText(
+                layout["message"],
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
+                self.mark.message,
+            )
+        metrics = QFontMetricsF(font)
+        for index, (option, rect) in enumerate(zip(self.mark.options, layout["rows"], strict=True)):
+            if index == self._hover_row and not self.busy:
+                hover = QPainterPath()
+                hover.addRoundedRect(rect, 5, 5)
+                painter.fillPath(hover, QColor(255, 255, 255, 22))
+            box = QRectF(rect.left() + 8, rect.center().y() - CHECK_SIZE / 2, CHECK_SIZE, CHECK_SIZE)
+            _paint_check(painter, box, option.checked, dimmed=self.busy)
+            label = metrics.elidedText(option.label, Qt.TextElideMode.ElideRight, rect.width() - 40)
+            painter.setFont(font)
+            painter.setPen(TEXT_MAIN if not self.busy else TEXT_SUB)
+            painter.drawText(
+                QRectF(box.right() + 10, rect.top(), rect.width() - 40, rect.height()),
+                Qt.AlignmentFlag.AlignVCenter,
+                label,
+            )
+        small = layout["small"]
+        painter.setFont(small)
+        if layout["empty"] is not None:
+            painter.setPen(TEXT_SUB)
+            painter.drawText(layout["empty"], Qt.AlignmentFlag.AlignVCenter, "자동 수정 후보가 없습니다.")
+        if layout["note"] is not None:
+            painter.setPen(TEXT_SUB if self.busy else DIFF_BEFORE)
+            painter.drawText(
+                layout["note"],
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
+                "PowerPoint에 적용하는 중…" if self.busy else self.note,
+            )
+        painter.setPen(QColor("#8A90A0"))
+        painter.drawText(
+            layout["hint"],
+            Qt.AlignmentFlag.AlignVCenter,
+            "체크하면 바로 적용 · 해제하면 원래대로 · 유지하려면 저장",
+        )
+
+
+def _paint_check(painter: QPainter, box: QRectF, checked: bool, *, dimmed: bool = False):
+    path = QPainterPath()
+    path.addRoundedRect(box, 3, 3)
+    color = QColor(CHECK_ON)
+    if dimmed:
+        color.setAlpha(120)
+    if checked:
+        painter.fillPath(path, color)
+        pen = QPen(QColor("#FFFFFF"), 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawPolyline(
+            [
+                QPointF(box.left() + 3, box.center().y()),
+                QPointF(box.left() + 6, box.bottom() - 3.5),
+                QPointF(box.right() - 3, box.top() + 3.5),
+            ]
+        )
+    else:
+        painter.setPen(QPen(QColor("#98A2B3"), 1.4))
+        painter.drawPath(path)
+
+
+def _wrapped_lines(text: str, font: QFont, width: float) -> int:
+    metrics = QFontMetricsF(font)
+    rect = metrics.boundingRect(QRectF(0, 0, width, 10_000), int(Qt.TextFlag.TextWordWrap), text)
+    return max(1, round(rect.height() / metrics.lineSpacing()))
 
 
 class SlideViewProbe(QThread):
@@ -457,7 +895,10 @@ class SlideViewProbe(QThread):
 
 
 def read_slide_view(path: Path, hwnd: int) -> SlideView | None:
-    """저장된 상태로 기본 편집 보기에 열린 path의 현재 슬라이드 위치. 알 수 없으면 None."""
+    """기본 편집 보기에 열린 path의 현재 슬라이드 위치. 알 수 없으면 None.
+
+    저장하지 않은 편집이 있으면 saved=False (검사 결과 위치가 맞지 않을 수 있으므로 화면에서 판단).
+    """
     import pythoncom
     import win32com.client
     import win32gui
@@ -474,8 +915,7 @@ def read_slide_view(path: Path, hwnd: int) -> SlideView | None:
         if window is None:
             return None
         presentation = window.Presentation
-        if presentation.Saved != -1:  # 저장하지 않은 편집이 있으면 검사 결과 위치가 맞지 않을 수 있다
-            return None
+        saved = presentation.Saved == -1
         view = window.View
         slide = int(view.Slide.SlideIndex)
         width, height = float(presentation.PageSetup.SlideWidth), float(presentation.PageSetup.SlideHeight)
@@ -489,13 +929,84 @@ def read_slide_view(path: Path, hwnd: int) -> SlideView | None:
         client_left, client_top = win32gui.ClientToScreen(hwnd, (left, top))
         client_right, client_bottom = win32gui.ClientToScreen(hwnd, (right, bottom))
         return SlideView(
-            path, slide, slide_pixels, (client_left, client_top, client_right, client_bottom), (width, height)
+            path,
+            slide,
+            slide_pixels,
+            (client_left, client_top, client_right, client_bottom),
+            (width, height),
+            saved,
         )
     except Exception:  # noqa: BLE001 - 슬라이드 쇼·여러 슬라이드 보기 등은 표시하지 않음
         return None
     finally:
         view = window = presentation = application = None
         pythoncom.CoUninitialize()
+
+
+# ------------------------------------------------------------------ 입력이 있을 때만 묻기
+
+
+class InputActivity:
+    """PowerPoint에 COM으로 묻는 일을 "사용자가 무언가 한 뒤"로 줄인다.
+
+    다른 프로그램이 COM으로 계속 물으면 PowerPoint는 그때마다 바쁜 커서(돌아가는 커서)를 띄운다.
+    슬라이드·선택·저장 상태는 사용자가 마우스·키보드를 써야만 바뀌므로,
+    마지막 입력 뒤 settle초 동안 조용해졌을 때 한 번만 묻는다 (입력 중에는 묻지 않음).
+
+    due(이름)  이번에 물어도 되면 True. 이름별로 따로 센다 (렌즈, 문서 경로, 위치 표시 등)
+    reader     (마지막 입력 시각 표식, 입력 뒤 지난 초) 또는 None. None이면(Windows 아님) 항상 True
+    """
+
+    SETTLE = 0.3
+
+    def __init__(self, reader=None, settle: float = SETTLE):
+        self.reader = reader or last_input
+        self.settle = settle
+        self._seen: dict[str, object] = {}
+
+    def due(self, consumer: str) -> bool:
+        info = self.reader()
+        if info is None:
+            return True
+        stamp, idle = info
+        if self._seen.get(consumer) == stamp or idle < self.settle:
+            return False
+        self._seen[consumer] = stamp
+        return True
+
+    def reset(self, consumer: str | None = None):
+        """다음 due()가 (입력이 없어도) 한 번 True가 되게 한다."""
+        if consumer is None:
+            self._seen.clear()
+        else:
+            self._seen.pop(consumer, None)
+
+
+_LAST_INPUT_INFO = None
+
+
+def last_input():
+    """Windows 마지막 입력 시각과 그 뒤 지난 초. Windows가 아니거나 실패하면 None."""
+    global _LAST_INPUT_INFO
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        if _LAST_INPUT_INFO is None:
+
+            class LastInputInfo(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+            _LAST_INPUT_INFO = LastInputInfo
+        info = _LAST_INPUT_INFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        now = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
+        return int(info.dwTime), ((now - info.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ------------------------------------------------------------------ 작은 도우미

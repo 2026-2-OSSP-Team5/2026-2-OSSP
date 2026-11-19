@@ -5,15 +5,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QRect, QRectF, QSizeF
-from PySide6.QtGui import QColor, QImage, QPainter
+from PySide6.QtCore import QPointF, QRect, QRectF, QSizeF, Qt
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter
 from PySide6.QtWidgets import QApplication
 
+from slideguard.adapters.powerpoint.live_edit import LiveResult
 from slideguard.adapters.storage.sqlite import WorkspaceSettings
 from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, DeckSnapshot, Finding
 from slideguard.ui import overlay
 from slideguard.ui.slide_lens import (
-    LensMark,
+    BadgeHandle,
+    InputActivity,
     SlideView,
     build_marks,
     map_box,
@@ -72,6 +74,32 @@ def test_selected_proposals_turn_into_diff_marks(tmp_path):
     assert marks["1:2"].kind == "change" and (marks["1:2"].before, marks["1:2"].after) == ("11pt", "14pt")
     assert (marks["1:3"].before, marks["1:3"].after) == ("#C8C8C8", "#767676")
     assert marks["1:4"].kind == "warning"  # 선택하지 않은 개체는 그대로 문제 표시
+    assert not marks["1:2"].applied  # 패널에서 선택만 함 → 점선
+
+
+def test_marks_offer_proposals_as_options_and_show_applied_ones(tmp_path):
+    report = _report(tmp_path / "d.pptx")
+    marks = {mark.key: mark for mark in build_marks(report, 1, applied_ids={"font.size@1:2"})}
+    option = marks["1:2"].options[0]
+    assert option.proposal_ids == ("font.size@1:2",) and option.checked
+    assert option.label == "글자 크기 11pt → 14pt"
+    assert marks["1:2"].kind == "change" and marks["1:2"].applied
+    assert marks["1:2"].message == "메시지"
+    assert not marks["1:3"].options[0].checked and marks["1:3"].kind == "warning"
+    assert marks["1:4"].options == ()
+
+
+def test_bundled_proposals_toggle_together(tmp_path):
+    report = _report(tmp_path / "d.pptx")
+    report.proposals += [
+        ChangeProposal("shape.height@1:4#overflow:1:4", "x", "1:4", "shape.height", 60, 90, 0.1),
+        ChangeProposal(
+            "shape.position@1:6#overflow:1:4", "x", "1:6", "shape.position", (50, 170), (50, 190), 0.1
+        ),
+    ]
+    marks = {mark.key: mark for mark in build_marks(report, 1)}
+    (option,) = marks["1:4"].options
+    assert option.proposal_ids == ("shape.height@1:4#overflow:1:4", "shape.position@1:6#overflow:1:4")
 
 
 @pytest.mark.parametrize(
@@ -161,11 +189,13 @@ def controller(application, tmp_path, monkeypatch):
     target = overlay.PowerPointWindow(
         7, QRect(0, 0, 1600, 900), "deck.pptx - PowerPoint", (0, 0, 1600, 900), screen
     )
-    views = {"slide": 1}
+    views = {"slide": 1, "saved": True}
 
     def reader(view_path, hwnd):
         assert hwnd == 7
-        return SlideView(view_path, views["slide"], (300, 150, 1260, 690), (0, 0, 1600, 900), (960, 540))
+        return SlideView(
+            view_path, views["slide"], (300, 150, 1260, 690), (0, 0, 1600, 900), (960, 540), views["saved"]
+        )
 
     built = overlay.OverlayController(
         tracker=_Tracker(target),
@@ -206,9 +236,13 @@ def test_selecting_a_proposal_shows_the_change_on_the_slide(controller, applicat
     assert _poll_until_lens(controller, application, 1)
     controller.overlay.proposal_items["font.size@1:2"].setCheckState(overlay.Qt.CheckState.Checked)
     application.processEvents()
-    marks = {mark.key: mark for mark in controller.lens.marks}
-    assert marks["1:2"] == LensMark(
-        marks["1:2"].key, marks["1:2"].box, "change", "글자 크기", "", before="11pt", after="14pt"
+    mark = {mark.key: mark for mark in controller.lens.marks}["1:2"]
+    assert (mark.kind, mark.title, mark.before, mark.after, mark.applied) == (
+        "change",
+        "글자 크기",
+        "11pt",
+        "14pt",
+        False,
     )
 
 
@@ -226,9 +260,147 @@ def test_lens_hides_when_turned_off_stale_or_powerpoint_leaves(controller, appli
     assert not controller.lens.isVisible()
 
 
-def test_unsaved_or_unreadable_view_hides_the_lens(controller, application):
-    controller.slide_view_reader = lambda *_args: None  # 저장 안 한 편집, 슬라이드 쇼 등
-    controller.poll_powerpoint()
-    _wait_for(lambda: controller._lens_probe is None, application)
-    controller.poll_powerpoint()
-    assert not controller.lens.isVisible()
+def test_unreadable_view_hides_the_lens(controller, application):
+    assert _poll_until_lens(controller, application, 1)
+    controller.slide_view_reader = lambda *_args: None  # 슬라이드 쇼, 여러 슬라이드 보기 등
+    controller._lens_force = True
+    assert _wait_for(lambda: (controller.poll_powerpoint(), not controller.lens.isVisible())[1], application)
+
+
+def test_user_edits_hide_the_lens_but_our_live_edits_keep_it(controller, application):
+    assert _poll_until_lens(controller, application, 1)
+    controller.views["saved"] = False  # 사용자가 직접 고치고 저장하지 않음
+    controller._lens_force = True
+    assert _wait_for(lambda: (controller.poll_powerpoint(), not controller.lens.isVisible())[1], application)
+    controller._live_hash = controller.overlay._report.deck.source_sha256  # 렌즈 체크로 바꾼 상태
+    controller._lens_force = True
+    assert _wait_for(lambda: (controller.poll_powerpoint(), controller.lens.isVisible())[1], application)
+
+
+# ---------------------------------------------------------------- 배지 펼치기·체크
+
+
+def _click(widget, point):
+    for kind in (QMouseEvent.Type.MouseMove, QMouseEvent.Type.MouseButtonPress):
+        event = QMouseEvent(
+            kind,
+            QPointF(point),
+            QPointF(point),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(widget, event)
+
+
+def test_hovering_a_badge_expands_it_and_clicking_a_row_toggles(application, tmp_path):
+    mark = {m.key: m for m in build_marks(_report(tmp_path / "d.pptx"), 1)}["1:2"]
+    handle = BadgeHandle()
+    handle.set_mark(mark, QRect(100, 100, 180, 26))
+    assert handle.geometry() == QRect(100, 100, 180, 26) and not handle.expanded
+    seen = []
+    handle.toggled.connect(lambda ids, checked: seen.append((ids, checked)))
+    handle.expand()  # 마우스를 올림
+    assert handle.expanded and handle.width() >= 300 and handle.height() > 26
+    row = handle._layout()["rows"][0]
+    _click(handle, row.center())
+    assert seen == [(("font.size@1:2",), True)]
+    handle.set_busy(True)  # 적용 중에는 다시 누를 수 없음
+    _click(handle, row.center())
+    assert len(seen) == 1
+    handle.set_busy(False)
+    handle.collapse()
+    assert handle.geometry() == QRect(100, 100, 180, 26)
+    handle.close()
+
+
+def test_controller_applies_and_reverts_from_the_lens(controller, application):
+    calls = []
+
+    class FakeEditor:
+        applied_ids: set = set()
+
+        def apply(self, report, ids):
+            calls.append(("apply", tuple(ids)))
+            self.applied_ids = set(ids)
+            return LiveResult(applied=list(ids))
+
+        def revert(self, ids):
+            calls.append(("revert", tuple(ids)))
+            self.applied_ids = set()
+            return LiveResult(applied=list(ids))
+
+        def forget(self):
+            self.applied_ids = set()
+
+    controller.live_editor = FakeEditor()
+    assert _poll_until_lens(controller, application, 1)
+    assert set(controller.lens.handles) == {"1:2", "1:3", "1:4"}  # 위치를 모르는 1:5는 요약에만
+    controller.lens.handles["1:2"].toggled.emit(("font.size@1:2",), True)
+    assert _wait_for(lambda: controller._live_task is None and calls, application)
+    application.processEvents()
+    mark = {m.key: m for m in controller.lens.marks}["1:2"]
+    assert calls == [("apply", ("font.size@1:2",))] and mark.applied and mark.options[0].checked
+    controller.lens.option_toggled.emit(("font.size@1:2",), False)
+    assert _wait_for(lambda: controller._live_task is None and len(calls) == 2, application)
+    application.processEvents()
+    assert calls[1] == ("revert", ("font.size@1:2",))
+    assert {m.key: m for m in controller.lens.marks}["1:2"].kind == "warning"
+
+
+def test_failed_live_edit_shows_a_note_on_the_badge(controller, application):
+    class Closed:
+        applied_ids: set = set()
+
+        def apply(self, report, ids):
+            from slideguard.adapters.powerpoint.live_edit import LiveEditUnavailable
+
+            raise LiveEditUnavailable("PowerPoint에서 이 문서가 열려 있을 때만 바로 고칠 수 있습니다.")
+
+        def forget(self):
+            pass
+
+    controller.live_editor = Closed()
+    assert _poll_until_lens(controller, application, 1)
+    controller.lens.option_toggled.emit(("font.size@1:2",), True)
+    assert _wait_for(lambda: controller.lens.handles["1:2"].note != "", application)
+    assert "열려 있을 때만" in controller.lens.handles["1:2"].note
+    assert not controller.lens.handles["1:2"].busy
+
+
+# ---------------------------------------------------------------- 바쁜 커서 줄이기
+
+
+def test_input_activity_asks_once_per_input_after_a_short_pause():
+    state = {"info": (100, 0.05)}
+    activity = InputActivity(lambda: state["info"], settle=0.3)
+    assert not activity.due("lens")  # 아직 입력 중
+    state["info"] = (100, 0.5)
+    assert activity.due("lens")
+    assert not activity.due(
+        "lens"
+    )  # 같은 입력으로는 다시 묻지 않음 (가만히 있으면 PowerPoint를 건드리지 않음)
+    assert activity.due("path")  # 이름별로 따로
+    state["info"] = (250, 0.4)
+    assert activity.due("lens")
+    activity.reset("lens")
+    assert activity.due("lens")
+    assert InputActivity(lambda: None).due("x")  # Windows가 아니면 제한 없음
+
+
+def test_idle_user_means_no_more_powerpoint_queries(controller, application):
+    probes = []
+    reader = controller.slide_view_reader
+
+    def counting(path, hwnd):
+        probes.append(path)
+        return reader(path, hwnd)
+
+    controller.slide_view_reader = counting
+    controller.activity = InputActivity(lambda: (7, 10.0))
+    controller._lens_force = True
+    assert _wait_for(lambda: (controller.poll_powerpoint(), len(probes) == 1)[1], application)
+    for _ in range(20):  # 사용자가 아무것도 하지 않음
+        _wait_for(lambda: controller._lens_probe is None, application)
+        controller.poll_powerpoint()
+    assert len(probes) == 2  # 처음 강제로 한 번 + 아직 보지 못한 입력 한 번, 그 뒤로는 묻지 않음
