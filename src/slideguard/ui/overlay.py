@@ -1778,7 +1778,9 @@ class OverlayController(QObject):
 
     def restart_collection(self):
         if self.collection is not None:
-            self.collection.stop()
+            # 기다리지 않는다: 이전 폴더의 파일을 PowerPoint로 읽는 중이면 그 파일이 끝날 때까지
+            # 화면이 멈췄다 (시작 직후 폴더를 바꾸면 수십 초). 이전 결과는 stop 즉시 버려진다.
+            self.collection.stop(wait=False)
             self.collection = None
         self._workspace = None
         self._processing_paths.clear()
