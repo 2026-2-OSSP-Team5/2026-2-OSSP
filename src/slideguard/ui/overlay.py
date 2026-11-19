@@ -54,6 +54,7 @@ from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Findin
 from slideguard.domain.policy import AnalysisPolicy, Purpose, Strength, ThresholdOverrides
 from slideguard.planning.bindings import TeamBindings
 from slideguard.ui.preview import render_slide_previews
+from slideguard.ui.slide_lens import SlideLens, SlideView, SlideViewProbe, build_marks
 
 LOGGER = logging.getLogger("slideguard.overlay")
 
@@ -731,6 +732,7 @@ class OverlayWidget(QWidget):
     slide_requested = Signal(object)
     lock_requested = Signal(str)
     preview_state_changed = Signal()
+    lens_toggled = Signal(bool)
 
     def __init__(self):
         super().__init__()
@@ -807,6 +809,13 @@ class OverlayWidget(QWidget):
         workspace = QPushButton("작업 폴더·이력")
         workspace.clicked.connect(self.workspace_requested)
         header.addWidget(workspace)
+        self.lens_check = QCheckBox("슬라이드 위 표시")
+        self.lens_check.setToolTip(
+            "문제가 있는 개체 위에 배지와 테두리를 겹쳐 보여 줍니다. 클릭은 PowerPoint로 그대로 전달됩니다."
+        )
+        self.lens_check.setChecked(True)
+        self.lens_check.toggled.connect(self.lens_toggled)
+        header.addWidget(self.lens_check)
         self.collapse_button = QPushButton("접기")
         self.collapse_button.clicked.connect(lambda: self.set_collapsed(True))
         header.addWidget(self.collapse_button)
@@ -1658,6 +1667,7 @@ class OverlayController(QObject):
         copy_inspector=inspect_saved_copy,
         outline_locator=None,
         slide_navigator=None,
+        slide_view_reader=None,
     ):
         super().__init__()
         self.overlay = OverlayWidget()
@@ -1667,6 +1677,14 @@ class OverlayController(QObject):
         self.outline_locator = outline_locator or _powerpoint_finding_rect
         self.slide_navigator = slide_navigator or _navigate_powerpoint_slide
         self._highlight: tuple[Path, int, Box] | None = None
+        # 슬라이드 렌즈: 지금 보이는 슬라이드 위에 검사 결과 배지·변경 표시를 겹쳐 그림
+        self.lens = SlideLens()
+        self.lens_enabled = True
+        self.slide_view_reader = slide_view_reader
+        self._lens_probe: SlideViewProbe | None = None
+        self._lens_view: SlideView | None = None
+        self._lens_target: PowerPointWindow | None = None
+        self._lens_checked = 0.0
         self.tracker = tracker or PowerPointTracker()
         self.path_provider = path_provider
         self.state_provider = state_provider
@@ -1700,6 +1718,8 @@ class OverlayController(QObject):
         self.overlay.slide_requested.connect(self.navigate_to_finding_slide)
         self.overlay.lock_requested.connect(self.show_settings)
         self.overlay.preview_state_changed.connect(self.schedule_preview)
+        self.overlay.preview_state_changed.connect(self._redraw_lens)
+        self.overlay.lens_toggled.connect(self.set_lens_enabled)
         self.settings_dialog.settings_saved.connect(self.restart_collection)
         self.detected.connect(self._on_detected)
         self.completed.connect(self._on_completed)
@@ -1782,6 +1802,7 @@ class OverlayController(QObject):
                 else:
                     dialog.reject()
         self.overlay.set_target(target)
+        self._update_lens(target)
         if target is None:
             outline_visible = self.outline.isVisible()
             self.outline.hide()
@@ -2397,6 +2418,84 @@ class OverlayController(QObject):
         if app is not None:
             app.quit()
 
+    # ---------------------------------------------------------- 슬라이드 렌즈
+
+    LENS_INTERVAL = 0.5  # PowerPoint에 현재 슬라이드·위치를 묻는 간격(초). 묻는 일은 작업 스레드에서 한다
+
+    def set_lens_enabled(self, enabled: bool):
+        self.lens_enabled = bool(enabled)
+        if not self.lens_enabled:
+            self._hide_lens()
+        elif self._lens_target is not None:
+            self._lens_checked = 0.0
+            self._update_lens(self._lens_target)
+
+    def _lens_report(self) -> AnalysisReport | None:
+        report = self.overlay._report
+        if report is None or self.overlay._report_stale or self.active_path is None:
+            return None
+        if not _same_path(Path(report.deck.source_path), self.active_path):
+            return None
+        return report
+
+    def _update_lens(self, target: PowerPointWindow | None):
+        self._lens_target = target
+        if target is None or not self.lens_enabled or self._stopping or self._lens_report() is None:
+            self._hide_lens()
+            return
+        if target.monitor_rect is None or target.screen_rect is None:
+            self._hide_lens()
+            return
+        if self._lens_probe is not None or monotonic() - self._lens_checked < self.LENS_INTERVAL:
+            return
+        self._lens_checked = monotonic()
+        probe = SlideViewProbe(self.active_path, target.hwnd, self.slide_view_reader)
+        probe.completed.connect(self._on_lens_view, Qt.ConnectionType.QueuedConnection)
+        probe.finished.connect(self._lens_probe_finished, Qt.ConnectionType.QueuedConnection)
+        self._lens_probe = probe
+        probe.start()
+
+    def _on_lens_view(self, view: SlideView | None):
+        self._lens_view = view
+        self._redraw_lens()
+
+    def _lens_probe_finished(self):
+        probe, self._lens_probe = self._lens_probe, None
+        if probe is not None:
+            probe.wait()
+            probe.deleteLater()
+
+    def _redraw_lens(self):
+        target, view, report = self._lens_target, self._lens_view, self._lens_report()
+        if (
+            not self.lens_enabled
+            or target is None
+            or view is None
+            or report is None
+            or target.monitor_rect is None
+            or target.screen_rect is None
+            or not _same_path(view.path, Path(report.deck.source_path))
+        ):
+            self._hide_lens()
+            return
+        client = _to_qt_rect(view.client_pixels, target.monitor_rect, target.screen_rect)
+        slide_rect = _to_qt_rect(view.slide_pixels, target.monitor_rect, target.screen_rect)
+        if client.width() < 50 or client.height() < 50 or slide_rect.width() < 50:
+            self._hide_lens()
+            return
+        marks = build_marks(
+            report, view.slide, self.overlay.selected_proposal_ids(), locate=finding_location_box
+        )
+        self.lens.set_scene(client, slide_rect, view.slide_size_pt, marks)
+        if not self.lens.isVisible():
+            self.lens.show()
+        _raise_over_powerpoint(self.lens, target)  # PowerPoint 바로 위, SlideGuard 패널 아래
+
+    def _hide_lens(self):
+        if self.lens.isVisible():
+            self.lens.hide()
+            _restore_normal_stacking(self.lens)
+
     def stop(self):
         self._stopping = True
         self.timer.stop()
@@ -2413,6 +2512,10 @@ class OverlayController(QObject):
             self.collection = None
         self._apply_finished()
         self._preview_thread_finished()
+        self._hide_lens()
+        if self._lens_probe is not None:
+            self._lens_probe.wait(2000)
+            self._lens_probe = None
 
 
 def start_overlay(app: QApplication) -> OverlayController:
