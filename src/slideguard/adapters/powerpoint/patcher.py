@@ -314,47 +314,52 @@ class PowerPointPatcher:
     # ------------------------------------------------------------------
 
     def _apply_one(self, doc: Document, p: ChangeProposal, result: ApplyResult) -> None:
-        where = f"슬라이드 {p.slide_index} 객체 {p.shape_id}"
+        apply_proposal(doc, p, result)
 
-        shape = doc.find_shape(p.slide_index, p.shape_id)
-        if shape is None:
-            result.rejected.append((p, f"{where}를 찾을 수 없음"))
-            return
 
-        appliers = {
-            Property.FONT_SIZE: _apply_font_size,
-            Property.FONT_COLOR: _apply_font_color,
-            Property.FONT_FAMILY: _apply_font_family,
-            Property.SHAPE_HEIGHT: _apply_height,
-            Property.SHAPE_POSITION: _apply_position,
-            Property.Z_ORDER: _apply_zorder,
-            Property.SHAPE_FILL: _apply_fill,
-            Property.AUTOFIT: _apply_autofit,
-            Property.LINE_SPACING: _apply_line_spacing,
-        }
-        applier = appliers.get(p.prop)
-        if applier is None:
-            result.rejected.append((p, f"적용 미지원 속성: {p.prop}"))
-            return
+def apply_proposal(doc: Document, p: ChangeProposal, result: ApplyResult) -> None:
+    """후보 하나를 문서에 적용하고 결과를 result에 남긴다 (실시간 적용 live_edit에서도 씀)."""
+    where = f"슬라이드 {p.slide_index} 객체 {p.shape_id}"
 
-        # applier는 바꾼 개수(int) 또는 거절 이유(str)를 돌려줌
-        outcome = applier(shape, p)
-        if isinstance(outcome, str):
-            result.rejected.append((p, f"{where}: {outcome}"))
-            return
-        if outcome == 0:
-            result.rejected.append((p, f"{where}의 현재 값이 후보 작성 시점과 달라 적용하지 않음"))
-            return
+    shape = doc.find_shape(p.slide_index, p.shape_id)
+    if shape is None:
+        result.rejected.append((p, f"{where}를 찾을 수 없음"))
+        return
 
-        result.applied.append(p)
+    appliers = {
+        Property.FONT_SIZE: _apply_font_size,
+        Property.FONT_COLOR: _apply_font_color,
+        Property.FONT_FAMILY: _apply_font_family,
+        Property.SHAPE_HEIGHT: _apply_height,
+        Property.SHAPE_POSITION: _apply_position,
+        Property.Z_ORDER: _apply_zorder,
+        Property.SHAPE_FILL: _apply_fill,
+        Property.AUTOFIT: _apply_autofit,
+        Property.LINE_SPACING: _apply_line_spacing,
+    }
+    applier = appliers.get(p.prop)
+    if applier is None:
+        result.rejected.append((p, f"적용 미지원 속성: {p.prop}"))
+        return
 
-        # 글자가 커지는 변경은 넘칠 수 있으므로 확인 (최종 판단은 재검사에서)
-        if p.prop in (Property.FONT_SIZE, Property.AUTOFIT, Property.LINE_SPACING):
-            overflow = shape.text_overflows()
-            if overflow is True:
-                result.warnings.append(f"{where}: 변경 후 텍스트가 상자를 넘칩니다.")
-            elif overflow is None:
-                result.warnings.append(f"{where}: 넘침 여부를 확인하지 못했습니다. 재검사 결과를 확인하세요.")
+    # applier는 바꾼 개수(int) 또는 거절 이유(str)를 돌려줌
+    outcome = applier(shape, p)
+    if isinstance(outcome, str):
+        result.rejected.append((p, f"{where}: {outcome}"))
+        return
+    if outcome == 0:
+        result.rejected.append((p, f"{where}의 현재 값이 후보 작성 시점과 달라 적용하지 않음"))
+        return
+
+    result.applied.append(p)
+
+    # 글자가 커지는 변경은 넘칠 수 있으므로 확인 (최종 판단은 재검사에서)
+    if p.prop in (Property.FONT_SIZE, Property.AUTOFIT, Property.LINE_SPACING):
+        overflow = shape.text_overflows()
+        if overflow is True:
+            result.warnings.append(f"{where}: 변경 후 텍스트가 상자를 넘칩니다.")
+        elif overflow is None:
+            result.warnings.append(f"{where}: 넘침 여부를 확인하지 못했습니다. 재검사 결과를 확인하세요.")
 
 
 # ======================================================================
@@ -544,6 +549,7 @@ except ImportError:
 MSO_FALSE = 0
 MSO_TRUE = -1
 MSO_BRING_TO_FRONT = 0
+MSO_SEND_BACKWARD = 3
 AUTOSIZE_NAMES = {0: "none", 1: "grow", 2: "shrink"}  # msoAutoSizeNone / ShapeToFitText / TextToFitShape
 AUTOSIZE_VALUES = {"none": 0, "grow": 1, "shrink": 2}
 
@@ -690,11 +696,25 @@ class _ComShape:
     def bring_to_front(self) -> None:
         self._shape.ZOrder(MSO_BRING_TO_FRONT)
 
+    def get_zorder(self) -> int:
+        return int(self._shape.ZOrderPosition)
+
+    def set_zorder(self, position: int) -> None:
+        """앞뒤 순서를 position(1=맨 뒤)으로 되돌린다. 한 칸씩 뒤로 보내며 맞춘다."""
+        for _ in range(500):
+            current = int(self._shape.ZOrderPosition)
+            if current <= position:
+                return
+            self._shape.ZOrder(MSO_SEND_BACKWARD)
+
     def get_fill(self) -> tuple[str, float] | None:
         fill = self._shape.Fill
         if fill.Visible != MSO_TRUE:
             return None
         return (_bgr_int_to_hex(int(fill.ForeColor.RGB)), float(fill.Transparency))
+
+    def clear_fill(self) -> None:
+        self._shape.Fill.Visible = MSO_FALSE
 
     def set_fill(self, hex_color: str, transparency: float) -> None:
         fill = self._shape.Fill

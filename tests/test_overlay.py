@@ -23,7 +23,7 @@ from slideguard.domain.models import (
 )
 from slideguard.domain.policy import AnalysisPolicy
 from slideguard.planning.bindings import TeamBindings
-from slideguard.ui import desktop, overlay
+from slideguard.ui import desktop, overlay, slide_lens
 
 
 @pytest.fixture(scope="module")
@@ -37,6 +37,15 @@ def isolated_startup_settings(monkeypatch):
     monkeypatch.setattr(
         overlay.startup, "set_enabled", lambda _value: pytest.fail("Unexpected Windows startup registration")
     )
+
+
+@pytest.fixture(autouse=True)
+def no_real_input(monkeypatch):
+    # PowerPoint 조회는 사용자 입력이 있을 때만 한다(slide_lens.InputActivity).
+    # 이 파일의 테스트는 입력 없이 poll_powerpoint()만 반복하므로, 테스트를 돌리는 PC의 실제
+    # 마우스·키보드 상태(CI 서버는 입력이 전혀 없음)에 결과가 좌우되지 않게 "입력 정보 없음"으로 둔다.
+    # 입력에 따른 동작 자체는 test_slide_lens.py에서 가짜 입력으로 따로 확인한다.
+    monkeypatch.setattr(slide_lens, "last_input", lambda: None)
 
 
 def _report(path: Path, source_sha256: str) -> AnalysisReport:

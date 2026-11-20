@@ -1336,6 +1336,9 @@ def main(*, background: bool | None = None) -> int:
 
     try:
         LOGGER.info("DESKTOP_STARTED")
+        from slideguard.ui.freeze_watch import install_freeze_watch
+
+        install_freeze_watch(app)  # 화면이 멈추면 어디서 멈췄는지 slideguard.log에 남김
         return _run_desktop(app, background=background)
     finally:
         LOGGER.info("DESKTOP_STOPPED")
