@@ -87,6 +87,28 @@ def _number(value: object) -> float | None:
         return None
 
 
+# 렌더링 주변 픽셀이 이 범위 안(각 RGB 채널 차이)이면 배경이 한 가지 색이라고 본다
+PLAIN_BACKGROUND_SPREAD = 12
+
+
+def _plain_background(samples: list[str]) -> str | None:
+    """주변 픽셀이 사실상 한 가지 색이면 그 색, 아니면 None.
+
+    옆 도형 테두리 선·옆 글자 획 같은 잡음이 섞이므로 밝기 순으로 위아래 20%씩 빼고 본다.
+    """
+    if len(samples) < 4:
+        return None
+    pixels = sorted((_rgb(color) for color in samples), key=sum)
+    cut = int(len(pixels) * 0.2)
+    middle = pixels[cut : len(pixels) - cut] or pixels
+    for channel in range(3):
+        values = [pixel[channel] for pixel in middle]
+        if max(values) - min(values) > PLAIN_BACKGROUND_SPREAD:
+            return None
+    r, g, b = middle[len(middle) // 2]
+    return f"{r:02X}{g:02X}{b:02X}"
+
+
 def parse_shape_key(key: str) -> tuple[int, int] | None:
     """'3:12' → (3, 12). 그룹 안 객체·표 칸처럼 긴 주소면 None."""
     match = _SIMPLE_KEY.match(str(key))
@@ -399,12 +421,26 @@ class TeamBindings:
         ]
         samples = [color for color in samples if color is not None]
         if samples and ratio is not None:
+            from slideguard.checks.contrast import best_sample_contrast, sample_contrast  # B와 같은 계산
+
+            pixels = [_rgb(color) for color in samples]
             for color in runs:
-                worst = min(contrast_ratio(color, sample) for sample in samples)
-                if abs(worst - ratio) <= _RATIO_TOLERANCE:
+                worst, _pixel = sample_contrast(_rgb(color), pixels)
+                best = best_sample_contrast(_rgb(color), pixels)
+                if min(abs(worst - ratio), abs(best - ratio)) <= _RATIO_TOLERANCE:
                     foreground = color
                     break
-        return {"foreground": foreground, "background_kind": "image"}
+        plain = _plain_background(samples)
+        if plain is not None:
+            # 렌더링해 보니 글자 뒤가 사실상 한 가지 색 (흰 슬라이드 위 연회색 출처 글씨 등)
+            # → 배경판을 깔 게 아니라 글자색을 고치면 된다 (함정 PPT 3쪽)
+            return {"foreground": foreground, "background": plain, "background_kind": "solid"}
+        # 배경판은 이 글상자의 모든 글자색을 함께 살려야 한다 (빨간 글씨만 보고 검정판을 깔면 검은 글씨가 묻힘)
+        return {
+            "foreground": foreground,
+            "background_kind": "image",
+            "text_colors": tuple(dict.fromkeys(runs)),
+        }
 
     # ------------------------------------------------------------------
     # 스냅샷(A) 읽기
@@ -723,3 +759,8 @@ def _overlap_partner(finding_id: str, rule_id: str, anchor_key: str) -> int | No
         return None
     address = parse_shape_key(other_key)
     return None if address is None else address[1]
+
+
+def _rgb(color: str) -> tuple[int, int, int]:
+    """ "C8C8C8" → (200, 200, 200) (B의 명암비 함수는 RGB 튜플을 받음)."""
+    return tuple(int(color[index : index + 2], 16) for index in (0, 2, 4))

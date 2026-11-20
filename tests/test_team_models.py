@@ -292,11 +292,32 @@ def photo_text_shape(samples=()):
 
 def test_unknown_background_text_is_marked_for_a_scrim():
     info = TeamBindings().read_finding(finding("contrast", "1:4", "unknown"), deck_of(photo_text_shape()))
-    assert info.values == {"foreground": "FFFFFF", "background_kind": "image"}
+    assert info.values == {"foreground": "FFFFFF", "background_kind": "image", "text_colors": ("FFFFFF",)}
+
+
+def test_scrim_keeps_every_text_color_readable():
+    """빨간 글씨만 보고 검정판을 깔면 같은 상자의 검은 글씨가 묻힌다 (자바게티 20쪽)."""
+    shape = Shape(
+        slide_number=1,
+        shape_id=4,
+        name="빨강+검정 글상자",
+        box=Box(60, 60, 400, 100),
+        text="포인트제 활용 대출기한 연장",
+        runs=(
+            TextRun("포인트제 활용", font_size_pt=24.0, color=(255, 0, 0), bold=False),
+            TextRun("대출기한 연장", font_size_pt=24.0, color=(0, 0, 0), bold=False),
+        ),
+        background=None,
+        supported=True,
+    )
+    review = finding("contrast", "1:4", "unknown")
+    result = RuleBasedPlanner().plan(deck_of(shape), [review], AnalysisPolicy(strength=Strength.STRONG))
+    assert [p.after["color"] for p in result.proposals if p.prop == Property.SHAPE_FILL] == ["FFFFFF"]
 
 
 def test_b_sample_review_gets_scrim_only_at_strong():
-    samples = tuple((float(i), 0.0, 200, 200, 200) for i in range(4))
+    # 사진처럼 밝은 곳(200)과 어두운 곳(90)이 섞인 배경
+    samples = tuple((float(i), 0.0, *([200] * 3 if i % 2 else [90] * 3)) for i in range(8))
     deck = deck_of(photo_text_shape(samples))
     review = finding("contrast", "1:4", "review", measured=1.67, expected=3.0)
 
@@ -335,3 +356,24 @@ def test_card_off_slide_shrinks_with_the_text_inside():
     assert changes[(3, Property.SHAPE_WIDTH)] == (331, 257)  # 오른쪽 끝을 960 - 여백 48 = 912에
     assert changes[(4, Property.SHAPE_WIDTH)] == (281, 207)  # 카드와의 여유 25pt 유지
     assert len({p.group for p in result.proposals}) == 1
+
+
+def test_plain_rendered_background_gets_a_text_color_fix_not_a_scrim():
+    """렌더링해 보니 글자 뒤가 흰색뿐이면 배경판이 아니라 글자색을 고친다 (함정 PPT 3쪽 출처 글씨)."""
+    samples = tuple((float(i), 0.0, 255, 255, 255) for i in range(10))
+    shape = Shape(
+        slide_number=1,
+        shape_id=4,
+        name="출처",
+        box=Box(60, 60, 400, 30),
+        text="출처",
+        runs=(TextRun("출처", font_size_pt=18.0, color=(0x9A, 0xA0, 0xA8), bold=False),),
+        background=None,
+        supported=True,
+        background_samples=samples,
+    )
+    warning = finding("contrast", "1:4", "warning", measured=2.64, expected=4.5)
+    info = TeamBindings().read_finding(warning, deck_of(shape))
+    assert info.values["background_kind"] == "solid" and info.values["background"] == "FFFFFF"
+    result = RuleBasedPlanner().plan(deck_of(shape), [warning], AnalysisPolicy())
+    assert [p.prop for p in result.proposals] == [Property.FONT_COLOR]

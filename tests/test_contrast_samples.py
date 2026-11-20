@@ -73,3 +73,20 @@ def test_unknown_background_shows_extraction_reason():
     findings = ContrastRule().evaluate(deck, AnalysisPolicy())
     assert [f.severity for f in findings] == ["unknown"]
     assert "object 50 is drawn over the text" in findings[0].evidence
+
+
+def test_a_thin_border_line_among_the_samples_is_not_a_contrast_problem():
+    """글상자 둘레 픽셀에 옆 도형의 테두리 선이 몇 개 섞여도 배경 대부분이 밝으면 통과 (자바게티 20쪽)."""
+    beige, border = (238, 225, 205), (40, 45, 40)
+    findings = evaluate([TextRun("본문", 20, BLACK, False)], samples(*([beige] * 18), border, border))
+    assert findings == []
+    mostly_dark = samples(*([border] * 10), *([beige] * 10))  # 배경 절반이 어두우면 여전히 검토
+    assert [f.severity for f in evaluate([TextRun("본문", 20, BLACK, False)], mostly_dark)] == ["review"]
+
+
+def test_failing_everywhere_on_a_plain_card_is_a_definite_problem():
+    """흰 카드 위 연회색 글자: 주변 픽셀이 모두 흰색이면 근사가 아니라 확정 문제 (함정 PPT 2쪽)."""
+    light_gray = (0x9A, 0xA0, 0xA8)  # 흰 바탕 대비 약 2.6:1
+    findings = evaluate([TextRun("본문", 18, light_gray, False)], samples(*([WHITE] * 20)))
+    assert [f.severity for f in findings] == ["warning"]
+    assert findings[0].measured < 3

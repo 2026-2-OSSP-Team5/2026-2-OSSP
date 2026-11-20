@@ -670,11 +670,12 @@ class RuleBasedPlanner:
         # TODO(C, FixTargets.unify_scrims): 같은 슬라이드의 배경판을 한 가지 색·투명도로 맞추기
         #       → planning/extras.py unify_slide_scrims() (NN/g: 가장 나쁜 경우를 기준으로 일관되게)
 
+        colors = info.values.get("text_colors") or (fg,)  # 같은 글상자의 모든 글자색
         best = None
         for scrim in ("000000", "FFFFFF"):
             for step in range(1, 101):
                 alpha = step / 100
-                worst = worst_contrast_over_unknown(fg, scrim, alpha)
+                worst = min(worst_contrast_over_unknown(color, scrim, alpha) for color in colors)
                 if worst >= target:
                     if best is None or alpha < best[1]:
                         best = (scrim, alpha, worst)

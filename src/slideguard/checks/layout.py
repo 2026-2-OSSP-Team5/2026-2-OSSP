@@ -9,6 +9,8 @@ from slideguard.domain.policy import GEOMETRY_TOLERANCE_PT, AnalysisPolicy, Dens
 from .scope import target_shapes
 
 TOL = GEOMETRY_TOLERANCE_PT
+HANG_EM = 0.5  # 좌우 넘침 허용: 글자 크기의 절반 (줄 끝 문장 부호가 밖으로 나가는 정도)
+DESCENT_EM = 0.1  # 위아래 넘침 허용: 글자 크기의 10% (글꼴 아래 여유)
 
 
 class LayoutRule:
@@ -33,6 +35,7 @@ class LayoutRule:
         for slide_number in sorted(by_slide):
             slide_shapes = sorted(by_slide[slide_number], key=lambda s: s.shape_id)
             findings.extend(_check_overlap(slide_shapes))
+            findings.extend(_check_card_off_slide(deck, slide_shapes))
             findings.extend(_check_density(slide_number, slide_shapes, policy.density_limits))
         return findings
 
@@ -129,10 +132,66 @@ def _check_margin(deck: DeckSnapshot, shape: Shape, margin_ratio: float) -> list
     ]
 
 
+# 카드처럼 글을 감싼 도형이 슬라이드 밖으로 이만큼 넘게 나가면 문제로 본다 (슬라이드 너비·높이 비율)
+CARD_OFF_SLIDE_RATIO = 0.01
+# 이보다 넓은(높은) 도형은 일부러 가장자리까지 꽉 채운 배경·띠로 보고 검사하지 않는다
+FULL_BLEED_RATIO = 0.9
+
+
+def _check_card_off_slide(deck: DeckSnapshot, shapes: list[Shape]) -> list[Finding]:
+    """글상자를 감싼 카드·패널이 슬라이드 밖으로 나가는지 (함정 PPT 2쪽 세 번째 카드).
+
+    글자 자체는 슬라이드 안이라 여백 검사에 걸리지 않지만, 슬라이드 쇼에서는 카드 테두리가 잘려
+    '실수로 밀린 슬라이드'처럼 보인다. 배경 사진·띠처럼 일부러 가장자리 밖까지 깐 도형은
+    슬라이드 너비(높이)의 90% 이상이거나 글상자를 감싸지 않으므로 빼고 본다.
+    """
+    texts = [shape for shape in shapes if _has_text(shape) and _effective_box(shape) is not None]
+    findings = []
+    for shape in shapes:
+        box = shape.box
+        if _has_text(shape) or box is None:
+            continue
+        if box.width >= deck.width_pt * FULL_BLEED_RATIO or box.height >= deck.height_pt * FULL_BLEED_RATIO:
+            continue
+        if not any(_contains(box, _effective_box(text)) for text in texts if text.key != shape.key):
+            continue
+        sides = {
+            "왼쪽": -box.x,
+            "오른쪽": box.x + box.width - deck.width_pt,
+            "위": -box.y,
+            "아래": box.y + box.height - deck.height_pt,
+        }
+        limit = {"왼쪽": deck.width_pt, "오른쪽": deck.width_pt, "위": deck.height_pt, "아래": deck.height_pt}
+        outside = {
+            name: amount for name, amount in sides.items() if amount > limit[name] * CARD_OFF_SLIDE_RATIO
+        }
+        if not outside:
+            continue
+        name = max(outside, key=lambda key: outside[key])
+        findings.append(
+            _finding(
+                "layout.margin",
+                f"{shape.key}:card",
+                shape,
+                "warning",
+                f"글을 감싼 도형이 슬라이드 밖으로 나갑니다 ({name})",
+                round(-outside[name], 1),
+                0.0,
+                "슬라이드 밖으로 나간 길이: " + ", ".join(f"{k} {v:.1f}pt" for k, v in outside.items()),
+                box=box,
+            )
+        )
+    return findings
+
+
 # --- 텍스트 넘침 ---------------------------------------------------------------
 def _check_overflow(shape: Shape) -> list[Finding]:
     """렌더링 좌표와 도형 상자가 모두 있어야 판정한다. 없으면 판정 불가로 남긴다."""
     if not _has_text(shape):
+        return []
+    if shape.locator is not None and shape.locator.kind == "table_cell":
+        # 표 칸은 글자가 늘면 PowerPoint가 행 높이를 저절로 늘리므로 넘치지 않는다.
+        # (칸 글자 위치는 픽셀 차이로 재는 근사값이라, 잘못 재면 '655pt 넘침' 같은 오판정이 난다)
         return []
     rendered = shape.text_bounds
     box = shape.box
@@ -145,7 +204,16 @@ def _check_overflow(shape: Shape) -> list[Finding]:
         "오른쪽": (rendered.x + rendered.width) - (box.x + box.width),
         "아래": (rendered.y + rendered.height) - (box.y + box.height),
     }
-    exceeded = {name: amount for name, amount in over.items() if amount > TOL}
+    # PowerPoint는 줄 끝 쉼표·마침표를 상자 밖으로 조금 내보내고(문장 부호 끝 맞춤),
+    # 글꼴의 아래 여유(내림 획 자리)도 상자 끝에 살짝 걸친다. 이런 미세한 넘침은 화면에서 잘리지 않는다.
+    size = max((run.font_size_pt or 0.0 for run in shape.runs), default=0.0)
+    allowed = {
+        "왼쪽": max(TOL, size * HANG_EM),
+        "오른쪽": max(TOL, size * HANG_EM),
+        "위": max(TOL, size * DESCENT_EM),
+        "아래": max(TOL, size * DESCENT_EM),
+    }
+    exceeded = {name: amount for name, amount in over.items() if amount > allowed[name]}
     if not exceeded:
         return []
     worst_name = max(exceeded, key=lambda n: exceeded[n])
@@ -195,6 +263,31 @@ def _behind(back: Shape, front: Shape) -> bool | None:
     return back.z_order < front.z_order
 
 
+def _ink_boxes(shape: Shape, fallback: Box) -> list[Box]:
+    """겹침을 따질 실제 영역: 글자가 있으면 줄마다의 상자, 없으면 도형 상자.
+
+    PowerPoint에서 줄 위치(TextSpan kind="line")를 읽었으면 그것을 쓰고, 못 읽었으면
+    전체 글자 영역(fallback)을 쓴다. 표 셀의 줄 좌표는 셀 기준이라 쓰지 않는다.
+    """
+    if _has_text(shape) and not (shape.locator is not None and shape.locator.kind == "table_cell"):
+        lines = [span.box for span in shape.spans if span.kind == "line" and span.box and span.text.strip()]
+        if lines:
+            return lines
+    return [fallback]
+
+
+def _ink_overlap(first: list[Box], second: list[Box]) -> tuple[Box | None, float]:
+    """두 영역 목록이 겹치는 부분을 감싼 상자와 실제로 겹친 넓이 합."""
+    parts = [part for a in first for b in second if (part := _intersection(a, b)) is not None]
+    if not parts:
+        return None, 0.0
+    left = min(part.x for part in parts)
+    top = min(part.y for part in parts)
+    right = max(part.x + part.width for part in parts)
+    bottom = max(part.y + part.height for part in parts)
+    return Box(left, top, right - left, bottom - top), sum(part.width * part.height for part in parts)
+
+
 def _owns_content(container: Shape, content: Shape) -> bool:
     outer, inner = container.locator, content.locator
     return (
@@ -221,30 +314,33 @@ def _check_overlap(shapes: list[Shape]) -> list[Finding]:
         box_a, box_b = _effective_box(a), _effective_box(b)
         if box_a is None or box_b is None:
             continue  # 위에서 판정 불가로 이미 보고했다
-        overlap = _intersection(box_a, box_b)
-        if overlap is None:
+        if _intersection(box_a, box_b) is None:
             continue
         anchor, other = (a, b) if a_text else (b, a)
         anchor_box, other_box = (box_a, box_b) if a_text else (box_b, box_a)
+        # 글상자 테두리(줄들을 감싼 사각형)끼리가 아니라 실제 글자 줄끼리 겹치는지 본다.
+        # 예) 위 상자의 짧은 마지막 줄 옆으로 아래 상자가 올라와도 글자는 안 겹침 → 겹침 아님
+        overlap, area = _ink_overlap(_ink_boxes(anchor, anchor_box), _ink_boxes(other, other_box))
+        if overlap is None:
+            continue
+        if not _has_text(other) and _behind(other, anchor) is True:
+            # 글자 뒤에 깔린 도형(말풍선·카드·사진 등)은 배경이다. 글씨가 잘 보이는지는 명암비 검사가 본다.
+            continue
 
         severity: Severity = "review"
         message = "텍스트가 다른 객체와 겹칩니다 (의도한 배치인지 확인)"
-        area = overlap.width * overlap.height
         measured: float | None = round(area, 1)
         expected: float | None = 0.0
         evidence = (
             f"{anchor.name}({anchor.key}) ↔ {other.name}({other.key}): "
             f"겹친 영역 {overlap.width:.1f}×{overlap.height:.1f}pt"
         )
-        if not _has_text(other) and _contains(other_box, anchor_box):
-            # 글자 없는 도형이 텍스트를 완전히 덮고 있다. 뒤면 배경 패널, 앞이면 텍스트를 가린다.
-            behind = _behind(other, anchor)
-            if behind is True:
-                continue
+        if not _has_text(other):
+            behind = _behind(other, anchor)  # 뒤에 깔린 경우는 위에서 이미 제외했다
             if behind is False:
                 message = "앞쪽 도형이 텍스트를 가립니다"
-            else:
-                # 앞뒤를 모르면 배경인지 가림인지 정할 수 없으므로 판정 불가로 남긴다.
+            elif _contains(other_box, anchor_box):
+                # 글자를 완전히 덮는데 앞뒤를 모르면 배경인지 가림인지 정할 수 없으므로 판정 불가로 남긴다.
                 severity = "unknown"
                 message = "앞뒤 순서를 알 수 없어 배경인지 가림인지 판정할 수 없습니다"
                 measured = expected = None
@@ -266,6 +362,29 @@ def _check_overlap(shapes: list[Shape]) -> list[Finding]:
 
 
 # --- 정보 밀도 -----------------------------------------------------------------
+# 눈에 보이지 않는 글자 (폭 없는 공백 등). 이런 글자만 있는 줄은 빈 줄로 본다
+_INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad\u3000"), None)
+# 정보 밀도에서 세지 않는 것: 차트 글자(축 눈금·데이터 레이블 등)와 쪽 번호·바닥글·날짜
+_DENSITY_KINDS = frozenset({"shape", "table_cell"})
+_FOOTER_PLACEHOLDERS = frozenset({13, 15, 16})
+
+
+def _visible(line: str) -> bool:
+    """공백·폭 없는 글자만 있는 줄이 아닌지."""
+    return bool(line.translate(_INVISIBLE).strip())
+
+
+def _counts_for_density(shape: Shape) -> bool:
+    """청중이 '읽을 내용'으로 세는 글인지 (함정 PPT 3쪽: 그래프 축 눈금 12개가 12줄로 잡힘)."""
+    if shape.locator is not None and shape.locator.kind not in _DENSITY_KINDS:
+        return False
+    if shape.placeholder_type in _FOOTER_PLACEHOLDERS:
+        return False
+    # '01', '02.' 같은 번호 표시는 읽을 내용이 아니라 장식 (함정 PPT 각 쪽 왼쪽 위 번호)
+    label = "".join(_text_of(shape).translate(_INVISIBLE).split())
+    return not (len(label) <= 3 and all(ch.isdigit() or ch in ".-#()" for ch in label))
+
+
 def _line_count(shape: Shape) -> tuple[int, bool]:
     """(줄 수, 렌더링 줄을 반영했는지).
 
@@ -273,18 +392,25 @@ def _line_count(shape: Shape) -> tuple[int, bool]:
     reader가 실제 줄(``TextSpan.kind == "line"``)을 주면 둘 중 큰 값을 쓴다.
     reader는 줄을 일정 개수까지만 읽으므로, 아주 긴 텍스트에서는 원문 개행이 더 많을 수 있다.
     """
-    source = sum(1 for line in _text_of(shape).splitlines() if line.strip())
-    rendered = sum(1 for span in shape.spans if span.kind == "line" and span.text.strip())
+    source = sum(1 for line in _text_of(shape).splitlines() if _visible(line))
+    rendered = sum(1 for span in shape.spans if span.kind == "line" and _visible(span.text))
     if rendered:
         return max(source, rendered), True
     return source, False
 
 
+DENSITY_WARNING_FACTOR = 2  # 기준의 2배 이상이면 '검토'가 아니라 '문제'(발표 화면으로 읽을 수 없는 양)
+
+
+def _density_severity(count: int, limit: int) -> Severity:
+    return "warning" if count >= limit * DENSITY_WARNING_FACTOR else "review"
+
+
 def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThreshold) -> list[Finding]:
-    text_shapes = [s for s in shapes if _has_text(s)]
+    text_shapes = [s for s in shapes if _has_text(s) and _counts_for_density(s)]
     if not text_shapes:
         return []
-    chars_by_shape = {s.key: len("".join(_text_of(s).split())) for s in text_shapes}
+    chars_by_shape = {s.key: len("".join(_text_of(s).translate(_INVISIBLE).split())) for s in text_shapes}
     total_chars = sum(chars_by_shape.values())
     counts = [_line_count(s) for s in text_shapes]
     total_lines = sum(count for count, _ in counts)
@@ -298,7 +424,7 @@ def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThresh
                 "layout.density",
                 f"{slide_number}:chars",
                 heaviest,
-                "review",
+                _density_severity(total_chars, limits.max_chars),
                 f"슬라이드의 글자 수가 많습니다 ({total_chars}자)",
                 total_chars,
                 limits.max_chars,
@@ -312,7 +438,7 @@ def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThresh
                 "layout.density",
                 f"{slide_number}:lines",
                 heaviest,
-                "review",
+                _density_severity(total_lines, limits.max_lines),
                 f"슬라이드의 줄(항목) 수가 많습니다 ({total_lines}줄)",
                 total_lines,
                 limits.max_lines,

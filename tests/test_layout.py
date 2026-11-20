@@ -374,3 +374,103 @@ def test_line_count_uses_the_larger_of_source_and_rendered():
     shape = make_shape(text="\n".join(["줄"] * 7), lines=["a", "b"])
     findings = only(run_rule(shape), "layout.density")
     assert findings[0].measured == 7
+
+
+def _with_lines(shape, *boxes):
+    """PowerPoint에서 읽은 줄 위치(BoundLeft/Top/Width/Height)를 붙인다."""
+    spans = tuple(TextSpan("line", i, f"줄{i}", Box(*box)) for i, box in enumerate(boxes, start=1))
+    return replace(shape, spans=spans)
+
+
+def test_text_frames_overlap_but_lines_do_not_is_not_overlap():
+    """상자 테두리만 겹치고 글자 줄은 안 겹치면 겹침이 아니다 (짧은 마지막 줄 옆에 다른 상자)."""
+    upper = _with_lines(
+        make_shape(x=100, y=100, w=400, h=60, shape_id=1, rendered=(100, 100, 400, 60)),
+        (100, 100, 400, 30),  # 긴 첫 줄
+        (100, 130, 120, 30),  # 짧은 마지막 줄
+    )
+    lower = _with_lines(
+        make_shape(x=300, y=140, w=200, h=40, shape_id=2, rendered=(300, 140, 200, 40)),
+        (300, 140, 200, 40),
+    )
+    assert only(run_rule(upper, lower), "layout.overlap") == []
+
+
+def test_lines_that_really_collide_are_still_review():
+    a = _with_lines(
+        make_shape(x=100, y=100, w=300, h=40, shape_id=1, rendered=(100, 100, 300, 40)), (100, 100, 300, 40)
+    )
+    b = _with_lines(
+        make_shape(x=250, y=120, w=300, h=40, shape_id=2, rendered=(250, 120, 300, 40)), (250, 120, 300, 40)
+    )
+    findings = only(run_rule(a, b), "layout.overlap")
+    assert [f.severity for f in findings] == ["review"]
+    assert findings[0].measured == 150 * 20  # 실제로 겹친 줄 넓이
+
+
+def test_bubble_partly_behind_text_is_background_not_overlap():
+    """글자 뒤에 일부만 깔린 말풍선·카드·사진은 배경 (글씨가 보이는지는 명암비 검사가 본다)."""
+    bubble = make_shape(x=250, y=90, w=300, h=100, text="", shape_id=1, z_order=1, name="말풍선")
+    label = make_shape(x=100, y=100, w=200, h=50, shape_id=2, z_order=2)
+    assert only(run_rule(bubble, label), "layout.overlap") == []
+    cover = replace(bubble, z_order=5)  # 앞에서 가리면 여전히 검토
+    assert "가립니다" in only(run_rule(cover, label), "layout.overlap")[0].message
+
+
+def test_hanging_punctuation_and_descent_are_not_overflow():
+    """40pt 글자의 줄 끝 쉼표가 9.7pt 밖으로 나가거나 아래로 1.8pt 걸친 정도는 넘침이 아니다 (자바게티 7쪽)."""
+    shape = replace(
+        make_shape(x=255.6, y=99.0, w=932.4, h=104.2, rendered=(262.8, 102.6, 935.3, 103.0)),
+        runs=(TextRun("보유 도서의 상태를 쉽게 등록,", 40),),
+    )
+    assert only(run_rule(shape), "layout.overflow") == []
+    wide = replace(shape, rendered_box=Box(262.8, 102.6, 960.0, 96.0))  # 오른쪽 35pt: 진짜 넘침
+    assert [f.message for f in only(run_rule(wide), "layout.overflow")] == [
+        "텍스트가 도형 영역을 벗어납니다 (오른쪽)"
+    ]
+
+
+def test_density_far_over_the_limit_is_a_problem_not_just_review():
+    """기준(발표용 6줄)의 2배 이상이면 빨간 '문제'로 (자바게티 22쪽 참고문헌처럼 20줄 넘는 글 벽)."""
+    lines = [f"{i}. https://blog.example.com/{i}" for i in range(1, 21)]
+    wall = make_shape(text="\n".join(lines), shape_id=1)
+    some = make_shape(text="\n".join(f"항목 {i}" for i in range(8)), shape_id=1)  # 8줄·짧은 글
+    assert {f.severity for f in only(run_rule(wall), "layout.density")} == {"warning"}
+    assert {f.severity for f in only(run_rule(some), "layout.density")} == {"review"}
+
+
+def test_card_holding_text_that_runs_off_the_slide_is_a_problem():
+    """함정 PPT 2쪽: 글자는 슬라이드 안이지만 그 글을 감싼 카드가 오른쪽 끝을 넘으면 문제."""
+    card = make_shape(x=655, y=151, w=331, h=281, text="", shape_id=3)
+    body = make_shape(x=680, y=238, w=270, h=173, shape_id=4)
+    found = [f for f in only(run_rule(card, body), "layout.margin") if f.id.endswith(":card")]
+    assert [(f.shape_key, f.severity, f.measured) for f in found] == [("1:3", "warning", -26.0)]
+
+
+def test_full_bleed_background_or_empty_decoration_off_slide_is_fine():
+    banner = make_shape(x=-10, y=0, w=980, h=120, text="", shape_id=3)  # 가장자리까지 꽉 채운 띠
+    title = make_shape(x=60, y=30, w=500, h=60, shape_id=4)
+    blob = make_shape(x=900, y=400, w=200, h=200, text="", shape_id=5)  # 글이 없는 장식
+    assert [f for f in run_rule(banner, title, blob) if f.id.endswith(":card")] == []
+
+
+def test_table_cell_text_never_counts_as_overflow():
+    """표 칸은 행이 저절로 늘어나므로 넘치지 않는다 (칸 글자 픽셀 측정이 틀려도 '655pt 넘침'이 안 나오게)."""
+    cell = replace(
+        make_shape(x=60, y=200, w=300, h=40, rendered=(60, 80, 1240, 450)),
+        locator=ObjectLocator((7,), "table_cell", (2, 1)),
+    )
+    assert only(run_rule(cell), "layout.overflow") == []
+
+
+def test_density_ignores_blank_lines_chart_labels_and_footers():
+    """빈 줄·폭 없는 공백 줄, 그래프 축 눈금, 쪽 번호는 '읽을 내용'의 줄로 세지 않는다 (함정 PPT 3쪽)."""
+    body = make_shape(text="첫째 줄\n\n \n​\n둘째 줄", shape_id=1)
+    axis = replace(
+        make_shape(text="\n".join(f"{hour}시" for hour in range(7, 19)), shape_id=2),
+        locator=ObjectLocator((2,), "axis_title", (1, 1)),
+    )
+    page = replace(make_shape(text="3", shape_id=3), placeholder_type=13)
+    number = make_shape(text="02", shape_id=4)  # 쪽 왼쪽 위 번호 표시
+    lines = make_shape(text="\n".join(["항목"] * 3), shape_id=5)
+    assert only(run_rule(body, axis, page, number, lines), "layout.density") == []  # 2 + 3 = 5줄
