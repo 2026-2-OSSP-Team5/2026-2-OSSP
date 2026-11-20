@@ -421,6 +421,51 @@ class TeamBindings:
             result.append(self.read_shape(shape))
         return result
 
+    def flow_items(self, snapshot: object, slide_index: int) -> list:
+        """슬라이드 재배치(planning/reflow.py)에 쓸 객체들. 팀 스냅샷이 아니면 빈 목록 (재배치 안 함)."""
+        from slideguard.planning.reflow import BACKGROUND_AREA, FOOTER_PLACEHOLDERS, FlowItem
+
+        slide_w, slide_h = self.slide_size(snapshot)
+        items = []
+        for shape in getattr(snapshot, "shapes", ()):
+            if not _is_team_shape(shape) or _slide_of(shape) != slide_index:
+                continue
+            if getattr(shape, "effective_visible", None) is False or parse_shape_key(shape.key) is None:
+                continue
+            box = shape.box
+            if box is None:
+                continue
+            text = str(shape.text or "").strip()
+            sized = [
+                (float(run.font_size_pt), len(run.text))
+                for run in shape.runs
+                if run.font_size_pt and run.text
+            ]
+            weight = sum(count for _size, count in sized)
+            size = sum(size * count for size, count in sized) / weight if weight else None
+            rendered, content = shape.text_bounds, shape.content_box
+            background = box.width * box.height >= BACKGROUND_AREA * slide_w * slide_h
+            footer = shape.placeholder_type in FOOTER_PLACEHOLDERS
+            items.append(
+                FlowItem(
+                    shape_id=int(shape.shape_id),
+                    left=float(box.x),
+                    top=float(box.y),
+                    width=float(box.width),
+                    height=float(box.height),
+                    is_text=bool(text),
+                    text=str(shape.text or ""),
+                    size_pt=size,
+                    text_height=None if rendered is None else float(rendered.height),
+                    margins=None if content is None else max(float(box.height - content.height), 0.0),
+                    inner_width=None if content is None else float(content.width),
+                    z_order=shape.z_order,
+                    fixed=background or footer or not bool(shape.supported),
+                    background=background,
+                )
+            )
+        return items
+
     def find_shape(self, snapshot: object, slide_index: int, shape_id: int) -> ShapeInfo | None:
         for shape in snapshot.shapes:
             if _slide_of(shape) != slide_index or shape.shape_id != shape_id:

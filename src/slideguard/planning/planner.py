@@ -59,6 +59,7 @@ from slideguard.planning.contracts import (
     SkippedFinding,
     Status,
 )
+from slideguard.planning.reflow import MIN_GROW, reflow_slide
 from slideguard.planning.standards import Standards, build_standards
 
 # ======================================================================
@@ -176,10 +177,13 @@ class RuleBasedPlanner:
         }
 
         result = PlanResult(standards=standards, strength=level)
+        overflows = []  # 슬라이드 재배치에 넘길 넘침 판정
 
         for raw in findings:
             info = self.bindings.read_finding(raw, snapshot)
             category = self._classify(info, profile)
+            if info.rule == Rule.OVERFLOW and info.rule not in excluded and info.status == Status.WARNING:
+                overflows.append(info)
 
             def skip(reason, raw=raw, category=category):
                 result.skipped.append(SkippedFinding(raw, reason, category))
@@ -267,7 +271,146 @@ class RuleBasedPlanner:
                 result.alternatives.extend(bundle)
 
         result.proposals = _merge_same_target(result.proposals, result)
+        self._reflow(snapshot, overflows, result, profile, standards, slide_h)
         return result
+
+    # ==================================================================
+    # 슬라이드 재배치 (planning/reflow.py)
+    # ==================================================================
+
+    def _reflow(self, snapshot, overflows, result, profile, standards, slide_h):
+        """글자 키우기·넘침 고치기를 슬라이드 단위로 다시 계산해 한 묶음으로 만든다.
+
+        - 글자를 키우면 상자가 모자랄 글상자는 상자도 늘리고, 그 아래 객체는 늘어난 만큼 내린다.
+        - 넘친 글상자도 같은 방법으로 늘린다 (아래 객체가 막아도 함께 내려서 해결).
+        - 슬라이드에 다 들어가지 않으면 묶음을 만들지 않고 글자 크기 후보에 이유를 붙인다.
+        """
+        if not {Property.SHAPE_HEIGHT, Property.SHAPE_POSITION} <= profile.allowed_props:
+            return
+        slides = {p.slide_index for p in result.proposals if p.prop == Property.FONT_SIZE}
+        slides |= {info.slide_index for info in overflows}
+        for slide in sorted(slides):
+            items = self.bindings.flow_items(snapshot, slide)
+            if not items:
+                continue
+            fonts = [p for p in result.proposals if p.slide_index == slide and p.prop == Property.FONT_SIZE]
+            new_sizes = {p.shape_id: float(p.after) for p in fonts}
+            needed = {
+                info.shape_id: float(info.values["needed_height"])
+                for info in overflows
+                if info.slide_index == slide and info.values.get("needed_height") is not None
+            }
+            unmeasured = {
+                info.shape_id
+                for info in overflows
+                if info.slide_index == slide and info.values.get("needed_height") is None
+            }
+            flow = reflow_slide(
+                items,
+                new_sizes,
+                needed,
+                unmeasured,
+                slide_h=slide_h,
+                bottom_margin=slide_h * standards.safe_margin_ratio.value,
+            )
+            if not flow.ok:
+                warned = {p.shape_id for p in fonts}
+                result.proposals = [
+                    replace(p, note=f"{p.note} (주의: {flow.reason})")
+                    if p.slide_index == slide and p.prop == Property.FONT_SIZE and p.shape_id in warned
+                    else p
+                    for p in result.proposals
+                ]
+                continue
+            if not flow.changes:
+                continue
+            self._apply_reflow(slide, flow, items, fonts, overflows, result, slide_h)
+
+    def _apply_reflow(self, slide, flow, items, fonts, overflows, result, slide_h):
+        group = f"reflow:{slide}"
+        by_id = {item.shape_id: item for item in items}
+        touched = set(flow.heights) | set(flow.tops)
+        # 같은 객체의 높이·위치를 따로 바꾸던 후보(와 그 묶음)는 재배치가 대신한다
+        replaced_groups = {
+            p.group
+            for p in result.proposals
+            if p.slide_index == slide
+            and p.shape_id in touched
+            and p.prop in (Property.SHAPE_HEIGHT, Property.SHAPE_POSITION)
+            and p.group
+        }
+        result.proposals = [
+            p
+            for p in result.proposals
+            if not (
+                p.slide_index == slide
+                and (
+                    (p.shape_id in touched and p.prop in (Property.SHAPE_HEIGHT, Property.SHAPE_POSITION))
+                    or (p.group and p.group in replaced_groups)
+                )
+            )
+        ]
+        # 원인 판정: 상자가 늘어난 글상자의 글자 크기 후보 또는 넘침 판정
+        overflow_by_shape = {info.shape_id: info for info in overflows if info.slide_index == slide}
+        font_by_shape = {p.shape_id: p for p in fonts}
+        trigger = next(
+            (
+                font_by_shape[sid].finding_id if sid in font_by_shape else overflow_by_shape[sid].finding_id
+                for sid in sorted(flow.heights, key=lambda sid: by_id[sid].top)
+                if sid in font_by_shape or sid in overflow_by_shape
+            ),
+            "",
+        )
+        # 상자가 늘어나는 글상자의 글자 크기 후보는 재배치와 한 묶음 (따로 켜면 넘침)
+        result.proposals = [
+            replace(p, group=group) if p in fonts and p.shape_id in flow.heights else p
+            for p in result.proposals
+        ]
+        for sid in sorted(touched, key=lambda sid: by_id[sid].top):
+            item = by_id[sid]
+            cause = font_by_shape.get(sid)
+            finding_id = (
+                cause.finding_id
+                if cause is not None
+                else (overflow_by_shape[sid].finding_id if sid in overflow_by_shape else trigger)
+            )
+            if sid in flow.heights:
+                why = f"글자 {float(cause.after):g}pt에 맞게" if cause is not None else "넘친 글자를 담게"
+                if cause is None and sid not in overflow_by_shape:
+                    why = "안의 글상자가 늘어난 만큼"
+                result.proposals.append(
+                    ChangeProposal(
+                        slide_index=slide,
+                        shape_id=sid,
+                        prop=Property.SHAPE_HEIGHT,
+                        before=item.height,
+                        after=flow.heights[sid],
+                        cost=(flow.heights[sid] - item.height) / slide_h,
+                        rule=Rule.OVERFLOW,
+                        note=f"슬라이드 재배치: 상자 높이 {item.height:g}pt → {flow.heights[sid]:g}pt ({why})",
+                        group=group,
+                        finding_id=finding_id,
+                    )
+                )
+            if sid in flow.tops:
+                down = flow.tops[sid] - item.top
+                result.proposals.append(
+                    ChangeProposal(
+                        slide_index=slide,
+                        shape_id=sid,
+                        prop=Property.SHAPE_POSITION,
+                        before=(item.left, item.top),
+                        after=(item.left, flow.tops[sid]),
+                        cost=down / slide_h,
+                        rule=Rule.OVERFLOW,
+                        note=f"슬라이드 재배치: 위 상자가 늘어난 만큼 {down:g}pt 내림 (간격 유지)",
+                        group=group,
+                        finding_id=finding_id,
+                    )
+                )
+        # 재배치로 해결된 넘침은 '사람이 판단' 목록에서 뺀다
+        solved = {overflow_by_shape[sid].finding_id for sid in flow.heights if sid in overflow_by_shape}
+        result.skipped = [s for s in result.skipped if getattr(s.finding, "id", None) not in solved]
 
     # ==================================================================
     # 분류
@@ -527,6 +670,8 @@ class RuleBasedPlanner:
         new_h = math.ceil(needed)
         if new_h <= shape.height + TOLERANCE:
             return [], "상자 높이가 이미 충분함 (측정값 확인 필요)"
+        if new_h <= shape.height + MIN_GROW:
+            return [], f"모자란 높이가 {MIN_GROW:g}pt 이하라 그대로 둠 (화면에서 잘리지 않는 정도)"
         if shape.top + new_h > slide_h + TOLERANCE:
             return [], "상자를 키우면 슬라이드 아래로 나감 → 글자 줄이기·나누기는 사람이 판단"
         blocked = _new_collisions(shape, (shape.left, shape.top, shape.width, new_h), others)
@@ -771,16 +916,25 @@ class RuleBasedPlanner:
 
 
 def _recommended_only(minimum: list[ChangeProposal], extra: list[ChangeProposal]) -> list[ChangeProposal]:
-    """권장 목표로 만든 후보 중 최소 수정과 값이 다른 것만 '권장 수정'으로 남긴다."""
+    """권장 목표로 만든 후보 중 최소 수정과 값이 다른 것만 '권장 수정'으로 남긴다.
+
+    묶음(group)은 통째로 판단한다: 묶음 안에 하나라도 다르면 묶음 전체를 권장 수정으로 남긴다.
+    """
 
     def target(p):
         return (p.finding_id, p.slide_index, p.shape_id, p.prop, str(p.before).upper())
 
     chosen = {target(p): p for p in minimum}
+
+    def differs(p):
+        same = chosen.get(target(p))
+        return same is None or same.after != p.after or same.group != p.group
+
+    changed_groups = {p.group for p in extra if p.group is not None and differs(p)}
     out = []
     for p in extra:
-        same = chosen.get(target(p))
-        if same is not None and same.after == p.after:
+        keep = p.group in changed_groups if p.group is not None else differs(p)
+        if not keep:
             continue
         group = None if p.group is None else f"{p.group}~rec"  # 최소 수정 묶음과 섞이지 않게
         out.append(replace(p, variant="recommended", group=group))
