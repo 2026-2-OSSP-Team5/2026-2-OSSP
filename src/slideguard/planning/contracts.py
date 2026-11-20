@@ -139,6 +139,7 @@ class ChangeProposal:
     contrast: float | None = None  # 글자색 후보일 때 바꾼 뒤 명암비
     group: str | None = None  # 함께 적용해야 하는 변경 묶음 이름 (예: 상자 키우기 + 아래 그림 내리기)
     finding_id: str = ""  # 이 후보를 만든 팀 Finding.id
+    variant: str = "minimum"  # "minimum" 최소 수정 / "recommended" 권장 수정 (FixTargets 목표)
 
 
 @dataclass(frozen=True)
@@ -152,7 +153,8 @@ class SkippedFinding:
 
 @dataclass
 class PlanResult:
-    proposals: list[ChangeProposal] = field(default_factory=list)
+    proposals: list[ChangeProposal] = field(default_factory=list)  # 최소 수정
+    recommended: list[ChangeProposal] = field(default_factory=list)  # 권장 수정 (최소 수정과 값이 다른 것만)
     alternatives: list[ChangeProposal] = field(default_factory=list)
     skipped: list[SkippedFinding] = field(default_factory=list)
     standards: Standards | None = None  # 이번 계산에 쓴 기준값 (화면에 근거 표시용)

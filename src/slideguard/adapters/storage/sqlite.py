@@ -22,7 +22,7 @@ from slideguard.domain.models import (
     TextRun,
     TextSpan,
 )
-from slideguard.domain.policy import AnalysisPolicy, Purpose, Strength, ThresholdOverrides
+from slideguard.domain.policy import AnalysisPolicy, FixTargets, Purpose, Strength, ThresholdOverrides
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,7 @@ class WorkspaceSettings:
             locked_properties=frozenset(options.get("locked_properties", ())),
             locked_shapes=self._locked_shapes(document),
             thresholds=ThresholdOverrides(**options.get("thresholds", {})),
+            fix=FixTargets(**options.get("fix", {})),
         )
 
     def _locked_shapes(self, document: Path | None) -> frozenset[str]:
@@ -227,6 +228,10 @@ class SqliteWorkspaceSettingsRepository:
                         "locked_properties": sorted(policy.locked_properties),
                         "document_locks": locks,
                         "thresholds": asdict(policy.thresholds),
+                        "fix": {
+                            key: str(value) if hasattr(value, "value") else value
+                            for key, value in asdict(policy.fix).items()
+                        },
                     },
                 )
             elif purpose is not None:

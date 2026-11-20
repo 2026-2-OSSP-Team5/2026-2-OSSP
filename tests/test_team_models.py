@@ -22,6 +22,7 @@ from slideguard.domain.models import (
 )
 from slideguard.domain.policy import AnalysisPolicy, Purpose, Strength
 from slideguard.planning import MinimumChangePlanner, Property, Rule, RuleBasedPlanner, TeamBindings
+from slideguard.planning.bindings import is_recommended
 from slideguard.planning.contracts import ChangeProposal, Status
 from tests.test_patcher import Doc, DocRun, DocShape, opener_for
 
@@ -220,8 +221,10 @@ def test_propose_returns_team_change_proposals():
     planner = MinimumChangePlanner()
     proposals = planner.propose(report, AnalysisPolicy())
 
-    by_property = {p.property: p for p in proposals}
+    by_property = {p.property: p for p in proposals if not is_recommended(p.id)}  # 최소 수정
     assert by_property[Property.FONT_SIZE].after == 14.0
+    recommended = {p.property: p for p in proposals if is_recommended(p.id)}  # 권장 수정 (권장 18pt)
+    assert recommended[Property.FONT_SIZE].after == 18.0
     assert by_property[Property.FONT_SIZE].finding_id == "typography:1:2:1"
     assert by_property[Property.FONT_SIZE].shape_key == "1:2"
     assert by_property[Property.FONT_COLOR].before == "C8C8C8"

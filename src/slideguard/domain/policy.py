@@ -16,6 +16,29 @@ class Strength(StrEnum):
     STRONG = "strong"
 
 
+class ContrastGoal(StrEnum):
+    """명암비 수정 목표: 검사 기준(통과선)을 넘은 뒤 '얼마나 여유 있게' 고칠지.
+
+    검사(경고 여부)는 항상 CONTRAST_NORMAL / CONTRAST_LARGE로 하고, 이 값은 수정 후보의 목표만 바꾼다.
+    MINIMUM      기준선 바로 위 (원래 색에 가장 가까움, 2026-11 이전 동작)
+    COMFORTABLE  큰 글자도 일반 글자 기준 4.5:1까지 (투사 환경의 대비 손실 여유)
+    ENHANCED     WCAG 2.2 SC 1.4.6 (AAA): 일반 7:1, 큰 글자 4.5:1
+    CUSTOM       FixTargets.contrast_ratio 에 적은 값
+    """
+
+    MINIMUM = "minimum"
+    COMFORTABLE = "comfortable"
+    ENHANCED = "enhanced"
+    CUSTOM = "custom"
+
+
+class FontGoal(StrEnum):
+    """글자 크기 수정 목표. MINIMUM = 최소 크기(경고선)까지, RECOMMENDED = 권장 크기(검토선)까지."""
+
+    MINIMUM = "minimum"
+    RECOMMENDED = "recommended"
+
+
 PROPERTIES = frozenset({"font_size", "font_color", "font_family", "position", "size"})
 
 # --- 검사 기준값 -------------------------------------------------------------
@@ -24,6 +47,9 @@ CONTRAST_NORMAL = 4.5  # 일반 텍스트
 CONTRAST_LARGE = 3.0  # 대형 텍스트
 LARGE_TEXT_PT = 18.0  # 이 크기 이상이면 대형 텍스트
 LARGE_BOLD_TEXT_PT = 14.0  # 굵은 글씨는 이 크기 이상이면 대형 텍스트
+# 명암비 향상 기준: WCAG 2.2 AAA (1.4.6 Contrast Enhanced) — 수정 목표(ContrastGoal.ENHANCED)에만 쓴다
+CONTRAST_ENHANCED_NORMAL = 7.0
+CONTRAST_ENHANCED_LARGE = 4.5
 
 # 안전 여백: 슬라이드 각 방향 길이의 비율 (팀 평가 기준표)
 SAFE_MARGIN_RATIO = 0.05
@@ -115,6 +141,62 @@ class ThresholdOverrides:
 
 
 @dataclass(frozen=True)
+class FixTargets:
+    """권장 수정의 목표값 (검사 기준과 별개).
+
+    수정 후보는 두 가지로 나온다.
+      최소 수정  기준을 겨우 넘기는, 원래 모습에 가장 가까운 후보 (항상 만듦)
+      권장 수정  이 목표까지 여유 있게 고친 후보 (최소 수정과 값이 다를 때만 만듦)
+    두 목표를 모두 MINIMUM으로 두면 권장 수정은 만들지 않는다.
+    """
+
+    contrast_goal: ContrastGoal = ContrastGoal.COMFORTABLE
+    contrast_ratio: float | None = None  # CUSTOM일 때 목표 명암비 (1~21)
+    font_goal: FontGoal = FontGoal.RECOMMENDED
+    # TODO(B 검사 규칙 추가 후): 줄 간격 최소 배수. None이면 줄 간격 후보를 만들지 않음
+    line_spacing: float | None = None
+    # TODO(C): 같은 슬라이드의 사진 위 배경판을 한 가지 색·투명도로 통일
+    unify_scrims: bool = False
+
+    def __post_init__(self):
+        # 설정 파일에서 문자열로 읽어 와도 enum으로 바꾼다
+        object.__setattr__(self, "contrast_goal", ContrastGoal(self.contrast_goal))
+        object.__setattr__(self, "font_goal", FontGoal(self.font_goal))
+        if self.contrast_goal == ContrastGoal.CUSTOM:
+            if self.contrast_ratio is None:
+                raise ValueError("직접 지정한 명암비 목표가 없습니다.")
+        if self.contrast_ratio is not None and (
+            not math.isfinite(self.contrast_ratio) or not 1 <= self.contrast_ratio <= 21
+        ):
+            raise ValueError("명암비 목표는 1~21 사이여야 합니다.")
+        if self.line_spacing is not None and (
+            not math.isfinite(self.line_spacing) or not 1 <= self.line_spacing <= 3
+        ):
+            raise ValueError("줄 간격 목표는 1~3배 사이여야 합니다.")
+
+    @classmethod
+    def minimum(cls) -> "FixTargets":
+        """최소 수정용 목표: 검사 기준을 겨우 넘기는 값."""
+        return cls(ContrastGoal.MINIMUM, None, FontGoal.MINIMUM)
+
+    @property
+    def offers_recommended(self) -> bool:
+        return self.contrast_goal != ContrastGoal.MINIMUM or self.font_goal != FontGoal.MINIMUM
+
+    def contrast_target(self, required: float, *, large: bool, normal: float = CONTRAST_NORMAL) -> float:
+        """검사 기준 required(그 글자에 적용된 통과선)를 넘는 수정 목표 명암비."""
+        if self.contrast_goal == ContrastGoal.COMFORTABLE:
+            goal = normal
+        elif self.contrast_goal == ContrastGoal.ENHANCED:
+            goal = CONTRAST_ENHANCED_LARGE if large else CONTRAST_ENHANCED_NORMAL
+        elif self.contrast_goal == ContrastGoal.CUSTOM:
+            goal = float(self.contrast_ratio)
+        else:
+            goal = required
+        return max(required, goal)  # 어떤 목표도 검사 기준보다 낮아지지 않음
+
+
+@dataclass(frozen=True)
 class AnalysisPolicy:
     purpose: Purpose = Purpose.PRESENTATION
     strength: Strength = Strength.STANDARD
@@ -122,6 +204,7 @@ class AnalysisPolicy:
     locked_properties: frozenset[str] = frozenset()
     locked_shapes: frozenset[str] = frozenset()
     thresholds: ThresholdOverrides = field(default_factory=ThresholdOverrides)
+    fix: FixTargets = field(default_factory=FixTargets)  # 수정 후보의 목표 (검사에는 영향 없음)
 
     def __post_init__(self):
         if not isinstance(self.purpose, Purpose) or not isinstance(self.strength, Strength):
@@ -169,13 +252,14 @@ class AnalysisPolicy:
     def cache_key(self) -> str:
         return json.dumps(
             {
-                "revision": 2,
+                "revision": 3,
                 "purpose": self.purpose,
                 "strength": self.strength,
                 "slides": sorted(set(self.slides)),
                 "locked_properties": sorted(self.locked_properties),
                 "locked_shapes": sorted(self.locked_shapes),
                 "thresholds": asdict(self.thresholds),
+                "fix": asdict(self.fix),
             },
             sort_keys=True,
             separators=(",", ":"),

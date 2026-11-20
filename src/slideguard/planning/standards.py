@@ -12,10 +12,10 @@ C는 기준값을 따로 정하지 않습니다. 검사(B)와 수정 후보(C)�
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from slideguard.domain import policy as team
-from slideguard.domain.policy import AnalysisPolicy, Purpose
+from slideguard.domain.policy import AnalysisPolicy, FixTargets, Purpose
 
 SOURCE = "B 기준 (domain/policy.py)"
 NO_TEAM_CRITERION = "B에 이 기준이 없음 → 수정 후보를 만들지 않음"
@@ -48,6 +48,7 @@ class Standards:
     max_chars: Criterion  # 정보 밀도: 슬라이드 전체 글자 수 (공백 제외)
     min_line_spacing: Criterion  # B에 없음
     title_body_ratio: Criterion
+    fix: FixTargets = field(default_factory=FixTargets)  # 수정 목표 (B 정책의 FixTargets)
 
     def criteria(self) -> list[tuple[str, Criterion]]:
         """화면·보고서 출력용 (이름, 기준) 목록"""
@@ -87,6 +88,11 @@ def build_standards(
         safe_margin_ratio=Criterion(policy.margin_ratio, f"{SOURCE} 안전 여백"),
         max_lines=Criterion(density.max_lines, f"{SOURCE} {label} 정보 밀도(줄)"),
         max_chars=Criterion(density.max_chars, f"{SOURCE} {label} 정보 밀도(글자)"),
-        min_line_spacing=Criterion(None, NO_TEAM_CRITERION),
+        min_line_spacing=(
+            Criterion(policy.fix.line_spacing, f"{SOURCE} 수정 목표 줄 간격")
+            if policy.fix.line_spacing is not None
+            else Criterion(None, NO_TEAM_CRITERION)
+        ),
         title_body_ratio=Criterion(team.TITLE_BODY_RATIO, f"{SOURCE} 시각적 위계"),
+        fix=policy.fix,
     )

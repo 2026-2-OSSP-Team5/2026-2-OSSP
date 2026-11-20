@@ -99,6 +99,15 @@ def shape_key_of(slide_index: int, shape_id: int) -> str:
     return f"{slide_index}:{shape_id}"
 
 
+# 권장 수정 후보의 팀 ChangeProposal.id 표시 (예: "font.color@4:3~rec", 묶음이면 "...~rec#group~rec")
+RECOMMENDED_MARK = "~rec"
+
+
+def is_recommended(proposal_id: object) -> bool:
+    """팀 ChangeProposal.id가 권장 수정 후보인지."""
+    return RECOMMENDED_MARK in str(proposal_id).split("#", 1)[0]
+
+
 class TeamBindings:
     # ------------------------------------------------------------------
     # B(검사 엔진)와 맞출 이름
@@ -572,6 +581,8 @@ class TeamBindings:
 
         key = shape_key_of(proposal.slide_index, proposal.shape_id)
         proposal_id = f"{proposal.prop}@{key}"
+        if getattr(proposal, "variant", "minimum") == "recommended":
+            proposal_id += RECOMMENDED_MARK
         if proposal.group:
             proposal_id += f"#{proposal.group}"
         return TeamChangeProposal(

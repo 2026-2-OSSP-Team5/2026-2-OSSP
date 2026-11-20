@@ -52,8 +52,16 @@ from slideguard.bootstrap import (
     build_workspace_settings_repository,
 )
 from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Finding
-from slideguard.domain.policy import AnalysisPolicy, Purpose, Strength, ThresholdOverrides
-from slideguard.planning.bindings import TeamBindings
+from slideguard.domain.policy import (
+    AnalysisPolicy,
+    ContrastGoal,
+    FixTargets,
+    FontGoal,
+    Purpose,
+    Strength,
+    ThresholdOverrides,
+)
+from slideguard.planning.bindings import TeamBindings, is_recommended
 from slideguard.ui.preview import render_slide_previews
 from slideguard.ui.slide_lens import InputActivity, SlideLens, SlideView, SlideViewProbe, build_marks
 
@@ -925,10 +933,18 @@ class OverlayWidget(QWidget):
         self.apply_one_button.clicked.connect(self._apply_current_proposal)
         self.apply_one_button.setEnabled(False)
         direct_actions.addWidget(self.apply_one_button)
-        self.apply_all_button = QPushButton("전체 사본 적용")
-        self.apply_all_button.clicked.connect(self._apply_all_proposals)
+        self.apply_all_button = QPushButton("최소 수정 전체 사본 적용")
+        self.apply_all_button.setToolTip("기준을 겨우 넘기는, 원래 모습에 가장 가까운 수정")
+        self.apply_all_button.clicked.connect(lambda: self._apply_all_proposals(recommended=False))
         self.apply_all_button.setEnabled(False)
         direct_actions.addWidget(self.apply_all_button)
+        self.apply_all_recommended_button = QPushButton("권장 수정 전체 사본 적용")
+        self.apply_all_recommended_button.setToolTip(
+            "설정의 권장 목표(명암비·글자 크기)까지 여유 있게 고친 수정"
+        )
+        self.apply_all_recommended_button.clicked.connect(lambda: self._apply_all_proposals(recommended=True))
+        self.apply_all_recommended_button.setEnabled(False)
+        direct_actions.addWidget(self.apply_all_recommended_button)
         proposal_layout.addLayout(direct_actions)
         self.apply_original_button = QPushButton("선택한 제안을 원본에 적용 (0)", objectName="primary")
         self.apply_original_button.setEnabled(False)
@@ -1264,6 +1280,7 @@ class OverlayWidget(QWidget):
         self.proposal_items.clear()
         self._proposal_ids_by_severity.clear()
         findings = {item.id: item for item in report.findings}
+        has_recommended = {_variant_target(item) for item in report.proposals if is_recommended(item.id)}
         try:
             for proposal in report.proposals:
                 finding = findings.get(proposal.finding_id)
@@ -1271,7 +1288,12 @@ class OverlayWidget(QWidget):
                 if finding is not None:
                     self._proposal_ids_by_severity.setdefault(finding.severity, set()).add(proposal.id)
                 slide = _slide_number(proposal.shape_key)
-                label = f"{slide}번 · {severity}\n{proposal_change_text(proposal)}"
+                variant = ""
+                if is_recommended(proposal.id):
+                    variant = " · 권장 수정"
+                elif _variant_target(proposal) in has_recommended:
+                    variant = " · 최소 수정"
+                label = f"{slide}번 · {severity}{variant}\n{proposal_change_text(proposal)}"
                 item = QListWidgetItem(label)
                 item.setData(Qt.ItemDataRole.UserRole, proposal)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -1296,18 +1318,27 @@ class OverlayWidget(QWidget):
         group = _proposal_group(proposal)
         checked = self.proposal_items[proposal_id].checkState()
         members = [proposal.id]
-        if group is not None:
-            members = [item.id for item in self._report.proposals if _proposal_group(item) == group]
-            self._syncing_proposals = True
-            try:
+        released = []  # 이 체크 때문에 해제된 반대쪽 변형 (최소 ↔ 권장)
+        self._syncing_proposals = True
+        try:
+            if group is not None:
+                members = [item.id for item in self._report.proposals if _proposal_group(item) == group]
                 for member in members:
                     self.proposal_items[member].setCheckState(checked)
-            finally:
-                self._syncing_proposals = False
+            if checked == Qt.CheckState.Checked:
+                # 최소 수정과 권장 수정은 같은 대상의 다른 값이라 하나만 고를 수 있다
+                for other in _counterparts(self._report, proposal):
+                    if self.proposal_items[other.id].checkState() == Qt.CheckState.Checked:
+                        released.append(other.id)
+                    self.proposal_items[other.id].setCheckState(Qt.CheckState.Unchecked)
+        finally:
+            self._syncing_proposals = False
         self._update_apply_button()
         self.proposals_list.viewport().update()
         self.preview_state_changed.emit()
-        # 열린 문서에 바로 적용하고 그 슬라이드로 이동 (컨트롤러가 처리)
+        # 열린 문서에 바로 적용하고 그 슬라이드로 이동 (컨트롤러가 처리). 반대쪽 변형은 먼저 되돌린다
+        if released:
+            self.proposal_user_toggled.emit(tuple(released), False)
         self.proposal_user_toggled.emit(tuple(members), checked == Qt.CheckState.Checked)
 
     def set_proposals_checked(self, proposal_ids, checked: bool):
@@ -1325,7 +1356,10 @@ class OverlayWidget(QWidget):
         self.proposals_list.viewport().update()
 
     def select_severity(self, severity: str):
-        proposal_ids = self._proposal_ids_by_severity.get(severity)
+        # 최소 수정을 고른다 (권장 수정은 목록에서 직접 고르거나 '권장 수정 전체 사본 적용')
+        proposal_ids = {
+            item for item in self._proposal_ids_by_severity.get(severity, set()) if not is_recommended(item)
+        }
         if self._report is None or not proposal_ids:
             return
         self._syncing_proposals = True
@@ -1350,11 +1384,15 @@ class OverlayWidget(QWidget):
             current.setCheckState(Qt.CheckState.Checked)
             self.apply_requested.emit()
 
-    def _apply_all_proposals(self):
+    def _apply_all_proposals(self, recommended: bool = False):
+        """모든 대상에 최소 수정(또는 권장 수정이 있으면 권장 수정)을 하나씩 골라 적용한다."""
+        chosen = set(_pick_variant(self._report, recommended=recommended)) if self._report else set()
         self.proposals_list.blockSignals(True)
         try:
-            for item in self.proposal_items.values():
-                item.setCheckState(Qt.CheckState.Checked)
+            for proposal_id, item in self.proposal_items.items():
+                item.setCheckState(
+                    Qt.CheckState.Checked if proposal_id in chosen else Qt.CheckState.Unchecked
+                )
         finally:
             self.proposals_list.blockSignals(False)
         self._update_apply_button()
@@ -1413,6 +1451,9 @@ class OverlayWidget(QWidget):
         self.apply_original_button.setEnabled(ready and count > 0)
         self.apply_one_button.setEnabled(ready and self.proposals_list.currentItem() is not None)
         self.apply_all_button.setEnabled(ready and bool(self.proposal_items))
+        self.apply_all_recommended_button.setEnabled(
+            ready and any(is_recommended(proposal_id) for proposal_id in self.proposal_items)
+        )
         self.locate_button.setEnabled(
             ready
             and self._finding is not None
@@ -1488,6 +1529,23 @@ class SettingsDialog(QDialog):
         self.strength.addItem("표준", Strength.STANDARD.value)
         self.strength.addItem("강하게", Strength.STRONG.value)
         policy_form.addRow("수정 강도", self.strength)
+        # 수정 목표: 검사 기준을 넘은 뒤 얼마나 여유 있게 고칠지 (검사 결과에는 영향 없음)
+        contrast_row = QHBoxLayout()
+        self.contrast_goal = QComboBox()
+        self.contrast_goal.addItem("기준선만 넘기기 (원래 색에 가장 가깝게)", ContrastGoal.MINIMUM.value)
+        self.contrast_goal.addItem("여유 있게 (모든 글자 4.5:1 이상)", ContrastGoal.COMFORTABLE.value)
+        self.contrast_goal.addItem("매우 선명하게 (WCAG AAA 7:1)", ContrastGoal.ENHANCED.value)
+        self.contrast_goal.addItem("직접 입력", ContrastGoal.CUSTOM.value)
+        self.contrast_ratio_edit = QLineEdit(placeholderText="예 6")
+        self.contrast_ratio_edit.setMaximumWidth(70)
+        self.contrast_goal.currentIndexChanged.connect(self._update_contrast_goal)
+        contrast_row.addWidget(self.contrast_goal, 1)
+        contrast_row.addWidget(self.contrast_ratio_edit)
+        policy_form.addRow("명암비 수정 목표", contrast_row)
+        self.font_goal = QComboBox()
+        self.font_goal.addItem("최소 크기까지", FontGoal.MINIMUM.value)
+        self.font_goal.addItem("권장 크기까지", FontGoal.RECOMMENDED.value)
+        policy_form.addRow("글자 크기 수정 목표", self.font_goal)
         self.slides_edit = QLineEdit(placeholderText="비우면 전체 · 예 1, 3-5")
         policy_form.addRow("검사 슬라이드", self.slides_edit)
         locks = QHBoxLayout()
@@ -1561,6 +1619,12 @@ class SettingsDialog(QDialog):
         policy = settings.policy_for(self.document) if settings is not None else AnalysisPolicy()
         self.purpose.setCurrentIndex(self.purpose.findData(policy.purpose.value))
         self.strength.setCurrentIndex(self.strength.findData(policy.strength.value))
+        self.contrast_goal.setCurrentIndex(self.contrast_goal.findData(policy.fix.contrast_goal.value))
+        self.contrast_ratio_edit.setText(
+            "" if policy.fix.contrast_ratio is None else f"{policy.fix.contrast_ratio:g}"
+        )
+        self.font_goal.setCurrentIndex(self.font_goal.findData(policy.fix.font_goal.value))
+        self._update_contrast_goal()
         self.slides_edit.setText(", ".join(map(str, policy.slides)))
         for key, checkbox in self.property_locks.items():
             checkbox.setChecked(key in policy.locked_properties)
@@ -1600,6 +1664,21 @@ class SettingsDialog(QDialog):
         if folder:
             self.folder_edit.setText(folder)
             self.refresh_files()
+
+    def _update_contrast_goal(self, *_args):
+        self.contrast_ratio_edit.setEnabled(self.contrast_goal.currentData() == ContrastGoal.CUSTOM.value)
+
+    def _fix_targets(self) -> FixTargets:
+        goal = ContrastGoal(self.contrast_goal.currentData())
+        ratio = None
+        if goal == ContrastGoal.CUSTOM:
+            try:
+                ratio = float(self.contrast_ratio_edit.text().strip())
+            except ValueError:
+                raise ValueError("명암비 수정 목표를 숫자로 입력하세요 (예 6).") from None
+        return FixTargets(
+            contrast_goal=goal, contrast_ratio=ratio, font_goal=FontGoal(self.font_goal.currentData())
+        )
 
     def refresh_files(self):
         self.files.clear()
@@ -1641,6 +1720,7 @@ class SettingsDialog(QDialog):
                 ),
                 locked_shapes=shapes,
                 thresholds=ThresholdOverrides(**overrides),
+                fix=self._fix_targets(),
             )
             build_workspace_settings_repository().save(
                 folder.resolve(), self.recursive.isChecked(), policy=policy, document=self.document
@@ -3006,16 +3086,69 @@ def _selection_conflicts(report: AnalysisReport, selected: list[ChangeProposal])
         if chosen and chosen != member_ids:
             messages.append(f"묶음 '{group}'의 제안을 모두 선택하거나 모두 해제해 주세요.")
 
-    targets: dict[tuple[str, str], list[ChangeProposal]] = {}
+    targets: dict[tuple, list[ChangeProposal]] = {}
     for proposal in selected:
-        targets.setdefault((proposal.shape_key, proposal.property), []).append(proposal)
-    for (shape_key, property_name), proposals in targets.items():
+        targets.setdefault(_variant_target(proposal), []).append(proposal)
+    for (shape_key, property_name, _before), proposals in targets.items():
         values = {_normalized_value(item.after) for item in proposals}
         if len(values) > 1:
             messages.append(
                 f"{shape_key}의 {_property_name(property_name)}에 서로 다른 변경값이 선택되었습니다."
             )
     return messages
+
+
+def _variant_target(proposal: ChangeProposal) -> tuple:
+    """같은 대상(객체·속성·원래 값)이면 최소/권장 수정 중 하나만 고를 수 있다.
+
+    글자 색·글씨체는 원래 값이 같은 글자에만 적용되므로 원래 값까지 대상에 넣는다
+    (한 상자에 회색이 두 가지면 두 후보를 함께 고를 수 있어야 함).
+    """
+    before = (
+        _normalized_value(proposal.before) if proposal.property in ("font.color", "font.family") else None
+    )
+    return (proposal.shape_key, proposal.property, before)
+
+
+def _counterparts(report: AnalysisReport, proposal: ChangeProposal) -> list[ChangeProposal]:
+    """proposal과 같은 대상의 다른 수정 후보 (그 묶음 전체 포함)."""
+    target = _variant_target(proposal)
+    own_group = _proposal_group(proposal)
+    rivals = [
+        item
+        for item in report.proposals
+        if item.id != proposal.id
+        and _variant_target(item) == target
+        and (own_group is None or _proposal_group(item) != own_group)
+    ]
+    groups = {_proposal_group(item) for item in rivals if _proposal_group(item) is not None}
+    return rivals + [
+        item for item in report.proposals if _proposal_group(item) in groups and item not in rivals
+    ]
+
+
+def _pick_variant(report: AnalysisReport, *, recommended: bool) -> list[str]:
+    """대상마다 후보 하나: recommended=True면 권장 수정이 있는 대상은 권장, 나머지는 최소 수정."""
+    rec_targets = {_variant_target(item) for item in report.proposals if is_recommended(item.id)}
+    chosen = []
+    for item in report.proposals:
+        if recommended:
+            replaced = _variant_target(item) in rec_targets or _replaced_bundle(report, item, rec_targets)
+            if is_recommended(item.id) or not replaced:
+                chosen.append(item.id)
+        elif not is_recommended(item.id):
+            chosen.append(item.id)
+    return chosen
+
+
+def _replaced_bundle(report: AnalysisReport, item: ChangeProposal, rec_targets: set) -> bool:
+    """item이 속한 최소 수정 묶음의 일부가 권장 수정으로 바뀌면 묶음 전체를 권장 쪽으로 넘긴다."""
+    group = _proposal_group(item)
+    if group is None:
+        return False
+    return any(
+        _variant_target(other) in rec_targets for other in report.proposals if _proposal_group(other) == group
+    )
 
 
 def proposal_change_text(proposal: ChangeProposal) -> str:
