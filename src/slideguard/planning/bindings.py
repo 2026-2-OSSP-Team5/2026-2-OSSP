@@ -95,6 +95,18 @@ def parse_shape_key(key: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
+# 표 칸 주소 "7:5:table_cell:2,1" (슬라이드 7, 표 도형 5의 2행 1열)
+_TABLE_CELL_KEY = re.compile(r"^(\d+):(\d+):table_cell:")
+
+
+def table_of_cell(key: str) -> tuple[int, int] | None:
+    """'7:5:table_cell:2,1' → (7, 5): 표 칸이 속한 표 도형. 표 칸이 아니면 None."""
+    match = _TABLE_CELL_KEY.match(str(key))
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 def shape_key_of(slide_index: int, shape_id: int) -> str:
     return f"{slide_index}:{shape_id}"
 
@@ -217,6 +229,7 @@ class TeamBindings:
         Property.SHAPE_POSITION: ("position",),
         Property.Z_ORDER: ("position",),
         Property.SHAPE_HEIGHT: ("size",),
+        Property.SHAPE_WIDTH: ("size",),
         Property.LINE_SPACING: ("font_size", "size"),  # 글자가 차지하는 높이를 바꿈
     }
 

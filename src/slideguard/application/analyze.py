@@ -13,7 +13,10 @@ class AnalyzePresentation:
         rules: tuple[CheckRule, ...] = (),
         planner: ProposalPlanner | None = None,
         repository: ReportRepository | None = None,
+        finding_filter=None,
     ):
+        """finding_filter(deck, findings) → (남길 판정, 부가 정보): 표지·출처 슬라이드 제외 등."""
+        self.finding_filter = finding_filter
         self.reader = reader
         self.rules = rules
         self.planner = planner
@@ -26,6 +29,8 @@ class AnalyzePresentation:
         report = AnalysisReport(deck=deck, policy_key=policy.cache_key)
         for rule in self.rules:
             report.findings.extend(rule.evaluate(report.deck, policy))
+        if self.finding_filter is not None:
+            report.findings, _info = self.finding_filter(report.deck, report.findings)
         report.executed_rules = tuple(rule.id for rule in self.rules)
         if self.rules:
             report.status = "analyzed"

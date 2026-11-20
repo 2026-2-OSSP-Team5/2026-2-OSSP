@@ -45,6 +45,21 @@ PROPERTIES = frozenset({"font_size", "font_color", "font_family", "position", "s
 # 명암비: WCAG 2.2 AA (1.4.3 Contrast Minimum)
 CONTRAST_NORMAL = 4.5  # 일반 텍스트
 CONTRAST_LARGE = 3.0  # 대형 텍스트
+# 글자 크기 기준(발표용 14pt 등)은 PowerPoint 기본 슬라이드 높이(7.5인치 = 540pt) 기준이다.
+# 화면에 띄우면 슬라이드 전체가 화면 크기에 맞춰 늘거나 줄기 때문에, 보이는 크기는 '글자 pt ÷ 슬라이드 높이'에 비례한다.
+# 예) 높이 810pt(20×11.25인치) 슬라이드의 18pt = 기본 슬라이드의 12pt처럼 보인다.
+# 기준은 더 큰 슬라이드에서만 그만큼 키운다 (작은 슬라이드에서 기준을 낮추지는 않음: 인쇄·모니터에서는 pt 그대로 보임).
+REFERENCE_SLIDE_HEIGHT_PT = 540.0
+MAX_SLIDE_SCALE = 2.0
+
+
+def slide_scale(height_pt: float | None) -> float:
+    """글자 크기 기준에 곱할 배수 (1 이상)."""
+    if not height_pt or not math.isfinite(height_pt) or height_pt <= 0:
+        return 1.0
+    return min(MAX_SLIDE_SCALE, max(1.0, height_pt / REFERENCE_SLIDE_HEIGHT_PT))
+
+
 LARGE_TEXT_PT = 18.0  # 이 크기 이상이면 대형 텍스트
 LARGE_BOLD_TEXT_PT = 14.0  # 굵은 글씨는 이 크기 이상이면 대형 텍스트
 # 명암비 향상 기준: WCAG 2.2 AAA (1.4.6 Contrast Enhanced) — 수정 목표(ContrastGoal.ENHANCED)에만 쓴다

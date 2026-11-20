@@ -27,12 +27,19 @@ if TYPE_CHECKING:
     from slideguard.adapters.watching.monitor import SavedFileMonitor
 
 
+def exempt_special_slides(deck, findings):
+    from slideguard.checks.slide_kinds import exempt
+
+    return exempt(deck, findings)
+
+
 def build_analyzer(reader: DeckReader | None = None) -> AnalyzePresentation:
     """Use the same rules for saved COM snapshots and the metadata-only CLI."""
     return AnalyzePresentation(
         reader=reader or OoxmlDeckReader(),
         rules=(ContrastRule(), TypographyRule(), LayoutRule()),
         planner=MinimumChangePlanner(),
+        finding_filter=exempt_special_slides,  # 표지·목차·출처·마무리 슬라이드의 의미 없는 판정 제외
     )
 
 

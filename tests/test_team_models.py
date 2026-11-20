@@ -306,3 +306,32 @@ def test_b_sample_review_gets_scrim_only_at_strong():
     assert [p.prop for p in strong.proposals] == [Property.SHAPE_FILL]
     assert strong.proposals[0].after["color"] == "000000"
     assert standard.proposals == []
+
+
+def test_small_table_cells_become_one_table_font_proposal():
+    """표 칸마다 후보를 내지 않고 표 하나에 '표 전체 글자 크기' 후보 하나 (함정 PPT 7쪽)."""
+    table = Shape(slide_number=1, shape_id=5, name="표", box=Box(40, 100, 600, 300), text="", supported=True)
+    cells = [
+        finding("typography", f"1:5:table_cell:{row},1", measured=size, expected=14.0)
+        for row, size in ((1, 10.0), (2, 10.0), (3, 11.0))
+    ]
+    result = RuleBasedPlanner().plan(deck_of(table), cells, AnalysisPolicy())
+    assert [(p.slide_index, p.shape_id, p.prop, p.before, p.after) for p in result.proposals] == [
+        (1, 5, Property.FONT_SIZE, 10.0, 14.0)
+    ]
+    assert "표 전체" in result.proposals[0].note and "3개" in result.proposals[0].note
+
+
+def test_card_off_slide_shrinks_with_the_text_inside():
+    """함정 PPT 2쪽: 세 번째 카드가 오른쪽 끝을 넘음 → 카드와 안쪽 글상자를 같은 만큼 줄인다 (옮기면 옆 카드와 겹침)."""
+    card = Shape(1, 3, "카드 3", Box(655, 151, 331, 281), text="", supported=True)
+    neighbour = Shape(1, 9, "카드 2", Box(349, 151, 284, 281), text="", supported=True)
+    body = text_shape(4, Box(680, 238, 281, 173))
+    off = finding(
+        "layout.margin", "1:3", "warning", measured=-26.0, expected=0.0, finding_id="layout.margin:1:3:card"
+    )
+    result = RuleBasedPlanner().plan(deck_of(card, neighbour, body, width=960.0), [off], AnalysisPolicy())
+    changes = {(p.shape_id, p.prop): (p.before, p.after) for p in result.proposals}
+    assert changes[(3, Property.SHAPE_WIDTH)] == (331, 257)  # 오른쪽 끝을 960 - 여백 48 = 912에
+    assert changes[(4, Property.SHAPE_WIDTH)] == (281, 207)  # 카드와의 여유 25pt 유지
+    assert len({p.group for p in result.proposals}) == 1

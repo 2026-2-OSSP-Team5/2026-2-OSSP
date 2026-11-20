@@ -24,6 +24,7 @@ class Property:
     FONT_COLOR = "font.color"  # 글자색
     FONT_FAMILY = "font.family"  # 글씨체
     SHAPE_HEIGHT = "shape.height"  # 상자 높이
+    SHAPE_WIDTH = "shape.width"  # 상자 너비 (슬라이드 밖으로 나간 카드 줄이기)
     SHAPE_POSITION = "shape.position"  # 상자 위치 (슬라이드 밖 → 안)
     Z_ORDER = "shape.zorder"  # 앞뒤 순서
     SHAPE_FILL = "shape.fill"  # 상자 배경 채우기 (사진 위 글씨용 배경판)
@@ -51,7 +52,7 @@ class Rule:
 # 사용자 지정 체크박스 → 고정되는 속성 (회의록: 글자 크기 고정, 레이아웃/좌표 고정 …)
 USER_LOCK_GROUPS = {
     "font_size": (Property.FONT_SIZE, Property.AUTOFIT),  # 자동 맞춤 해제도 표시 크기를 바꿈
-    "layout": (Property.SHAPE_POSITION, Property.SHAPE_HEIGHT, Property.Z_ORDER),
+    "layout": (Property.SHAPE_POSITION, Property.SHAPE_HEIGHT, Property.SHAPE_WIDTH, Property.Z_ORDER),
     "font_family": (Property.FONT_FAMILY,),
     "color": (Property.FONT_COLOR, Property.SHAPE_FILL),
 }
