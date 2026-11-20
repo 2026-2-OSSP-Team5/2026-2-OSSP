@@ -158,3 +158,78 @@ def measure_pixels(shape, slide, before, render, sx, sy):
         visible_text_box=text_box,
         measurements=(*shape.measurements, *notes),
     )
+
+
+def measure_table_cells(cells, slide, render, sx, sy):
+    """한 표의 글자 있는 칸들을 한꺼번에 잰다. {shape.key: Box 또는 None}.
+
+    예전에는 칸마다 슬라이드를 복제하고 두 번 그렸다 (칸 n개 → 복제 n번 + 내보내기 2n번).
+    이제는 표마다 한 번 복제해서 한 번 그린 뒤, 칸 글자를 하나씩 지우며 바로 앞 그림과 비교한다
+    (복제 1번 + 내보내기 n+1번). 지운 칸 하나만 달라지므로 그 차이가 그 칸 글자의 위치다.
+    지우는 사이 표 크기·줄 높이가 바뀌면 그 칸은 측정하지 않는다 (위치가 함께 바뀌어 비교가 틀어짐).
+    """
+    result = {shape.key: None for shape in cells}
+    if not cells:
+        return result
+    positions = _positions(slide, cells[0].locator.shape_path)
+    if not positions:
+        return result
+    notes = []
+    duplicate = optional(lambda: slide.Duplicate().Item(1), "Temporary probe slide", notes)
+    if duplicate is None:
+        return result
+    try:
+        container = _item(duplicate, positions)
+        table = container.Table
+
+        def geometry():
+            return (
+                _geometry(container),
+                tuple(table.Rows.Item(index).Height for index in range(1, table.Rows.Count + 1)),
+                tuple(table.Columns.Item(index).Width for index in range(1, table.Columns.Count + 1)),
+            )
+
+        previous = render(duplicate)
+        if previous is None:
+            return result
+        for shape in cells:
+            row, column = shape.locator.indices
+            item = table.Cell(row, column).Shape
+            frame = optional(lambda item=item: item.TextFrame, "Probe text frame", notes)
+            if (
+                frame is None
+                or optional(lambda frame=frame: frame.AutoSize, "Probe text frame AutoSize", notes) != 0
+            ):
+                continue
+            before = geometry()
+            optional(
+                lambda frame=frame: setattr(frame.TextRange, "Text", ""), "Clear text in probe slide", notes
+            )
+            after = render(duplicate)
+            if after is None:
+                break
+            if geometry() == before:
+                result[shape.key] = _inside_cell(_pixel_box(previous, after, sx, sy), shape.box)
+            previous = after  # 다음 칸은 이번 그림과 비교 (지운 칸은 계속 비어 있음)
+        return result
+    finally:
+        duplicate.Delete()
+
+
+def _inside_cell(text_box, cell_box):
+    """칸 글자를 지웠을 때 달라진 픽셀이 그 칸 근처에 있어야 그 칸의 글자다.
+
+    지우는 사이 PowerPoint가 다른 곳(맞춤법 표시, 다시 그려진 표 테두리 등)까지 다르게 그리면
+    차이가 표 전체로 잡혀 '655pt 넘침' 같은 오판정이 난다 (함정 PPT 7쪽). 그런 값은 버린다(None).
+    칸 밖으로 글자 한 줄 높이 정도 나간 것까지는 실제 위치로 인정한다.
+    """
+    if text_box is None or cell_box is None:
+        return text_box
+    slack = max(cell_box.height, 20.0)
+    inside = (
+        text_box.x >= cell_box.x - slack
+        and text_box.y >= cell_box.y - slack
+        and text_box.x + text_box.width <= cell_box.x + cell_box.width + slack
+        and text_box.y + text_box.height <= cell_box.y + cell_box.height + slack
+    )
+    return text_box if inside else None

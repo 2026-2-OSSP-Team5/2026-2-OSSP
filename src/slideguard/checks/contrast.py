@@ -3,7 +3,8 @@
 배경색을 하나로 정할 수 없을 때(사진·그라데이션·반투명 등)는 렌더링에서 모은
 글자 주변 픽셀(background_samples)이 있으면 '가장 불리한 픽셀' 기준으로 근사 판정합니다.
   - 모든 픽셀에서 기준 통과 → 통과
-  - 하나라도 미달 → 검토 필요(review): 근사값이라 경고로 단정하지 않음
+  - 가장 유리한 픽셀에서도 미달 → 문제(warning): 배경 어디서도 읽기 어려우므로 확정
+  - 일부 위치만 미달 → 검토 필요(review): 근사값이라 경고로 단정하지 않음
   - 픽셀 근거도 없으면 → 판정 불가(unknown)
 """
 
@@ -126,6 +127,31 @@ def _background_reason(shape: Shape) -> str:
 
 # 렌더링 픽셀 근거로 판정하려면 최소 이만큼의 픽셀이 필요 (A의 렌더링 코드와 같은 값)
 MIN_BACKGROUND_SAMPLES = 4
+# 주변 픽셀 중 이 비율만큼은 무시하고 판정한다. 글상자 둘레를 따라 뽑은 픽셀에는 옆 도형의 테두리 선,
+# 옆 글자 획 같은 가는 선이 섞이는데, '가장 나쁜 1개'로 판정하면 그 선 때문에 1.1:1 같은 오판정이 난다.
+# (자바게티 20쪽: 베이지 배경의 검은 글씨가 둥근 테두리 선 때문에 1.1:1로 판정됨)
+SAMPLE_OUTLIER_SHARE = 0.2
+
+
+def sample_contrast(color: Color, samples: list[Color]) -> tuple[float, Color]:
+    """주변 픽셀 대비 명암비: 가장 나쁜 쪽에서 SAMPLE_OUTLIER_SHARE만큼 뺀 뒤 가장 나쁜 값 (근사).
+
+    planner(bindings)도 이 함수로 어떤 글자색의 판정인지 찾는다.
+    """
+    ranked = sorted(samples, key=lambda sample: contrast_ratio(color, sample))
+    pick = ranked[min(len(ranked) - 1, int(len(ranked) * SAMPLE_OUTLIER_SHARE))]
+    return contrast_ratio(color, pick), pick
+
+
+def best_sample_contrast(color: Color, samples: list[Color]) -> float:
+    """가장 유리한 쪽 명암비 (좋은 쪽에서도 SAMPLE_OUTLIER_SHARE만큼은 뺀다: 옆 글자·선 같은 잡음).
+
+    이 값조차 기준 미달이면 배경 어디에 놓여도 읽기 어렵다는 뜻이라 '근사'가 아니라 확정 문제다.
+    (예: 흰 카드 위 연회색 글자 → 주변 픽셀이 전부 흰색이라 가장 유리한 값도 2.6:1)
+    """
+    ranked = sorted(samples, key=lambda sample: contrast_ratio(color, sample))
+    pick = ranked[max(0, len(ranked) - 1 - int(len(ranked) * SAMPLE_OUTLIER_SHARE))]
+    return contrast_ratio(color, pick)
 
 
 def _sample_colors(shape: Shape) -> list[Color]:
@@ -158,21 +184,35 @@ def _evaluate_with_samples(
                 )
             )
             continue
-        worst_color = min(samples, key=lambda color: contrast_ratio(run.color, color))
-        worst = contrast_ratio(run.color, worst_color)
+        worst, worst_color = sample_contrast(run.color, samples)
         large = large_text_state(run.font_size_pt, run.bold)
         # 글자 유형을 모르면 더 엄격한 일반 기준 (근사 판정이라 보수적으로)
         expected = policy.large_contrast if large else policy.normal_contrast
         if worst >= expected:
             continue
         kind = "대형" if large else "일반"
+        best = best_sample_contrast(run.color, samples)
+        if best < expected:
+            # 가장 밝은(유리한) 배경 위치에서도 미달 → 배경이 고르든 아니든 확정 문제
+            results.append(
+                (
+                    "warning",
+                    f"글자와 배경의 명암비가 부족합니다 ({best:.2f}:1)",
+                    round(best, 2),
+                    expected,
+                    f"글자 {hex_color(run.color)} / 렌더링된 주변 픽셀 {len(samples)}개 중 가장 유리한 쪽도 "
+                    f"{best:.2f}:1 < {expected}:1 ({kind} 텍스트 기준, 배경 어디서도 미달)",
+                )
+            )
+            continue
         results.append(
             (
                 "review",
                 f"배경이 고르지 않아 일부 위치에서 명암비가 부족할 수 있습니다 (최저 {worst:.2f}:1, 근사)",
                 round(worst, 2),
                 expected,
-                f"글자 {hex_color(run.color)} / 렌더링된 주변 픽셀 {len(samples)}개 중 가장 불리한 "
+                f"글자 {hex_color(run.color)} / 렌더링된 주변 픽셀 {len(samples)}개 중 가는 선 등 "
+                f"{SAMPLE_OUTLIER_SHARE:.0%}를 뺀 가장 불리한 "
                 f"{hex_color(worst_color)} → {worst:.2f}:1 < {expected}:1 ({kind} 텍스트 기준, "
                 "배경이 사진·그라데이션·반투명이라 근사값)",
             )

@@ -78,6 +78,9 @@ class DocShape:
     def set_height(self, h):
         self.geometry[3] = h
 
+    def set_width(self, w):
+        self.geometry[2] = w
+
     def set_position(self, left, top):
         self.geometry[0] = left
         self.geometry[1] = top
@@ -298,3 +301,76 @@ def test_partially_applied_bundle_is_warned(original, tmp_path):
     shape = DocShape(geometry=(50, 100, 400, 60))  # 객체 7은 문서에 없음 → 내리기 실패
     result = run_apply(original, tmp_path, shape, [height, push])
     assert any("일부만 적용" in w for w in result.warnings)
+
+
+# ---------------------------------------------------------------- 함정 PPT 4쪽·7쪽
+
+
+def test_shrunk_text_turns_autofit_off_and_scales_to_target(original, tmp_path):
+    """'넘치면 자동 축소'로 24pt가 13pt로 보이는 상자: 글자를 키워도 다시 줄어드므로
+    자동 축소를 끄고 가장 작은 글자가 목표 크기가 되게 맞춘다 (제목·본문 비율 유지)."""
+    shape = DocShape(runs=[DocRun(24, "000000"), DocRun(36, "000000")], autofit="shrink")
+    result = run_apply(original, tmp_path, shape, [proposal(Property.FONT_SIZE, 13, 14)])
+    assert result.applied and shape.autofit == "grow"
+    assert [run.size for run in shape.runs()] == [14, 21]
+
+
+def test_com_table_runs_cover_every_cell():
+    def cell(text, size):
+        run = SimpleNamespace(Start=1, Text=text, Font=SimpleNamespace(Size=size))
+
+        class TextRange:
+            Text = text
+
+            def Runs(self, index, length):
+                return run
+
+        return SimpleNamespace(Shape=SimpleNamespace(TextFrame2=SimpleNamespace(TextRange=TextRange())))
+
+    cells = {
+        (1, 1): cell("단계", 10.0),
+        (1, 2): cell("", 10.0),
+        (2, 1): cell("수요 확정", 11.0),
+        (2, 2): cell("12월", 10.0),
+    }
+    table = SimpleNamespace(
+        Rows=SimpleNamespace(Count=2),
+        Columns=SimpleNamespace(Count=2),
+        Cell=lambda row, column: cells[(row, column)],
+    )
+    shape = SimpleNamespace(HasTable=-1, HasTextFrame=0, Table=table, Top=100.0, Height=200.0)
+
+    com = patcher._ComShape(shape, 540)
+
+    assert [run.get_size() for run in com.runs()] == [10.0, 11.0, 10.0]  # 빈 칸은 건너뜀
+    assert com.text_overflows() is False
+
+
+def test_com_table_rows_grow_to_fit_bigger_text_but_never_shrink():
+    """함정 PPT 7쪽: 글자를 18pt로 키워도 행이 그대로라 표 밖으로 넘치던 문제.
+    PowerPoint는 행 높이를 바로 다시 계산하지 않으므로 칸 글자 높이로 직접 계산해 늘린다."""
+
+    def cell(text, bound):
+        frame = SimpleNamespace(
+            TextRange=SimpleNamespace(Text=text, BoundHeight=bound), MarginTop=3.6, MarginBottom=3.6
+        )
+        return SimpleNamespace(Shape=SimpleNamespace(TextFrame2=frame))
+
+    rows = [SimpleNamespace(Height=30.0), SimpleNamespace(Height=60.0)]
+    cells = {
+        (1, 1): cell("단계", 20.0),
+        (1, 2): cell("탑승 데이터 재집계, 급행 수요 조사", 43.2),
+        (2, 1): cell("1. 수요 확정", 20.0),
+        (2, 2): cell("", 0.0),
+    }
+    table = SimpleNamespace(
+        Rows=SimpleNamespace(Count=2, Item=lambda index: rows[index - 1]),
+        Columns=SimpleNamespace(Count=2),
+        Cell=lambda row, column: cells[(row, column)],
+    )
+    shape = patcher._ComShape(SimpleNamespace(HasTable=-1, Table=table, Id=5), 540)
+
+    assert shape.fit_table_rows() == [30.0, 60.0]
+    assert [row.Height for row in rows] == [50.4, 60.0]  # 두 줄이 된 칸에 맞춰 늘고, 높던 행은 그대로
+    shape.set_row_heights([30.0, 60.0])
+    assert rows[0].Height == 30.0

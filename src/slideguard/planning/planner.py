@@ -35,10 +35,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from slideguard.domain.policy import GEOMETRY_TOLERANCE_PT, AnalysisPolicy
-from slideguard.planning.bindings import TeamBindings
+from slideguard.domain.policy import GEOMETRY_TOLERANCE_PT, AnalysisPolicy, FixTargets, FontGoal
+from slideguard.planning.bindings import TeamBindings, table_of_cell
 from slideguard.planning.color import (
     color_distance,
     contrast_ratio,
@@ -59,6 +59,7 @@ from slideguard.planning.contracts import (
     SkippedFinding,
     Status,
 )
+from slideguard.planning.reflow import MIN_GROW, reflow_slide
 from slideguard.planning.standards import Standards, build_standards
 
 # ======================================================================
@@ -72,6 +73,7 @@ PROPERTY_GROUP = {
     Property.FONT_FAMILY: "글씨체",
     Property.SHAPE_POSITION: "항목 위치",
     Property.SHAPE_HEIGHT: "항목 위치",
+    Property.SHAPE_WIDTH: "항목 위치",
     Property.Z_ORDER: "항목 위치",
     Property.SHAPE_FILL: "배경색",
     Property.AUTOFIT: "서식",
@@ -83,6 +85,7 @@ _BALANCED = _PASSIVE | {
     Property.FONT_FAMILY,
     Property.SHAPE_POSITION,
     Property.SHAPE_HEIGHT,
+    Property.SHAPE_WIDTH,
     Property.Z_ORDER,
 }
 _AGGRESSIVE = _BALANCED | {Property.SHAPE_FILL, Property.AUTOFIT, Property.LINE_SPACING}
@@ -144,15 +147,30 @@ class RuleBasedPlanner:
     # ==================================================================
 
     def plan(self, snapshot: object, findings: list, policy: object) -> PlanResult:
-        level = self.bindings.strength(policy)
-        profile = STRENGTH_PROFILES[level]
-        excluded = self.bindings.excluded_rules(policy)
-        slide_w, slide_h = self.bindings.slide_size(snapshot)
+        """최소 수정과 권장 수정 두 가지 후보를 만든다.
+
+        최소 수정: 기준을 겨우 넘기는 후보 (FixTargets.minimum()) → result.proposals
+        권장 수정: 정책의 FixTargets 목표까지 고친 후보 중 최소 수정과 값이 다른 것 → result.recommended
+        """
         standards = self.standards
         if standards is None:
             standards = build_standards(
                 self.bindings.purpose(policy), policy if isinstance(policy, AnalysisPolicy) else None
             )
+        result = self._plan_with(snapshot, findings, policy, replace(standards, fix=FixTargets.minimum()))
+        result.standards = standards
+        if standards.fix.offers_recommended:
+            extra = self._plan_with(snapshot, findings, policy, standards)
+            result.recommended = _recommended_only(result.proposals, extra.proposals)
+        return result
+
+    def _plan_with(
+        self, snapshot: object, findings: list, policy: object, standards: Standards
+    ) -> PlanResult:
+        level = self.bindings.strength(policy)
+        profile = STRENGTH_PROFILES[level]
+        excluded = self.bindings.excluded_rules(policy)
+        slide_w, slide_h = self.bindings.slide_size(snapshot)
         context = {
             "standards": standards,
             "slide_w": slide_w,
@@ -161,10 +179,14 @@ class RuleBasedPlanner:
         }
 
         result = PlanResult(standards=standards, strength=level)
+        overflows = []  # 슬라이드 재배치에 넘길 넘침 판정
+        table_fonts: dict[tuple[int, int], list] = {}  # (슬라이드, 표 도형) → 칸별 글자 크기 판정
 
         for raw in findings:
             info = self.bindings.read_finding(raw, snapshot)
             category = self._classify(info, profile)
+            if info.rule == Rule.OVERFLOW and info.rule not in excluded and info.status == Status.WARNING:
+                overflows.append(info)
 
             def skip(reason, raw=raw, category=category):
                 result.skipped.append(SkippedFinding(raw, reason, category))
@@ -188,6 +210,11 @@ class RuleBasedPlanner:
                 skip("알 수 없는 판정 상태")
                 continue
 
+            table = table_of_cell(getattr(raw, "shape_key", ""))
+            if table is not None and info.rule == Rule.FONT_SIZE and info.status == Status.WARNING:
+                # 표 칸 글자 크기는 칸마다 고치지 않고 표 하나로 모아 '표 글자 크기'를 한 번에 키운다
+                table_fonts.setdefault(table, []).append((raw, info))
+                continue
             if not self.bindings.can_patch(info):
                 skip("그룹 안 객체·표 칸·차트 글자는 아직 자동 수정하지 않음")
                 continue
@@ -251,8 +278,149 @@ class RuleBasedPlanner:
             for bundle in affordable[1:]:
                 result.alternatives.extend(bundle)
 
+        for (slide, table_id), cells in table_fonts.items():
+            self._table_font(snapshot, slide, table_id, cells, standards, profile, policy, result)
         result.proposals = _merge_same_target(result.proposals, result)
+        self._reflow(snapshot, overflows, result, profile, standards, slide_h)
         return result
+
+    # ==================================================================
+    # 슬라이드 재배치 (planning/reflow.py)
+    # ==================================================================
+
+    def _reflow(self, snapshot, overflows, result, profile, standards, slide_h):
+        """글자 키우기·넘침 고치기를 슬라이드 단위로 다시 계산해 한 묶음으로 만든다.
+
+        - 글자를 키우면 상자가 모자랄 글상자는 상자도 늘리고, 그 아래 객체는 늘어난 만큼 내린다.
+        - 넘친 글상자도 같은 방법으로 늘린다 (아래 객체가 막아도 함께 내려서 해결).
+        - 슬라이드에 다 들어가지 않으면 묶음을 만들지 않고 글자 크기 후보에 이유를 붙인다.
+        """
+        if not {Property.SHAPE_HEIGHT, Property.SHAPE_POSITION} <= profile.allowed_props:
+            return
+        slides = {p.slide_index for p in result.proposals if p.prop == Property.FONT_SIZE}
+        slides |= {info.slide_index for info in overflows}
+        for slide in sorted(slides):
+            items = self.bindings.flow_items(snapshot, slide)
+            if not items:
+                continue
+            fonts = [p for p in result.proposals if p.slide_index == slide and p.prop == Property.FONT_SIZE]
+            new_sizes = {p.shape_id: float(p.after) for p in fonts}
+            needed = {
+                info.shape_id: float(info.values["needed_height"])
+                for info in overflows
+                if info.slide_index == slide and info.values.get("needed_height") is not None
+            }
+            unmeasured = {
+                info.shape_id
+                for info in overflows
+                if info.slide_index == slide and info.values.get("needed_height") is None
+            }
+            flow = reflow_slide(
+                items,
+                new_sizes,
+                needed,
+                unmeasured,
+                slide_h=slide_h,
+                bottom_margin=slide_h * standards.safe_margin_ratio.value,
+            )
+            if not flow.ok:
+                warned = {p.shape_id for p in fonts}
+                result.proposals = [
+                    replace(p, note=f"{p.note} (주의: {flow.reason})")
+                    if p.slide_index == slide and p.prop == Property.FONT_SIZE and p.shape_id in warned
+                    else p
+                    for p in result.proposals
+                ]
+                continue
+            if not flow.changes:
+                continue
+            self._apply_reflow(slide, flow, items, fonts, overflows, result, slide_h)
+
+    def _apply_reflow(self, slide, flow, items, fonts, overflows, result, slide_h):
+        group = f"reflow:{slide}"
+        by_id = {item.shape_id: item for item in items}
+        touched = set(flow.heights) | set(flow.tops)
+        # 같은 객체의 높이·위치를 따로 바꾸던 후보(와 그 묶음)는 재배치가 대신한다
+        replaced_groups = {
+            p.group
+            for p in result.proposals
+            if p.slide_index == slide
+            and p.shape_id in touched
+            and p.prop in (Property.SHAPE_HEIGHT, Property.SHAPE_POSITION)
+            and p.group
+        }
+        result.proposals = [
+            p
+            for p in result.proposals
+            if not (
+                p.slide_index == slide
+                and (
+                    (p.shape_id in touched and p.prop in (Property.SHAPE_HEIGHT, Property.SHAPE_POSITION))
+                    or (p.group and p.group in replaced_groups)
+                )
+            )
+        ]
+        # 원인 판정: 상자가 늘어난 글상자의 글자 크기 후보 또는 넘침 판정
+        overflow_by_shape = {info.shape_id: info for info in overflows if info.slide_index == slide}
+        font_by_shape = {p.shape_id: p for p in fonts}
+        trigger = next(
+            (
+                font_by_shape[sid].finding_id if sid in font_by_shape else overflow_by_shape[sid].finding_id
+                for sid in sorted(flow.heights, key=lambda sid: by_id[sid].top)
+                if sid in font_by_shape or sid in overflow_by_shape
+            ),
+            "",
+        )
+        # 상자가 늘어나는 글상자의 글자 크기 후보는 재배치와 한 묶음 (따로 켜면 넘침)
+        result.proposals = [
+            replace(p, group=group) if p in fonts and p.shape_id in flow.heights else p
+            for p in result.proposals
+        ]
+        for sid in sorted(touched, key=lambda sid: by_id[sid].top):
+            item = by_id[sid]
+            cause = font_by_shape.get(sid)
+            finding_id = (
+                cause.finding_id
+                if cause is not None
+                else (overflow_by_shape[sid].finding_id if sid in overflow_by_shape else trigger)
+            )
+            if sid in flow.heights:
+                why = f"글자 {float(cause.after):g}pt에 맞게" if cause is not None else "넘친 글자를 담게"
+                if cause is None and sid not in overflow_by_shape:
+                    why = "안의 글상자가 늘어난 만큼"
+                result.proposals.append(
+                    ChangeProposal(
+                        slide_index=slide,
+                        shape_id=sid,
+                        prop=Property.SHAPE_HEIGHT,
+                        before=item.height,
+                        after=flow.heights[sid],
+                        cost=(flow.heights[sid] - item.height) / slide_h,
+                        rule=Rule.OVERFLOW,
+                        note=f"슬라이드 재배치: 상자 높이 {item.height:g}pt → {flow.heights[sid]:g}pt ({why})",
+                        group=group,
+                        finding_id=finding_id,
+                    )
+                )
+            if sid in flow.tops:
+                down = flow.tops[sid] - item.top
+                result.proposals.append(
+                    ChangeProposal(
+                        slide_index=slide,
+                        shape_id=sid,
+                        prop=Property.SHAPE_POSITION,
+                        before=(item.left, item.top),
+                        after=(item.left, flow.tops[sid]),
+                        cost=down / slide_h,
+                        rule=Rule.OVERFLOW,
+                        note=f"슬라이드 재배치: 위 상자가 늘어난 만큼 {down:g}pt 내림 (간격 유지)",
+                        group=group,
+                        finding_id=finding_id,
+                    )
+                )
+        # 재배치로 해결된 넘침은 '사람이 판단' 목록에서 뺀다
+        solved = {overflow_by_shape[sid].finding_id for sid in flow.heights if sid in overflow_by_shape}
+        result.skipped = [s for s in result.skipped if getattr(s.finding, "id", None) not in solved]
 
     # ==================================================================
     # 분류
@@ -309,6 +477,8 @@ class RuleBasedPlanner:
             return self._grow_box(info, shape, others, ctx["slide_h"], category, profile.resolve_collisions)
         if info.rule == Rule.TEXT_OVERLAP:
             return self._separate(info, shape, others, ctx, category)
+        if info.rule in (Rule.OFF_SLIDE, Rule.SAFE_MARGIN) and info.finding_id.endswith(":card"):
+            return self._fit_card(info, shape, others, ctx, category)
         if info.rule in (Rule.OFF_SLIDE, Rule.SAFE_MARGIN):
             return self._move_inside(info, shape, others, ctx, category)
         if info.rule == Rule.HIDDEN_TEXT:
@@ -356,9 +526,53 @@ class RuleBasedPlanner:
             return [], "글자 크기 측정값이 0 이하"
         if size >= required:
             return [], f"현재 {size}pt가 이미 기준 {required}pt 이상 (글자를 줄이는 후보는 만들지 않음)"
-        note = f"글자 크기 {size}pt → {required}pt (B 기준: {standards.label} 최소 {required}pt)"
-        cost = _ratio_cost(size, required)
-        return [self._proposal(info, shape, Property.FONT_SIZE, size, required, cost, category, note)], ""
+        target, basis = required, f"{standards.label} 최소 {required}pt"
+        recommended = standards.recommended_font_pt.value
+        minimum = standards.min_font_pt.value
+        if recommended is not None and minimum and required > minimum:
+            # 큰 슬라이드라 B가 기준을 키웠으면(policy.slide_scale) 권장 크기도 같은 비율로
+            recommended = round(recommended * required / minimum, 1)
+        if (
+            standards.fix.font_goal == FontGoal.RECOMMENDED
+            and recommended is not None
+            and recommended > required
+        ):
+            target, basis = recommended, f"수정 목표: {standards.label} 권장 {recommended}pt"
+        # TODO(C): 글자가 커져 상자를 넘칠 것 같으면 상자 높이 후보를 같은 묶음(group)으로 함께 만든다
+        #          (지금은 적용 뒤 재검사에서 넘침이 나와야 높이 후보가 생김 → 2번 슬라이드처럼 빽빽해짐)
+        note = f"글자 크기 {size}pt → {target}pt ({basis})"
+        cost = _ratio_cost(size, target)
+        return [self._proposal(info, shape, Property.FONT_SIZE, size, target, cost, category, note)], ""
+
+    # ---- 표 글자 크기 ------------------------------------------------
+    # 표 칸마다 '10pt → 14pt'를 따로 내면 칸 수만큼 후보가 생기고 일부만 고르면 표가 들쭉날쭉해진다.
+    # 그래서 표 도형 하나에 후보 하나: 표 안에서 기준보다 작은 글자를 모두 목표 크기로 (patcher가 칸을 돈다).
+    # 행 높이는 PowerPoint가 글자에 맞춰 늘리므로 따로 고치지 않는다 (넘치면 재검사에서 다시 나옴).
+
+    def _table_font(self, snapshot, slide, table_id, cells, standards, profile, policy, result):
+        raw, info = min(cells, key=lambda item: item[1].values.get("size_pt") or 999)
+
+        def skip(reason):
+            for cell_raw, _info in cells:
+                result.skipped.append(SkippedFinding(cell_raw, reason, Category.READABILITY))
+
+        if Property.FONT_SIZE not in profile.allowed_props:
+            skip(_level_reason([], profile))
+            return
+        if self.bindings.is_locked(policy, slide, table_id, Property.FONT_SIZE):
+            skip("고정된 객체·속성이라 후보를 만들지 않음")
+            return
+        table = self.bindings.find_shape(snapshot, slide, table_id) or ShapeInfo(
+            slide, table_id, "other", True, ()
+        )
+        table_info = replace(info, shape_id=table_id)
+        candidates, why = self._font_size(table_info, table, standards, Category.READABILITY)
+        if not candidates:
+            skip(why)
+            return
+        for proposal in candidates:
+            note = f"표 전체 {proposal.note} (기준 미달 칸 {len(cells)}개)"
+            result.proposals.append(replace(proposal, note=note))
 
     # ---- 명암비 (단색 배경) ------------------------------------------
     # 후보 A: 색상 유지, 밝기만 조절 (회의록 Level 1: 명도만 미세 조정)
@@ -373,14 +587,21 @@ class RuleBasedPlanner:
         if fg is None or bg is None:
             return [], "명암비 측정값(글자색·배경색)이 없음"
         ratio = info.values.get("ratio", contrast_ratio(fg, bg))
-        required = info.values.get("required_ratio", standards.contrast_normal.value)
+        threshold = info.values.get("required_ratio", standards.contrast_normal.value)
+        # 검사 기준(threshold)을 넘는 범위에서 얼마나 여유 있게 고칠지는 수정 목표(FixTargets)가 정한다
+        required = contrast_goal(threshold, standards)
+        goal_text = (
+            f"기준 {threshold}:1" if required == threshold else f"기준 {threshold}:1, 목표 {required:g}:1"
+        )
 
         candidates = []
 
         def color_option(new_color, label):
             harmony = harmony_score(new_color, bg)
             new_ratio = contrast_ratio(new_color, bg)
-            note = f"{label} #{fg} → #{new_color} (명암비 {new_ratio:.2f}:1, 기준 {required}:1, 조화 {harmony:+.2f})"
+            note = (
+                f"{label} #{fg} → #{new_color} (명암비 {new_ratio:.2f}:1, {goal_text}, 조화 {harmony:+.2f})"
+            )
             cost = color_distance(fg, new_color)
             return self._proposal(
                 info, shape, Property.FONT_COLOR, fg, new_color, cost, category, note, harmony, new_ratio
@@ -404,7 +625,9 @@ class RuleBasedPlanner:
 
         # 후보 C
         large_ratio = standards.contrast_large.value
-        if self.allow_large_text_option and required > large_ratio and ratio >= large_ratio:
+        # (큰 글자가 돼도 수정 목표를 넘어야 함: 목표가 4.5:1이면 크기만 키워서는 안 됨)
+        large_goal = contrast_goal(large_ratio, standards, large=True)
+        if self.allow_large_text_option and required > large_goal and ratio >= large_goal:
             option = self._large_text_option(info, shape, fg, standards, category)
             if option is not None:
                 candidates.append(option)
@@ -441,15 +664,18 @@ class RuleBasedPlanner:
         fg = info.values.get("foreground")
         if fg is None:
             return [], "사진 위 글씨의 글자색을 알 수 없음"
-        target = standards.contrast_normal.value
-        if self._is_large_text(shape, fg, standards):
-            target = standards.contrast_large.value
+        large = self._is_large_text(shape, fg, standards)
+        target = standards.contrast_large.value if large else standards.contrast_normal.value
+        target = contrast_goal(target, standards, large=large)
+        # TODO(C, FixTargets.unify_scrims): 같은 슬라이드의 배경판을 한 가지 색·투명도로 맞추기
+        #       → planning/extras.py unify_slide_scrims() (NN/g: 가장 나쁜 경우를 기준으로 일관되게)
 
+        colors = info.values.get("text_colors") or (fg,)  # 같은 글상자의 모든 글자색
         best = None
         for scrim in ("000000", "FFFFFF"):
             for step in range(1, 101):
                 alpha = step / 100
-                worst = worst_contrast_over_unknown(fg, scrim, alpha)
+                worst = min(worst_contrast_over_unknown(color, scrim, alpha) for color in colors)
                 if worst >= target:
                     if best is None or alpha < best[1]:
                         best = (scrim, alpha, worst)
@@ -491,6 +717,8 @@ class RuleBasedPlanner:
         new_h = math.ceil(needed)
         if new_h <= shape.height + TOLERANCE:
             return [], "상자 높이가 이미 충분함 (측정값 확인 필요)"
+        if new_h <= shape.height + MIN_GROW:
+            return [], f"모자란 높이가 {MIN_GROW:g}pt 이하라 그대로 둠 (화면에서 잘리지 않는 정도)"
         if shape.top + new_h > slide_h + TOLERANCE:
             return [], "상자를 키우면 슬라이드 아래로 나감 → 글자 줄이기·나누기는 사람이 판단"
         blocked = _new_collisions(shape, (shape.left, shape.top, shape.width, new_h), others)
@@ -638,6 +866,107 @@ class RuleBasedPlanner:
         cost = distance / slide_h
         return [self._proposal(info, shape, Property.SHAPE_POSITION, before, after, cost, category, note)], ""
 
+    # ---- 슬라이드 밖으로 나간 카드 → 안쪽 글상자와 함께 줄이기 ------------------
+    # 카드만 옮기면 옆 카드와 겹치고, 카드만 줄이면 안쪽 글상자가 카드 밖으로 삐져나온다.
+    # 그래서 카드 너비를 안전 여백 안쪽까지 줄이고, 카드 안 글상자도 같은 만큼 줄인다 (한 묶음).
+    # 너무 많이 줄어들면(원래 너비의 70% 미만) 안전 여백 대신 슬라이드 끝까지만 줄인다.
+
+    def _fit_card(self, info, card, others, ctx, category):
+        if not card.has_geometry:
+            return [], "카드 좌표를 알 수 없음"
+        slide_w = ctx["slide_w"]
+        margin = slide_w * ctx["standards"].safe_margin_ratio.value
+        inside = [
+            other
+            for other in others
+            if other.shape_id != card.shape_id
+            and other.has_geometry
+            and other.left >= card.left - TOLERANCE
+            and other.top >= card.top - TOLERANCE
+            and other.left + other.width <= card.left + card.width + TOLERANCE
+            and other.top + other.height <= card.top + card.height + TOLERANCE
+        ]
+        right = card.left + card.width
+        if right > slide_w + TOLERANCE:
+            new_right = slide_w - margin
+            if new_right - card.left < card.width * 0.7:
+                new_right = slide_w  # 여백까지 줄이면 너무 좁아짐 → 슬라이드 끝까지만
+            shrink = right - new_right
+            new_left = card.left
+        elif card.left < -TOLERANCE:
+            new_left = margin if card.width - (margin - card.left) >= card.width * 0.7 else 0.0
+            shrink = new_left - card.left
+            new_right = right
+        else:
+            return [], "위·아래로 나간 카드는 아직 자동으로 고치지 않음 (사람이 판단)"
+        group = f"card:{card.slide_index}:{card.shape_id}"
+        note = f"카드 너비 {card.width:g}pt → {card.width - shrink:g}pt (슬라이드 안으로, 안쪽 글상자 함께)"
+        cost = shrink / slide_w
+        bundle = [
+            self._proposal(
+                info,
+                card,
+                Property.SHAPE_WIDTH,
+                card.width,
+                round(card.width - shrink, 2),
+                cost,
+                category,
+                note,
+                group=group,
+            )
+        ]
+        if new_left != card.left:
+            bundle.append(
+                self._proposal(
+                    info,
+                    card,
+                    Property.SHAPE_POSITION,
+                    (card.left, card.top),
+                    (round(new_left, 2), card.top),
+                    cost,
+                    category,
+                    note,
+                    group=group,
+                )
+            )
+        for item in inside:
+            # 카드 테두리와 안쪽 글상자 사이 원래 여유는 그대로 둔다
+            pad_left = item.left - card.left
+            pad_right = right - (item.left + item.width)
+            item_left = max(item.left, new_left + pad_left)
+            item_right = min(item.left + item.width, new_right - pad_right)
+            if item_right - item_left <= 0:
+                return [], "카드 안 개체가 너무 좁아짐 → 사람이 판단"
+            if abs(item_left - item.left) > TOLERANCE:
+                bundle.append(
+                    self._proposal(
+                        info,
+                        item,
+                        Property.SHAPE_POSITION,
+                        (item.left, item.top),
+                        (round(item_left, 2), item.top),
+                        cost,
+                        category,
+                        note,
+                        group=group,
+                    )
+                )
+            if abs((item_right - item_left) - item.width) > TOLERANCE:
+                bundle.append(
+                    self._proposal(
+                        info,
+                        item,
+                        Property.SHAPE_WIDTH,
+                        item.width,
+                        round(item_right - item_left, 2),
+                        cost,
+                        category,
+                        note,
+                        group=group,
+                    )
+                )
+        return [bundle], ""
+
     # ---- 가려진 글자 → 맨 앞으로 ---------------------------------------
 
     def _bring_front(self, info, shape, others, category):
@@ -734,6 +1063,40 @@ class RuleBasedPlanner:
 # ======================================================================
 
 
+def _recommended_only(minimum: list[ChangeProposal], extra: list[ChangeProposal]) -> list[ChangeProposal]:
+    """권장 목표로 만든 후보 중 최소 수정과 값이 다른 것만 '권장 수정'으로 남긴다.
+
+    묶음(group)은 통째로 판단한다: 묶음 안에 하나라도 다르면 묶음 전체를 권장 수정으로 남긴다.
+    """
+
+    def target(p):
+        return (p.finding_id, p.slide_index, p.shape_id, p.prop, str(p.before).upper())
+
+    chosen = {target(p): p for p in minimum}
+
+    def differs(p):
+        same = chosen.get(target(p))
+        return same is None or same.after != p.after or same.group != p.group
+
+    changed_groups = {p.group for p in extra if p.group is not None and differs(p)}
+    out = []
+    for p in extra:
+        keep = p.group in changed_groups if p.group is not None else differs(p)
+        if not keep:
+            continue
+        group = None if p.group is None else f"{p.group}~rec"  # 최소 수정 묶음과 섞이지 않게
+        out.append(replace(p, variant="recommended", group=group))
+    return out
+
+
+def contrast_goal(threshold: float, standards: Standards, *, large: bool | None = None) -> float:
+    """검사 기준 threshold를 넘는 수정 목표 명암비 (domain/policy.py FixTargets)."""
+    normal = standards.contrast_normal.value
+    if large is None:
+        large = threshold < normal  # B가 큰 글자 기준을 적용한 판정
+    return standards.fix.contrast_target(threshold, large=large, normal=normal)
+
+
 def _is_photo_text(info: FindingInfo) -> bool:
     return info.rule == Rule.CONTRAST and info.values.get("background_kind") == "image"
 
@@ -801,6 +1164,10 @@ def _merge_same_target(proposals: list[ChangeProposal], result: PlanResult) -> l
     order = []
     for p in proposals:
         key = (p.slide_index, p.shape_id, p.prop)
+        if p.prop in (Property.FONT_COLOR, Property.FONT_FAMILY):
+            # 글자 색·글씨체는 원래 값(before)이 같은 글자에만 적용된다 (patcher).
+            # 한 상자에 회색이 두 가지면 후보도 두 개가 있어야 둘 다 고쳐진다.
+            key = (p.slide_index, p.shape_id, p.prop, str(p.before).upper())
         if p.group is not None:
             # 묶음의 일부는 합치지 않고 그대로 둠 (함께 적용돼야 하므로)
             key = (p.slide_index, p.shape_id, f"{p.prop}@{p.group}")
@@ -837,4 +1204,13 @@ class MinimumChangePlanner:
         result = self.planner.plan(report.deck, list(report.findings), policy)
         self.last_result = result
         bindings = self.planner.bindings
-        return [bindings.to_team_proposal(p) for p in result.proposals]
+        proposals, seen = [], set()
+        for p in result.proposals + result.recommended:
+            team = bindings.to_team_proposal(p)
+            if team.id in seen:
+                # 한 상자에 원래 색이 다른 글자가 여럿이면 같은 ID가 나옴 → 원래 값으로 구분
+                head, sep, group = team.id.partition("#")
+                team = replace(team, id=f"{head}~{str(p.before).upper()}{sep}{group}")
+            seen.add(team.id)
+            proposals.append(team)
+        return proposals

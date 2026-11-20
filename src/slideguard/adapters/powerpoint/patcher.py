@@ -32,6 +32,7 @@
   font.color             색이 before와 같은 런만 after로 바꿈
   font.family            글꼴이 before인 런만 after로 바꿈 (라틴·한글 글꼴 모두)
   shape.height           현재 높이가 before일 때만 after로 바꿈
+  shape.width            현재 너비가 before일 때만 after로 바꿈
   shape.position         현재 위치가 before (left, top)일 때만 after로 옮김
   shape.zorder           맨 앞으로 가져옴
   shape.fill             채우기가 없을 때만 after {"color", "transparency"}로 채움
@@ -47,6 +48,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import shutil
 import time
@@ -60,6 +62,8 @@ from slideguard.planning.bindings import TeamBindings
 from slideguard.planning.contracts import ChangeProposal, Property
 
 from .properties import indexed_property
+
+LOGGER = logging.getLogger("slideguard.patcher")
 
 TOLERANCE = 0.5  # 좌표 비교 허용 오차 (pt)
 
@@ -108,6 +112,7 @@ class ShapeHandle(Protocol):
     def text_overflows(self) -> bool | None: ...  # 모르면 None
     def get_geometry(self) -> tuple[float, float, float, float]: ...  # left, top, width, height
     def set_height(self, height: float) -> None: ...
+    def set_width(self, width: float) -> None: ...
     def set_position(self, left: float, top: float) -> None: ...
     def bring_to_front(self) -> None: ...
     def get_fill(self) -> tuple[str, float] | None: ...  # (색, 투명도). 채우기 없으면 None
@@ -331,6 +336,7 @@ def apply_proposal(doc: Document, p: ChangeProposal, result: ApplyResult) -> Non
         Property.FONT_COLOR: _apply_font_color,
         Property.FONT_FAMILY: _apply_font_family,
         Property.SHAPE_HEIGHT: _apply_height,
+        Property.SHAPE_WIDTH: _apply_width,
         Property.SHAPE_POSITION: _apply_position,
         Property.Z_ORDER: _apply_zorder,
         Property.SHAPE_FILL: _apply_fill,
@@ -369,12 +375,45 @@ def apply_proposal(doc: Document, p: ChangeProposal, result: ApplyResult) -> Non
 
 def _apply_font_size(shape: ShapeHandle, p: ChangeProposal):
     target = float(p.after)
+    get_autofit = getattr(shape, "get_autofit", None)
+    if get_autofit is not None and get_autofit() == "shrink":
+        return _resize_shrunk_text(shape, target)
     changed = 0
     for run in shape.runs():
         size = run.get_size()
         if size is not None and size < target:  # 크기를 모르는 런은 건드리지 않음
             run.set_size(target)
             changed += 1
+    fit_rows = getattr(shape, "fit_table_rows", None)
+    if changed and fit_rows is not None:
+        fit_rows()  # 표: 커진 글자에 맞춰 행 높이를 다시 맞춤 (안 하면 글자가 행 밖으로 삐져나옴)
+    return changed
+
+
+def _resize_shrunk_text(shape: ShapeHandle, target: float):
+    """'넘치면 자동 축소' 상자의 글자 크기 고치기.
+
+    이런 상자는 글자를 키워도 PowerPoint가 화면에서 다시 줄여 버린다 (24pt로 써 있어도 13pt로 보임).
+    그래서 1) 자동 축소를 끄고 '도형을 텍스트 크기에 맞춤'으로 바꾼다 (글이 잘리지 않고 상자가 늘어남)
+          2) 가장 작은 글자가 목표 크기가 되도록 모든 글자를 같은 비율로 맞춘다 (제목·본문 비율 유지).
+    늘어난 상자가 다른 개체와 부딪히면 재검사에서 다시 알려 준다.
+    (실시간 적용을 해제하면 live_edit이 자동 맞춤과 원래 높이를 함께 되돌린다)
+    """
+    shape.set_autofit("grow")
+    runs = shape.runs()
+    sizes = [run.get_size() for run in runs]
+    known = [size for size in sizes if size]
+    if not known:
+        return "글자 크기를 읽지 못해 적용하지 않음"
+    factor = target / min(known)
+    changed = 0
+    for run, size in zip(runs, sizes, strict=True):
+        if not size:
+            continue  # 크기를 모르는 런은 건드리지 않음
+        new_size = round(size * factor * 2) / 2  # 0.5pt 단위
+        if abs(new_size - size) > TOLERANCE:
+            run.set_size(new_size)
+        changed += 1
     return changed
 
 
@@ -404,6 +443,14 @@ def _apply_height(shape: ShapeHandle, p: ChangeProposal):
     if abs(height - float(p.before)) > TOLERANCE:
         return f"현재 높이 {height:g}pt가 후보 작성 시점({p.before}pt)과 다름"
     shape.set_height(float(p.after))
+    return 1
+
+
+def _apply_width(shape: ShapeHandle, p: ChangeProposal):
+    _left, _top, width, _height = shape.get_geometry()
+    if abs(width - float(p.before)) > TOLERANCE:
+        return f"현재 너비 {width:g}pt가 후보 작성 시점({p.before}pt)과 다름"
+    shape.set_width(float(p.after))
     return 1
 
 
@@ -630,8 +677,9 @@ class _ComShape:
         self._shape = shape
         self._slide_height = slide_height
 
-    def _text_ranges(self, property_name: str) -> list:
-        text_range = self._shape.TextFrame2.TextRange
+    def _text_ranges(self, property_name: str, text_range=None) -> list:
+        if text_range is None:
+            text_range = self._shape.TextFrame2.TextRange
         text = str(text_range.Text)
         if not text:
             return []
@@ -660,9 +708,75 @@ class _ComShape:
         return result
 
     def runs(self) -> list[_ComRun]:
+        if self._is_table():
+            # 표는 모든 칸의 글자를 차례로 (1행 1열, 1행 2열, ...)
+            return [_ComRun(item) for cell in self._cell_ranges() for item in self._text_ranges("Runs", cell)]
         if self._shape.HasTextFrame != MSO_TRUE:
             return []
         return [_ComRun(item) for item in self._text_ranges("Runs")]
+
+    def fit_table_rows(self) -> list[float] | None:
+        """표 행 높이를 글자에 맞게 늘린다. 바꾸기 전 높이 목록을 돌려준다 (표가 아니면 None).
+
+        COM으로 칸 글자 크기를 바꾸면 PowerPoint가 행 높이를 바로 늘리지 않아 글자가 행 밖으로
+        삐져나온다 (함정 PPT 7쪽: 18pt로 키우자 표 아래로 넘침). 그래서 행마다
+        '칸 글자 높이(BoundHeight) + 칸 위아래 여백' 중 가장 큰 값을 직접 계산해 그만큼 늘린다.
+        원래 더 높았던 행은 줄이지 않는다 (일부러 준 여백 유지).
+        """
+        if not self._is_table():
+            return None
+        table = self._shape.Table
+        rows = table.Rows
+        before = [float(rows.Item(index).Height) for index in range(1, rows.Count + 1)]
+        after = []
+        for row_index, old in enumerate(before, start=1):
+            needed = 0.0
+            for column in range(1, table.Columns.Count + 1):
+                try:
+                    frame = table.Cell(row_index, column).Shape.TextFrame2
+                    if not str(frame.TextRange.Text):
+                        continue
+                    height = (
+                        float(frame.TextRange.BoundHeight)
+                        + float(frame.MarginTop)
+                        + float(frame.MarginBottom)
+                    )
+                except _COM_ERRORS:
+                    continue
+                needed = max(needed, height)
+            if needed > old + TOLERANCE:
+                rows.Item(row_index).Height = round(needed, 1)
+            after.append(float(rows.Item(row_index).Height))
+        LOGGER.info("TABLE_ROWS | shape=%s | 행 높이 %s → %s", getattr(self._shape, "Id", "?"), before, after)
+        return before
+
+    def set_row_heights(self, heights: list[float]) -> None:
+        rows = self._shape.Table.Rows
+        for index, height in enumerate(heights, start=1):
+            if index <= rows.Count:
+                rows.Item(index).Height = height
+
+    def _is_table(self) -> bool:
+        try:
+            return getattr(self._shape, "HasTable", 0) == MSO_TRUE
+        except _COM_ERRORS:
+            return False
+
+    def _cell_ranges(self) -> list:
+        table = self._shape.Table
+        ranges = []
+        seen = set()
+        for row in range(1, table.Rows.Count + 1):
+            for column in range(1, table.Columns.Count + 1):
+                cell = table.Cell(row, column).Shape
+                place = (float(getattr(cell, "Left", column)), float(getattr(cell, "Top", row)))
+                if place in seen:
+                    continue  # 병합된 칸은 같은 자리를 돌려주므로 한 번만
+                seen.add(place)
+                text_range = cell.TextFrame2.TextRange
+                if str(text_range.Text):
+                    ranges.append(text_range)
+        return ranges
 
     def paragraphs(self) -> list[_ComParagraph]:
         if self._shape.HasTextFrame != MSO_TRUE:
@@ -670,6 +784,12 @@ class _ComShape:
         return [_ComParagraph(item) for item in self._text_ranges("Paragraphs")]
 
     def text_overflows(self) -> bool | None:
+        if self._is_table():
+            # 표는 행 높이가 글자에 맞춰 늘어나므로 표 아래쪽이 슬라이드 밖으로 나가는지만 본다
+            try:
+                return self._shape.Top + self._shape.Height > self._slide_height + TOLERANCE
+            except _COM_ERRORS:
+                return None
         try:
             frame = self._shape.TextFrame2
             auto = frame.AutoSize
@@ -688,6 +808,9 @@ class _ComShape:
 
     def set_height(self, height: float) -> None:
         self._shape.Height = height
+
+    def set_width(self, width: float) -> None:
+        self._shape.Width = width
 
     def set_position(self, left: float, top: float) -> None:
         self._shape.Left = left

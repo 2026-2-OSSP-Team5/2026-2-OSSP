@@ -87,6 +87,28 @@ def _number(value: object) -> float | None:
         return None
 
 
+# 렌더링 주변 픽셀이 이 범위 안(각 RGB 채널 차이)이면 배경이 한 가지 색이라고 본다
+PLAIN_BACKGROUND_SPREAD = 12
+
+
+def _plain_background(samples: list[str]) -> str | None:
+    """주변 픽셀이 사실상 한 가지 색이면 그 색, 아니면 None.
+
+    옆 도형 테두리 선·옆 글자 획 같은 잡음이 섞이므로 밝기 순으로 위아래 20%씩 빼고 본다.
+    """
+    if len(samples) < 4:
+        return None
+    pixels = sorted((_rgb(color) for color in samples), key=sum)
+    cut = int(len(pixels) * 0.2)
+    middle = pixels[cut : len(pixels) - cut] or pixels
+    for channel in range(3):
+        values = [pixel[channel] for pixel in middle]
+        if max(values) - min(values) > PLAIN_BACKGROUND_SPREAD:
+            return None
+    r, g, b = middle[len(middle) // 2]
+    return f"{r:02X}{g:02X}{b:02X}"
+
+
 def parse_shape_key(key: str) -> tuple[int, int] | None:
     """'3:12' → (3, 12). 그룹 안 객체·표 칸처럼 긴 주소면 None."""
     match = _SIMPLE_KEY.match(str(key))
@@ -95,8 +117,29 @@ def parse_shape_key(key: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
+# 표 칸 주소 "7:5:table_cell:2,1" (슬라이드 7, 표 도형 5의 2행 1열)
+_TABLE_CELL_KEY = re.compile(r"^(\d+):(\d+):table_cell:")
+
+
+def table_of_cell(key: str) -> tuple[int, int] | None:
+    """'7:5:table_cell:2,1' → (7, 5): 표 칸이 속한 표 도형. 표 칸이 아니면 None."""
+    match = _TABLE_CELL_KEY.match(str(key))
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 def shape_key_of(slide_index: int, shape_id: int) -> str:
     return f"{slide_index}:{shape_id}"
+
+
+# 권장 수정 후보의 팀 ChangeProposal.id 표시 (예: "font.color@4:3~rec", 묶음이면 "...~rec#group~rec")
+RECOMMENDED_MARK = "~rec"
+
+
+def is_recommended(proposal_id: object) -> bool:
+    """팀 ChangeProposal.id가 권장 수정 후보인지."""
+    return RECOMMENDED_MARK in str(proposal_id).split("#", 1)[0]
 
 
 class TeamBindings:
@@ -208,6 +251,7 @@ class TeamBindings:
         Property.SHAPE_POSITION: ("position",),
         Property.Z_ORDER: ("position",),
         Property.SHAPE_HEIGHT: ("size",),
+        Property.SHAPE_WIDTH: ("size",),
         Property.LINE_SPACING: ("font_size", "size"),  # 글자가 차지하는 높이를 바꿈
     }
 
@@ -377,12 +421,26 @@ class TeamBindings:
         ]
         samples = [color for color in samples if color is not None]
         if samples and ratio is not None:
+            from slideguard.checks.contrast import best_sample_contrast, sample_contrast  # B와 같은 계산
+
+            pixels = [_rgb(color) for color in samples]
             for color in runs:
-                worst = min(contrast_ratio(color, sample) for sample in samples)
-                if abs(worst - ratio) <= _RATIO_TOLERANCE:
+                worst, _pixel = sample_contrast(_rgb(color), pixels)
+                best = best_sample_contrast(_rgb(color), pixels)
+                if min(abs(worst - ratio), abs(best - ratio)) <= _RATIO_TOLERANCE:
                     foreground = color
                     break
-        return {"foreground": foreground, "background_kind": "image"}
+        plain = _plain_background(samples)
+        if plain is not None:
+            # 렌더링해 보니 글자 뒤가 사실상 한 가지 색 (흰 슬라이드 위 연회색 출처 글씨 등)
+            # → 배경판을 깔 게 아니라 글자색을 고치면 된다 (함정 PPT 3쪽)
+            return {"foreground": foreground, "background": plain, "background_kind": "solid"}
+        # 배경판은 이 글상자의 모든 글자색을 함께 살려야 한다 (빨간 글씨만 보고 검정판을 깔면 검은 글씨가 묻힘)
+        return {
+            "foreground": foreground,
+            "background_kind": "image",
+            "text_colors": tuple(dict.fromkeys(runs)),
+        }
 
     # ------------------------------------------------------------------
     # 스냅샷(A) 읽기
@@ -411,6 +469,51 @@ class TeamBindings:
                     continue  # 그룹 안 객체는 그룹 전체 상자로 대신함
             result.append(self.read_shape(shape))
         return result
+
+    def flow_items(self, snapshot: object, slide_index: int) -> list:
+        """슬라이드 재배치(planning/reflow.py)에 쓸 객체들. 팀 스냅샷이 아니면 빈 목록 (재배치 안 함)."""
+        from slideguard.planning.reflow import BACKGROUND_AREA, FOOTER_PLACEHOLDERS, FlowItem
+
+        slide_w, slide_h = self.slide_size(snapshot)
+        items = []
+        for shape in getattr(snapshot, "shapes", ()):
+            if not _is_team_shape(shape) or _slide_of(shape) != slide_index:
+                continue
+            if getattr(shape, "effective_visible", None) is False or parse_shape_key(shape.key) is None:
+                continue
+            box = shape.box
+            if box is None:
+                continue
+            text = str(shape.text or "").strip()
+            sized = [
+                (float(run.font_size_pt), len(run.text))
+                for run in shape.runs
+                if run.font_size_pt and run.text
+            ]
+            weight = sum(count for _size, count in sized)
+            size = sum(size * count for size, count in sized) / weight if weight else None
+            rendered, content = shape.text_bounds, shape.content_box
+            background = box.width * box.height >= BACKGROUND_AREA * slide_w * slide_h
+            footer = shape.placeholder_type in FOOTER_PLACEHOLDERS
+            items.append(
+                FlowItem(
+                    shape_id=int(shape.shape_id),
+                    left=float(box.x),
+                    top=float(box.y),
+                    width=float(box.width),
+                    height=float(box.height),
+                    is_text=bool(text),
+                    text=str(shape.text or ""),
+                    size_pt=size,
+                    text_height=None if rendered is None else float(rendered.height),
+                    margins=None if content is None else max(float(box.height - content.height), 0.0),
+                    inner_width=None if content is None else float(content.width),
+                    z_order=shape.z_order,
+                    fixed=background or footer or not bool(shape.supported),
+                    background=background,
+                )
+            )
+        return items
 
     def find_shape(self, snapshot: object, slide_index: int, shape_id: int) -> ShapeInfo | None:
         for shape in snapshot.shapes:
@@ -572,6 +675,8 @@ class TeamBindings:
 
         key = shape_key_of(proposal.slide_index, proposal.shape_id)
         proposal_id = f"{proposal.prop}@{key}"
+        if getattr(proposal, "variant", "minimum") == "recommended":
+            proposal_id += RECOMMENDED_MARK
         if proposal.group:
             proposal_id += f"#{proposal.group}"
         return TeamChangeProposal(
@@ -654,3 +759,8 @@ def _overlap_partner(finding_id: str, rule_id: str, anchor_key: str) -> int | No
         return None
     address = parse_shape_key(other_key)
     return None if address is None else address[1]
+
+
+def _rgb(color: str) -> tuple[int, int, int]:
+    """ "C8C8C8" → (200, 200, 200) (B의 명암비 함수는 RGB 튜플을 받음)."""
+    return tuple(int(color[index : index + 2], 16) for index in (0, 2, 4))
