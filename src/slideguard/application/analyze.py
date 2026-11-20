@@ -1,9 +1,13 @@
+import logging
 from pathlib import Path
+from time import perf_counter
 
 from slideguard.domain.models import AnalysisReport, DeckSnapshot
 from slideguard.domain.policy import AnalysisPolicy
 
 from .ports import CheckRule, DeckReader, ProposalPlanner, ReportRepository
+
+LOGGER = logging.getLogger("slideguard.analyze")
 
 
 class AnalyzePresentation:
@@ -23,7 +27,20 @@ class AnalyzePresentation:
         self.repository = repository
 
     def execute(self, path: Path, policy: AnalysisPolicy) -> AnalysisReport:
-        return self.analyze_snapshot(self.reader.read(path), policy)
+        started = perf_counter()
+        deck = self.reader.read(path)
+        read_seconds = perf_counter() - started
+        report = self.analyze_snapshot(deck, policy)
+        LOGGER.info(
+            "ANALYZE_TIMING | file=%s | slides=%s shapes=%s | read=%.2fs check+plan=%.2fs total=%.2fs",
+            Path(path).name,
+            deck.slide_count,
+            len(deck.shapes),
+            read_seconds,
+            perf_counter() - started - read_seconds,
+            perf_counter() - started,
+        )
+        return report
 
     def analyze_snapshot(self, deck: DeckSnapshot, policy: AnalysisPolicy) -> AnalysisReport:
         report = AnalysisReport(deck=deck, policy_key=policy.cache_key)
