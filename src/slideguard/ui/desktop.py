@@ -1307,6 +1307,7 @@ def _acquire_instance_lock(lock_path: Path) -> QLockFile | None:
 
 
 def main(*, background: bool | None = None) -> int:
+    from slideguard.diagnostics import install_diagnostics
     from slideguard.ui.resident import activate_running_instance
 
     if background is None:
@@ -1330,6 +1331,8 @@ def main(*, background: bool | None = None) -> int:
         logger.addHandler(handler)
     except OSError:
         LOGGER.warning("DESKTOP_LOG_UNAVAILABLE", exc_info=True)
+    # 처리되지 않은 예외·비정상 종료·Qt 경고도 같은 폴더에 남긴다 (사용자 화면에는 표시 안 함)
+    install_diagnostics("desktop", report_database_path().parent)
 
     try:
         LOGGER.info("DESKTOP_STARTED")
