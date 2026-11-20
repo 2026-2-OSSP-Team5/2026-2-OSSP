@@ -32,6 +32,46 @@ from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Findin
 # ------------------------------------------------------------------ 모양 정의
 
 SEVERITY_ORDER = {"warning": 0, "review": 1, "unknown": 2}
+# 같은 등급이면 배지에 먼저 보여 줄 판정 (읽기에 직접 영향이 큰 것부터, 여백은 맨 뒤)
+RULE_ORDER = (
+    "layout.overflow",
+    "contrast",
+    "typography",
+    "layout.density",
+    "layout.overlap",
+    "typography.hierarchy",
+    "layout.margin",
+)
+
+
+def finding_rank(finding: Finding) -> tuple[int, int, int]:
+    """배지에 먼저 보여 줄 순서: (상자 자체의 읽기 문제가 아닌가, 등급, 규칙 순서).
+
+    넘침·명암비·글자 크기·겹침은 그 상자의 글을 읽기 어렵게 하는 문제라 등급과 상관없이 먼저 보여 준다.
+    정보 밀도는 슬라이드 전체의 줄 수를 '가장 글이 많은 상자'에 붙여 둔 것뿐이라, 앞에 오면
+    그 상자가 14줄인 것처럼 보이고 진짜 문제가 가려진다. (함정 PPT 2쪽: 연회색 글자 카드)
+    """
+    reading = 0 if _rule_group(finding) in READING_RULES else 1
+    return reading, SEVERITY_ORDER.get(finding.severity, 9), _rule_position(finding)
+
+
+# 상자의 글 자체를 읽기 어렵게 하는 판정
+READING_RULES = ("layout.overflow", "contrast", "typography", "layout.overlap")
+
+
+def _rule_group(finding: Finding) -> str:
+    rule = finding.rule_id
+    if rule.startswith("typography.hierarchy") or finding.id.endswith(":hierarchy"):
+        rule = "typography.hierarchy"
+    elif rule not in RULE_ORDER:
+        rule = rule.partition(".")[0]
+    return rule
+
+
+def _rule_position(finding: Finding) -> int:
+    rule = _rule_group(finding)
+    return RULE_ORDER.index(rule) if rule in RULE_ORDER else len(RULE_ORDER)
+
 
 # 종류별 (칩 글자, 강조색). 칩은 게임 오버레이의 등급 칩(S/A/B)처럼 한눈에 구분되게 한다.
 STYLE = {
@@ -61,6 +101,7 @@ PROPERTY_TITLES = {
     "font.color": "글자색",
     "font.family": "글꼴",
     "shape.height": "개체 높이",
+    "shape.width": "개체 너비",
     "shape.position": "개체 위치",
     "shape.zorder": "앞뒤 순서",
     "shape.fill": "배경 채우기",
@@ -95,6 +136,7 @@ class LensMark:
     message: str = ""  # 펼쳤을 때 보여 줄 판정 설명
     options: tuple[LensOption, ...] = ()  # 펼쳤을 때 보여 줄 수정 후보 체크 항목
     applied: bool = False  # 수정 후보가 문서에 실제로 적용되어 있음 (아니면 선택만 한 상태)
+    quiet: bool = False  # 묶음 때문에 따라 움직이기만 하는 객체: 테두리만 그리고 배지는 띄우지 않음
 
 
 @dataclass(frozen=True)
@@ -127,9 +169,13 @@ def build_marks(
     """
     locate = locate or (lambda _report, finding: finding.box)
     findings: dict[str, list[Finding]] = {}
+    tables: set[str] = set()  # 칸 판정을 모아 표 하나로 보여 주는 표 주소
     for finding in report.findings:
         if _slide_of(finding.shape_key) == slide:
-            findings.setdefault(finding.shape_key, []).append(finding)
+            key = _table_key(finding)
+            if key != finding.shape_key:
+                tables.add(key)
+            findings.setdefault(key, []).append(finding)
     proposals: dict[str, list[ChangeProposal]] = {}
     for proposal in report.proposals:
         if _slide_of(proposal.shape_key) == slide:
@@ -139,15 +185,27 @@ def build_marks(
 
     marks = []
     for key in sorted(set(findings) | set(proposals), key=_key_order):
-        items = sorted(findings.get(key, []), key=lambda item: SEVERITY_ORDER.get(item.severity, 9))
-        box = next((located for item in items if (located := locate(report, item)) is not None), None)
+        items = sorted(findings.get(key, []), key=finding_rank)
+        if key in tables:
+            # 표 칸 글자 크기 판정을 표 하나로 묶은 표시: 표 전체 테두리에 배지 하나
+            box = _shape_box(report, key) or _union(
+                [located for item in items if (located := locate(report, item)) is not None]
+            )
+        else:
+            box = next((located for item in items if (located := locate(report, item)) is not None), None)
         if box is None:
             box = _shape_box(report, key)
         options = _options(report, proposals.get(key, []), applied)
         active = [item for item in proposals.get(key, []) if item.id in applied or item.id in selected]
         message = items[0].message if items else ""
         if active:
+            # 위치 이동은 뒤로 (배지에는 글자 크기·상자 높이처럼 주된 변경을 보여 줌)
+            active.sort(key=lambda item: item.property == "shape.position")
             first = active[0]
+            follower = not items and all(
+                item.property == "shape.position" and _group_spans_other_shapes(report, item)
+                for item in active
+            )
             marks.append(
                 LensMark(
                     key,
@@ -155,12 +213,14 @@ def build_marks(
                     "change",
                     PROPERTY_TITLES.get(first.property, first.property),
                     "",
-                    more=len(active) - 1,
+                    # 변경 표시 뒤에 남은 판정(여백 등)도 개수에 넣어 숨지 않게 한다 (함정 PPT 2쪽)
+                    more=len(active) - 1 + len(items),
                     before=_short(first.before, first.property),
                     after=_short(first.after, first.property),
                     message=message,
                     options=options,
                     applied=any(item.id in applied for item in active),
+                    quiet=follower,
                 )
             )
             continue
@@ -197,15 +257,62 @@ def _options(
         if group in groups:
             groups[group].append(proposal)
     options = []
+    own = {item.shape_key for item in proposals}
     for group, members in groups.items():
-        label = " + ".join(
-            f"{PROPERTY_TITLES.get(item.property, item.property)} {_short(item.before, item.property)} → "
-            f"{_short(item.after, item.property)}"
-            for item in members
-        )
+        label = _option_label(members, own)
         ids = tuple(item.id for item in members)
         options.append(LensOption(group, ids, label, checked=all(item in applied for item in ids)))
     return tuple(options)
+
+
+def _option_label(members: list[ChangeProposal], own_keys: set[str]) -> str:
+    """체크 항목 글자: 이 개체의 변경은 값까지, 묶음 때문에 함께 움직이는 다른 개체는 개수로만."""
+    parts = [_change_text(item) for item in members if item.shape_key in own_keys]
+    followers = [item for item in members if item.shape_key not in own_keys]
+    if followers:
+        moves = [item for item in followers if item.property == "shape.position"]
+        if len(moves) == len(followers):
+            parts.append(f"아래 객체 {len({item.shape_key for item in moves})}개 함께 내림")
+        else:
+            parts.append(f"다른 객체 {len({item.shape_key for item in followers})}개 함께 변경")
+    label = " + ".join(parts)
+    if any("~rec" in str(item.id).split("#", 1)[0] for item in members):
+        label = f"[권장] {label}"
+    return label
+
+
+def _change_text(item: ChangeProposal) -> str:
+    title = PROPERTY_TITLES.get(item.property, item.property)
+    if item.property == "shape.position" and _is_point(item.before) and _is_point(item.after):
+        return f"{title} {_move_text(item.before, item.after)}"
+    return f"{title} {_short(item.before, item.property)} → {_short(item.after, item.property)}"
+
+
+def _move_text(before, after) -> str:
+    """(왼쪽, 위) 좌표 변화를 '아래로 12pt' 같은 말로."""
+    dx, dy = float(after[0]) - float(before[0]), float(after[1]) - float(before[1])
+    words = []
+    if abs(dy) >= 0.5:
+        words.append(f"{'아래로' if dy > 0 else '위로'} {abs(dy):.0f}pt")
+    if abs(dx) >= 0.5:
+        words.append(f"{'오른쪽으로' if dx > 0 else '왼쪽으로'} {abs(dx):.0f}pt")
+    return " ".join(words) or "그대로"
+
+
+def _is_point(value) -> bool:
+    return isinstance(value, (tuple, list)) and len(value) == 2 and all(_is_number(v) for v in value)
+
+
+def _group_spans_other_shapes(report: AnalysisReport, proposal: ChangeProposal) -> bool:
+    if "#" not in str(proposal.id):
+        return False
+    group = str(proposal.id).split("#", 1)[1]
+    return any(
+        item.shape_key != proposal.shape_key
+        and "#" in str(item.id)
+        and str(item.id).split("#", 1)[1] == group
+        for item in report.proposals
+    )
 
 
 def rule_title(finding: Finding) -> str:
@@ -238,7 +345,8 @@ def metric_text(finding: Finding) -> tuple[str, str]:
         return "겹침", ""
     if rule == "layout.density" and number:
         unit = "자" if finding.id.endswith(":chars") else "줄"
-        return f"{measured:g}{unit}", f"최대 {expected:g}{unit}" if limit else ""
+        # 슬라이드 전체 값임을 밝힌다 (이 상자 하나가 14줄인 것으로 오해하지 않게)
+        return f"슬라이드 {measured:g}{unit}", f"최대 {expected:g}{unit}" if limit else ""
     if number and limit:
         return f"{measured:g}", f"기준 {expected:g}"
     return "확인 필요", ""
@@ -345,8 +453,10 @@ def paint_lens(
     for mark, frame in zip(shown, frames, strict=True):
         _paint_frame(painter, frame, mark)
     if badges:
-        sizes = [badge_size(mark, font) for mark in shown]
-        for mark, rect in zip(shown, place_badges(frames, sizes, bounds), strict=True):
+        loud = [(mark, frame) for mark, frame in zip(shown, frames, strict=True) if not mark.quiet]
+        sizes = [badge_size(mark, font) for mark, _frame in loud]
+        placed = place_badges([frame for _mark, frame in loud], sizes, bounds)
+        for (mark, _frame), rect in zip(loud, placed, strict=True):
             _paint_badge(painter, rect, mark, font)
     _paint_summary(painter, slide_rect, marks, font, bounds)
 
@@ -356,7 +466,7 @@ def badge_rects(
 ) -> list[tuple[LensMark, QRectF]]:
     """배지를 그릴 자리 (그리기와 손잡이 창이 같은 자리를 쓰도록)."""
     font = badge_font()
-    shown = [mark for mark in marks if mark.box is not None]
+    shown = [mark for mark in marks if mark.box is not None and not mark.quiet]
     frames = [map_box(mark.box, slide_rect, slide_size_pt) for mark in shown]
     sizes = [badge_size(mark, font) for mark in shown]
     return list(zip(shown, place_badges(frames, sizes, bounds), strict=True))
@@ -739,6 +849,8 @@ class BadgeHandle(QWidget):
             if rect.left() < area.left():
                 rect.moveLeft(area.left())
         self.setGeometry(rect)
+        # 펼친 카드는 다른 배지 창보다 앞으로 (옆 배지가 체크 항목을 덮어 누를 수 없던 문제)
+        self.raise_()
 
     # ------------------------------------------------------------ 마우스
     def enterEvent(self, event):
@@ -1041,6 +1153,36 @@ def _slide_of(shape_key: str) -> int:
         return -1
 
 
+def _table_key(finding: Finding) -> str:
+    """표 칸의 글자 크기 판정은 표 주소로 ("7:5:table_cell:2,1" → "7:5").
+
+    표 칸마다 배지가 뜨면 표 전체가 배지로 덮이고(함정 PPT 7쪽: 배지 16개), 수정 후보도 표 하나에
+    '표 전체 글자 크기'로 만들어지므로(planner) 표 하나로 보여 준다. 다른 판정은 칸 그대로 둔다.
+    """
+    key = str(finding.shape_key)
+    parts = key.split(":")
+    is_size = finding.rule_id == "typography" and not finding.id.endswith(":hierarchy")
+    # '판정 불가'(칸 배경색을 몰라 명암비를 못 잼 등)도 칸마다 띄우면 표가 회색 배지로 덮이므로 표 하나로 모은다
+    if (
+        (is_size or finding.severity == "unknown")
+        and len(parts) >= 3
+        and parts[2] == "table_cell"
+        and parts[1].isdigit()
+    ):
+        return f"{parts[0]}:{parts[1]}"
+    return key
+
+
+def _union(boxes: list[Box]) -> Box | None:
+    if not boxes:
+        return None
+    left = min(box.x for box in boxes)
+    top = min(box.y for box in boxes)
+    right = max(box.x + box.width for box in boxes)
+    bottom = max(box.y + box.height for box in boxes)
+    return Box(left, top, right - left, bottom - top)
+
+
 def _key_order(key: str):
     return [int(part) if part.isdigit() else 0 for part in str(key).replace("/", ":").split(":")[:2]]
 
@@ -1055,8 +1197,20 @@ def _is_number(value) -> bool:
 
 
 def _short(value, property_name: str) -> str:
+    if value is None:
+        return "없음"  # 예: 배경 채우기가 없던 상자
+    if isinstance(value, dict) and "color" in value:
+        # 배경 채우기 {"color": "000000", "transparency": 0.3} → "#000000 (불투명 70%)"
+        color = _short(value["color"], property_name)
+        transparency = value.get("transparency")
+        if _is_number(transparency) and float(transparency) > 0:
+            return f"{color} (불투명 {round((1 - float(transparency)) * 100):g}%)"
+        return color
     if _is_number(value):
-        return f"{value:g}pt" if property_name == "font.size" else f"{value:g}"
+        number = f"{round(float(value), 1):g}"
+        return f"{number}pt" if property_name in ("font.size", "shape.height", "shape.width") else number
+    if _is_point(value):
+        return f"({float(value[0]):.0f}, {float(value[1]):.0f})"
     if isinstance(value, str) and len(value) == 6 and all(char in "0123456789abcdefABCDEF" for char in value):
         return f"#{value.upper()}"
     if isinstance(value, (tuple, list)) and len(value) == 3:

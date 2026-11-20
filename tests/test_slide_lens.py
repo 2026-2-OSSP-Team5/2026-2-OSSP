@@ -89,6 +89,35 @@ def test_marks_offer_proposals_as_options_and_show_applied_ones(tmp_path):
     assert marks["1:4"].options == ()
 
 
+def test_objects_that_only_follow_a_bundle_get_no_badge(application, tmp_path):
+    report = _report(tmp_path / "d.pptx")
+    report.proposals += [
+        ChangeProposal("shape.height@1:4#reflow:1", "x", "1:4", "shape.height", 104.208, 131.0, 0.1),
+        ChangeProposal(
+            "shape.position@1:6#reflow:1",
+            "x",
+            "1:6",
+            "shape.position",
+            (545.1063, 252.78),
+            (545.1063, 279.6),
+            0.1,
+        ),
+        ChangeProposal(
+            "shape.position@1:7#reflow:1", "x", "1:7", "shape.position", (792.0, 266.46), (792.0, 293.3), 0.1
+        ),
+    ]
+    ids = {p.id for p in report.proposals if "reflow" in p.id}
+    marks = {mark.key: mark for mark in build_marks(report, 1, applied_ids=ids)}
+    assert marks["1:4"].kind == "change" and not marks["1:4"].quiet  # 주된 변경: 배지
+    assert (marks["1:4"].before, marks["1:4"].after) == ("104.2pt", "131pt")
+    assert marks["1:6"].quiet and marks["1:7"].quiet  # 따라 내려가기만: 테두리만
+    assert marks["1:4"].options[0].label == "개체 높이 104.2pt → 131pt + 아래 객체 2개 함께 내림"
+    image = QImage(1000, 600, QImage.Format.Format_ARGB32)
+    painter = QPainter(image)
+    paint_lens(painter, QRectF(0, 0, 960, 540), (960, 540), list(marks.values()), QRectF(image.rect()))
+    painter.end()
+
+
 def test_bundled_proposals_toggle_together(tmp_path):
     report = _report(tmp_path / "d.pptx")
     report.proposals += [
@@ -107,8 +136,8 @@ def test_bundled_proposals_toggle_together(tmp_path):
     [
         ("typography.hierarchy.inferred", "typography:8:hierarchy", 20.0, 30.0, ("20pt", "필요 30pt")),
         ("layout.overflow", "layout.overflow:7:3", 13.2, 0.0, ("13.2pt", "")),
-        ("layout.density", "layout.density:2:lines", 19, 6, ("19줄", "최대 6줄")),
-        ("layout.density", "layout.density:2:chars", 358, 300, ("358자", "최대 300자")),
+        ("layout.density", "layout.density:2:lines", 19, 6, ("슬라이드 19줄", "최대 6줄")),
+        ("layout.density", "layout.density:2:chars", 358, 300, ("슬라이드 358자", "최대 300자")),
         ("layout.margin", "layout.margin:1:4", 10.0, 36.0, ("10pt", "여백 36pt 이상")),
     ],
 )
@@ -418,3 +447,118 @@ def test_idle_user_means_no_more_powerpoint_queries(controller, application):
         _wait_for(lambda: controller._lens_probe is None, application)
         controller.poll_powerpoint()
     assert len(probes) == 2  # 처음 강제로 한 번 + 아직 보지 못한 입력 한 번, 그 뒤로는 묻지 않음
+
+
+def test_badge_shows_the_most_important_problem_not_the_margin(tmp_path):
+    """같은 '검토' 등급이면 정보 과다가 여백보다 먼저 (자바게티 22쪽: 배지에 여백만 보이던 문제)."""
+    report = _report(tmp_path / "d.pptx")
+    report.findings += [
+        _finding("layout.margin:1:9", "layout.margin", "1:9", "review", 4.4, 40.5),
+        _finding("layout.density:1:lines", "layout.density", "1:9", "review", 9, 6),
+    ]
+    mark = {m.key: m for m in build_marks(report, 1)}["1:9"]
+    assert mark.title == "정보 밀도" and mark.more == 1
+
+
+def test_slide_wide_density_does_not_hide_the_box_own_problem():
+    """정보 밀도는 슬라이드 전체 판정이라, 등급이 더 높아도 상자 자체의 명암비 판정을 배지에 먼저 보여 준다."""
+    report = AnalysisReport(
+        DeckSnapshot("t.pptx", "0" * 64, 1, 960, 540),
+        (
+            _finding("layout.density:2:lines", "layout.density", "2:7", "warning", 14, 6),
+            _finding("contrast:2:7", "contrast", "2:7", "review", 2.6, 4.5),
+        ),
+        (),
+    )
+    [mark] = build_marks(report, 2)
+    assert mark.title == "명암비" and mark.more == 1
+
+
+def test_fill_change_reads_as_color_not_a_dict():
+    from slideguard.ui.slide_lens import _short
+
+    assert _short(None, "shape.fill") == "없음"
+    assert _short({"color": "000000", "transparency": 0.3}, "shape.fill") == "#000000 (불투명 70%)"
+
+
+def test_small_table_cells_show_one_badge_on_the_table():
+    """표 칸마다 배지가 뜨면 표가 배지로 덮인다 (함정 PPT 7쪽) → 표 하나에 배지 하나, 후보도 표에."""
+    cells = tuple(
+        _finding(
+            f"typography:7:5:table_cell:{row},1",
+            "typography",
+            f"7:5:table_cell:{row},1",
+            "warning",
+            10,
+            14,
+            Box(40, 100 + row * 30, 100, 20),
+        )
+        for row in (1, 2, 3)
+    )
+    fix = ChangeProposal("font.size@7:5", "typography:7:5:table_cell:1,1", "7:5", "font.size", 10, 14, 0.4)
+    report = AnalysisReport(DeckSnapshot("t.pptx", "0" * 64, 7, 960, 540), cells, (fix,))
+    marks = build_marks(report, 7)
+    assert [mark.key for mark in marks] == ["7:5"]
+    assert marks[0].box == Box(40, 130, 100, 80) and len(marks[0].options) == 1
+
+
+def test_expanded_badge_is_raised_above_neighbouring_badges(application, monkeypatch):
+    """펼친 카드가 옆 배지 창에 덮여 체크 항목을 누를 수 없던 문제: 펼칠 때 맨 앞으로 올린다."""
+    raised = []
+    monkeypatch.setattr(BadgeHandle, "raise_", lambda self: raised.append(self))
+    handle = BadgeHandle()
+    mark = build_marks(
+        AnalysisReport(
+            DeckSnapshot("t.pptx", "0" * 64, 1, 960, 540),
+            (_finding("typography:1:5", "typography", "1:5", "warning", 10, 14),),
+            (),
+        ),
+        1,
+    )[0]
+    handle.set_mark(mark, QRect(10, 10, 160, 22))
+    handle.expand()
+    assert raised == [handle]
+    handle.close()
+
+
+def test_panel_checkbox_goes_to_the_slide_and_applies_to_the_open_document(controller, application):
+    """상단 패널의 수정 후보 체크도 렌즈처럼 열린 문서에 바로 적용하고, 그 슬라이드로 이동한다."""
+    from slideguard.adapters.powerpoint.live_edit import LiveResult
+
+    calls, moved = [], []
+
+    class Editor:
+        applied_ids: set = set()
+
+        def apply(self, report, ids):
+            calls.append(("apply", tuple(ids)))
+            self.applied_ids = set(ids)
+            return LiveResult(applied=list(ids))
+
+        def revert(self, ids):
+            calls.append(("revert", tuple(ids)))
+            self.applied_ids = set()
+            return LiveResult(applied=list(ids))
+
+        def forget(self):
+            pass
+
+    controller.live_editor = Editor()
+    controller.slide_navigator = lambda path, slide: moved.append(slide) or True
+    item = controller.overlay.proposal_items["font.size@1:2"]
+    item.setCheckState(Qt.CheckState.Checked)
+    assert _wait_for(lambda: calls == [("apply", ("font.size@1:2",))], application)
+    assert moved == [1]
+    assert _wait_for(lambda: controller._live_task is None, application)
+    item.setCheckState(Qt.CheckState.Unchecked)
+    assert _wait_for(lambda: calls[-1] == ("revert", ("font.size@1:2",)), application)
+    assert moved == [1]  # 해제할 때는 이동하지 않음
+
+
+def test_unknown_cell_findings_join_the_table_badge():
+    cells = (
+        _finding("contrast:7:5:table_cell:2,1", "contrast", "7:5:table_cell:2,1", "unknown", None, None),
+        _finding("contrast:7:5:table_cell:1,2", "contrast", "7:5:table_cell:1,2", "warning", 4.0, 4.5),
+    )
+    report = AnalysisReport(DeckSnapshot("t.pptx", "0" * 64, 7, 960, 540), cells, ())
+    assert sorted(mark.key for mark in build_marks(report, 7)) == ["7:5", "7:5:table_cell:1,2"]

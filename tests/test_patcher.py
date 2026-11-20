@@ -78,6 +78,9 @@ class DocShape:
     def set_height(self, h):
         self.geometry[3] = h
 
+    def set_width(self, w):
+        self.geometry[2] = w
+
     def set_position(self, left, top):
         self.geometry[0] = left
         self.geometry[1] = top

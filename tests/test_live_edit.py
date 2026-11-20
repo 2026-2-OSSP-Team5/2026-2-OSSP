@@ -109,3 +109,48 @@ def test_another_document_resets_memory_and_unavailable_is_raised():
 
     with pytest.raises(LiveEditUnavailable):
         LiveEditor(closed).apply(_report(_size()), ["font.size@1:5"])
+
+
+def test_uncheck_autofit_change_also_restores_the_box_height():
+    """자동 맞춤을 바꾸면 PowerPoint가 상자 높이를 바꾸므로, 해제할 때 원래 높이까지 되돌린다."""
+    shape = DocShape([DocRun(24.0, "000000")], geometry=(50, 50, 400, 100), autofit="shrink")
+    editor = _editor(Doc(shape))
+    change = ChangeProposal(
+        "text.autofit@1:5", "layout.overflow:1:5", "1:5", "text.autofit", "shrink", "grow", 0.1
+    )
+    assert editor.apply(_report(change), ["text.autofit@1:5"]).applied == ["text.autofit@1:5"]
+    shape.geometry[3] = 180  # PowerPoint가 '텍스트에 맞춤'으로 상자를 늘린 것처럼
+    editor.revert(["text.autofit@1:5"])
+    assert shape.autofit == "shrink" and shape.geometry[3] == 100
+
+
+def test_table_rows_are_restored_after_the_text_size():
+    """표 글자를 키우며 늘린 행 높이도 되돌린다. 글자를 먼저 줄인 뒤에 행을 줄인다."""
+    order = []
+
+    class TableShape(DocShape):
+        def __init__(self, runs):
+            super().__init__(runs)
+            self.rows = [30.0, 30.0]
+
+        def fit_table_rows(self):
+            before = list(self.rows)
+            self.rows = [50.0, 50.0]
+            return before
+
+        def set_row_heights(self, heights):
+            order.append(("rows", [run.size for run in self._runs]))
+            self.rows = list(heights)
+
+    from slideguard.adapters.powerpoint.live_edit import _RecordingShape, _undo
+
+    runs = [DocRun(10.0, "000000")]
+    shape = TableShape(runs)
+    log = []
+    recording = _RecordingShape(shape, 1, 5, log)
+    recording.runs()[0].set_size(18.0)  # patcher가 표 글자를 키운 뒤
+    recording.fit_table_rows()  # 행 높이를 맞추는 순서 그대로
+    assert shape.rows == [50.0, 50.0]
+    _undo(Doc(shape), log)
+    assert shape.rows == [30.0, 30.0] and runs[0].size == 10.0
+    assert order == [("rows", [10.0])]  # 행은 글자를 10pt로 되돌린 뒤에

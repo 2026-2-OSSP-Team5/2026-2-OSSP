@@ -142,6 +142,18 @@ class _RecordingShape:
         self._record("shape.height", 0, self._shape.get_geometry()[3], float(height))
         self._shape.set_height(height)
 
+    def fit_table_rows(self):
+        """표 행 높이 맞추기. 되돌릴 때 원래 행 높이로 돌리려고 기억한다."""
+        fit = getattr(self._shape, "fit_table_rows", None)
+        before = fit() if fit is not None else None
+        if before is not None:
+            self._record("table.rows", 0, tuple(before), None)
+        return before
+
+    def set_width(self, width: float) -> None:
+        self._record("shape.width", 0, self._shape.get_geometry()[2], float(width))
+        self._shape.set_width(width)
+
     def set_position(self, left: float, top: float) -> None:
         old_left, old_top, _w, _h = self._shape.get_geometry()
         self._record("shape.position", 0, (old_left, old_top), (float(left), float(top)))
@@ -162,7 +174,9 @@ class _RecordingShape:
         return self._shape.get_autofit()
 
     def set_autofit(self, mode: str) -> None:
-        self._record("shape.autofit", 0, self._shape.get_autofit(), mode)
+        # '도형을 텍스트에 맞춤'으로 바꾸면 PowerPoint가 상자 높이를 저절로 바꾸므로 원래 높이도 기억한다
+        height = self._shape.get_geometry()[3]
+        self._record("shape.autofit", 0, (self._shape.get_autofit(), height), mode)
         self._shape.set_autofit(mode)
 
 
@@ -213,7 +227,10 @@ class _RecordingParagraph:
 def _undo(document: Document, steps: list[UndoStep]) -> int:
     """기록을 거꾸로 되돌린다. 사용자가 그 사이 바꾼 값은 건드리지 않고, 그런 값의 수를 돌려준다."""
     skipped = 0
-    for step in reversed(steps):
+    # 표 행 높이는 글자 크기를 되돌린 '뒤에' 돌린다 (글자가 큰 동안에는 행을 줄일 수 없음)
+    others = [step for step in steps if step.kind != "table.rows"]
+    rows = [step for step in steps if step.kind == "table.rows"]
+    for step in list(reversed(others)) + list(reversed(rows)):
         shape = document.find_shape(step.slide, step.shape_id)
         if shape is None or not _restore(shape, step):
             skipped += 1
@@ -247,6 +264,12 @@ def _restore(shape, step: UndoStep) -> bool:
             run.set_font_name(str(step.before))
             return True
         return False
+    if kind == "table.rows":
+        set_rows = getattr(shape, "set_row_heights", None)
+        if set_rows is None or step.before is None:
+            return False
+        set_rows(list(step.before))
+        return True
     if kind == "paragraph.spacing":
         paragraphs = shape.paragraphs()
         if step.index >= len(paragraphs) or step.before is None:
@@ -256,9 +279,12 @@ def _restore(shape, step: UndoStep) -> bool:
             return False
         paragraph.set_line_spacing(float(step.before))
         return True
-    left, top, _width, height = shape.get_geometry()
+    left, top, width, height = shape.get_geometry()
     if kind == "shape.height" and _close(height, step.after):
         shape.set_height(float(step.before))
+        return True
+    if kind == "shape.width" and _close(width, step.after):
+        shape.set_width(float(step.before))
         return True
     if kind == "shape.position" and _close(left, step.after[0]) and _close(top, step.after[1]):
         shape.set_position(float(step.before[0]), float(step.before[1]))
@@ -276,7 +302,12 @@ def _restore(shape, step: UndoStep) -> bool:
             shape.set_fill(step.before[0], step.before[1])
         return True
     if kind == "shape.autofit" and shape.get_autofit() == step.after and step.before is not None:
-        shape.set_autofit(str(step.before))
+        mode, old_height = step.before if isinstance(step.before, tuple) else (step.before, None)
+        if mode is None:
+            return False
+        shape.set_autofit(str(mode))
+        if old_height is not None:
+            shape.set_height(float(old_height))  # 늘어난 상자를 원래 높이로
         return True
     return False
 

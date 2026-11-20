@@ -762,6 +762,8 @@ class OverlayWidget(QWidget):
     lock_requested = Signal(str)
     preview_state_changed = Signal()
     lens_toggled = Signal(bool)
+    # 수정 후보 목록에서 사용자가 직접 체크/해제함: (같은 묶음 후보 ID들, 체크 여부)
+    proposal_user_toggled = Signal(object, bool)
 
     def __init__(self):
         super().__init__()
@@ -1293,17 +1295,34 @@ class OverlayWidget(QWidget):
             return
         group = _proposal_group(proposal)
         checked = self.proposal_items[proposal_id].checkState()
+        members = [proposal.id]
         if group is not None:
+            members = [item.id for item in self._report.proposals if _proposal_group(item) == group]
             self._syncing_proposals = True
             try:
-                for item in self._report.proposals:
-                    if _proposal_group(item) == group:
-                        self.proposal_items[item.id].setCheckState(checked)
+                for member in members:
+                    self.proposal_items[member].setCheckState(checked)
             finally:
                 self._syncing_proposals = False
         self._update_apply_button()
         self.proposals_list.viewport().update()
         self.preview_state_changed.emit()
+        # 열린 문서에 바로 적용하고 그 슬라이드로 이동 (컨트롤러가 처리)
+        self.proposal_user_toggled.emit(tuple(members), checked == Qt.CheckState.Checked)
+
+    def set_proposals_checked(self, proposal_ids, checked: bool):
+        """렌즈 배지에서 바로 적용·해제한 후보를 목록 체크에도 맞춘다 (신호는 내지 않음)."""
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self._syncing_proposals = True
+        try:
+            for proposal_id in proposal_ids:
+                item = self.proposal_items.get(proposal_id)
+                if item is not None and item.checkState() != state:
+                    item.setCheckState(state)
+        finally:
+            self._syncing_proposals = False
+        self._update_apply_button()
+        self.proposals_list.viewport().update()
 
     def select_severity(self, severity: str):
         proposal_ids = self._proposal_ids_by_severity.get(severity)
@@ -1723,6 +1742,7 @@ class OverlayController(QObject):
         self._live_task: LiveEditTask | None = None
         self._live_hash: str | None = None  # 적용할 때의 검사 결과 (저장 후 재검사되면 기억을 지움)
         self.lens.option_toggled.connect(self.toggle_live_edit)
+        self._live_queue: list[tuple[tuple[str, ...], bool]] = []  # 적용 중에 들어온 체크 (차례로 처리)
         # PowerPoint에 COM으로 묻는 일은 사용자 입력 뒤에만 (가만히 있을 때 바쁜 커서가 계속 돌지 않게)
         self.activity = input_activity or InputActivity()
         self._outline_window: QRect | None = None
@@ -1761,6 +1781,7 @@ class OverlayController(QObject):
         self.overlay.preview_state_changed.connect(self.schedule_preview)
         self.overlay.preview_state_changed.connect(self._redraw_lens)
         self.overlay.lens_toggled.connect(self.set_lens_enabled)
+        self.overlay.proposal_user_toggled.connect(self._panel_proposal_toggled)
         self.settings_dialog.settings_saved.connect(self.restart_collection)
         self.detected.connect(self._on_detected)
         self.completed.connect(self._on_completed)
@@ -2574,10 +2595,32 @@ class OverlayController(QObject):
 
     # ---------------------------------------------------------- 렌즈 체크: 바로 적용 / 되돌리기
 
+    def _panel_proposal_toggled(self, proposal_ids, checked: bool):
+        """수정 후보 목록의 체크: 그 슬라이드로 이동하고, 열린 문서에도 바로 적용·해제한다."""
+        report = self.overlay._report
+        ids = tuple(str(item) for item in proposal_ids)
+        if report is None or not ids:
+            return
+        first = next((item for item in report.proposals if item.id == ids[0]), None)
+        if (
+            checked
+            and first is not None
+            and self.overlay._target is not None
+            and not self.overlay._report_stale
+        ):
+            path = Path(report.deck.source_path)
+            slide = _slide_number(first.shape_key)
+            if self.slide_navigator(path, slide):
+                LOGGER.info("SLIDE_NAVIGATED | file=%s | slide=%d", path.name, slide)
+        self.toggle_live_edit(ids, checked)
+
     def toggle_live_edit(self, proposal_ids, checked: bool):
         report = self._lens_report()
         ids = tuple(str(item) for item in proposal_ids)
-        if report is None or not ids or self._live_task is not None:
+        if report is None or not ids:
+            return
+        if self._live_task is not None:
+            self._live_queue.append((ids, checked))  # 앞의 적용이 끝나면 이어서
             return
         key = next((item.shape_key for item in report.proposals if item.id == ids[0]), "")
         if checked:
@@ -2614,6 +2657,10 @@ class OverlayController(QObject):
                 self.lens.set_note(key, f"직접 바꾼 값 {outcome.skipped}개는 그대로 두었습니다.")
             if self.live_editor.applied_ids:
                 self._live_hash = report.deck.source_sha256
+            # 렌즈·목록 어느 쪽에서 체크했든 목록 체크 상태를 실제 적용 상태에 맞춘다
+            task = self._live_task
+            if task is not None and outcome.applied:
+                self.overlay.set_proposals_checked(outcome.applied, task.checked)
             LOGGER.info(
                 "LIVE_EDIT | file=%s | applied=%s | rejected=%d | skipped=%d",
                 Path(report.deck.source_path).name,
@@ -2629,6 +2676,9 @@ class OverlayController(QObject):
         if task is not None:
             task.wait()
             task.deleteLater()
+        if self._live_queue and not self._stopping:
+            ids, checked = self._live_queue.pop(0)
+            self.toggle_live_edit(ids, checked)
 
     def stop(self):
         self._stopping = True
@@ -2913,7 +2963,17 @@ def _severity(value: str) -> str:
 
 
 def _value(value) -> str:
-    return "확인할 수 없음" if value is None else str(value)
+    if value is None:
+        return "확인할 수 없음"
+    if isinstance(value, float):
+        return f"{round(value, 1):g}"
+    if (
+        isinstance(value, (tuple, list))
+        and len(value) == 2
+        and all(isinstance(v, (int, float)) for v in value)
+    ):
+        return f"({float(value[0]):.0f}, {float(value[1]):.0f})"
+    return str(value)
 
 
 def _slide_number(shape_key: str) -> int:
@@ -2968,6 +3028,7 @@ def _property_name(value: str) -> str:
         "font.color": "글자색",
         "font.family": "글꼴",
         "shape.height": "개체 높이",
+        "shape.width": "개체 너비",
         "shape.position": "개체 위치",
         "shape.zorder": "앞뒤 순서",
         "shape.fill": "배경 채우기",
