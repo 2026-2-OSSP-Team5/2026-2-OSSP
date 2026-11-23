@@ -161,7 +161,7 @@ def describe_finding(finding):
             if lines
             else "슬라이드 전체의 글상자·표 셀에서 공백을 제외한 글자 수를 합산했습니다.",
             _pair(current, target, unit, f"현재 {noun}", f"권장 {noun}", " 이하"),
-            "문단·목록 경계에서 여러 장으로 나눠 보세요. 분할 제안이 있으면 미리보기로 확인할 수 있습니다.",
+            "문단·목록 경계에서 여러 장으로 나눠 보세요. 분할 수정안을 사본에 적용한 뒤 PowerPoint에서 확인할 수 있습니다.",
         )
     if rule.startswith("readability."):
         subtype = rule.split(".")[1]

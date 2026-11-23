@@ -242,14 +242,9 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
             widget.clear_proposals()
             widget.select_warning_button.click()
             assert widget.select_warning_button.property("selected") is True
-            wait_for(
-                lambda: (
-                    controller._preview_thread is None
-                    and not controller.preview_timer.isActive()
-                    and not widget.preview_after_image._source_pixmap.isNull()
-                ),
-                "reopened toolbar renders proposal preview",
-            )
+            app.processEvents()
+            assert widget.selected_proposal_ids()
+            assert not hasattr(controller, "preview_timer")
             widget.locate_button.click()
             assert widget.collapsed and controller.outline.isVisible(), widget.location_label.text()
 
