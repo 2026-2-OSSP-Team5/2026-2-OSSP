@@ -169,6 +169,8 @@ class ChangeProposal:
     before: float | str | Color
     after: float | str | Color
     cost: float
+    payload: dict | None = None
+    explanation: str = ""
 
 
 @dataclass(frozen=True)
@@ -191,6 +193,7 @@ class AnalysisReport:
     schema_version: str = "0.3"
     policy_key: str | None = None
     comparison: FindingComparison | None = None
+    proposal_notes: dict[str, str] = field(default_factory=dict)
 
     def compare_with(self, before: "AnalysisReport") -> None:
         rank = {"review": 1, "warning": 2, "unknown": None}

@@ -90,13 +90,12 @@ class SqliteReportRepository:
             if report.policy_key is not None and report.status == "analyzed":
                 prior = self._latest(connection, Path(deck.source_path), report.policy_key)
                 if prior is not None and prior.report.deck.source_sha256 == deck.source_sha256:
-                    if report.comparison is not None and prior.report.comparison is None:
-                        connection.execute(
-                            "UPDATE analysis_reports SET report_json = ? WHERE id = ?",
-                            (json.dumps(asdict(report), ensure_ascii=False), prior.id),
-                        )
-                    elif report.comparison is None:
+                    if report.comparison is None:
                         report.comparison = prior.report.comparison
+                    connection.execute(
+                        "UPDATE analysis_reports SET report_json = ? WHERE id = ?",
+                        (json.dumps(asdict(report), ensure_ascii=False), prior.id),
+                    )
                     return
                 if prior is not None and report.comparison is None:
                     report.compare_with(prior.report)
@@ -469,6 +468,8 @@ def _report_from_json(payload: str) -> AnalysisReport:
             before=tuple(item["before"]) if isinstance(item["before"], list) else item["before"],
             after=tuple(item["after"]) if isinstance(item["after"], list) else item["after"],
             cost=item["cost"],
+            payload=item.get("payload"),
+            explanation=item.get("explanation", ""),
         )
         for item in data.get("proposals", [])
     ]
@@ -481,4 +482,5 @@ def _report_from_json(payload: str) -> AnalysisReport:
         schema_version=data.get("schema_version", "0.1"),
         policy_key=data.get("policy_key"),
         comparison=FindingComparison(**data["comparison"]) if data.get("comparison") else None,
+        proposal_notes=dict(data.get("proposal_notes", {})),
     )

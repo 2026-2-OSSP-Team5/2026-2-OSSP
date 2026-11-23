@@ -1,4 +1,12 @@
-"""Presentation of saved-file analysis progress."""
+"""On-demand slide reconstruction and shared progress wording."""
+
+from copy import deepcopy
+from hashlib import file_digest
+from pathlib import Path
+
+from PySide6.QtCore import QThread, Signal
+
+from slideguard.application.ports import ReadInterrupted
 
 
 def progress_text(progress):
@@ -19,3 +27,41 @@ def progress_text(progress):
     if progress.reused:
         text += f" · 이전 측정 {progress.reused}장 재사용"
     return text
+
+
+class SplitProposalWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, report, policy, slide, parent=None):
+        super().__init__(parent)
+        self.report = deepcopy(report)
+        self.policy = policy
+        self.slide = slide
+
+    def run(self):
+        from slideguard.adapters.powerpoint.restructure import prepare_split_proposals
+        from slideguard.bootstrap import build_analysis_policy, build_report_repository
+
+        try:
+            prepare_split_proposals(
+                self.report,
+                self.policy,
+                slide_numbers=(self.slide,),
+                should_cancel=self.isInterruptionRequested,
+            )
+            if not self.isInterruptionRequested():
+                source = Path(self.report.deck.source_path)
+                with source.open("rb") as stream:
+                    current_hash = file_digest(stream, "sha256").hexdigest()
+                if (
+                    current_hash != self.report.deck.source_sha256
+                    or build_analysis_policy(source).cache_key != self.policy.cache_key
+                ):
+                    raise ValueError("검사 후 파일이나 설정이 변경되었습니다. 다시 검사해 주세요.")
+                build_report_repository().save(self.report)
+                self.completed.emit(self.report)
+        except ReadInterrupted:
+            pass
+        except Exception as error:
+            self.failed.emit(str(error))

@@ -18,6 +18,52 @@ from tests.test_powerpoint_reader import Collection, ShapeProxy
 from tests.test_snapshot_collection import Source, revision, snapshot
 
 
+def test_regular_inspection_never_prepares_split_proposals(tmp_path, monkeypatch):
+    from slideguard.adapters.powerpoint import restructure
+    from slideguard.bootstrap import build_analyzer
+    from slideguard.domain.policy import AnalysisPolicy
+    from slideguard.ui import overlay
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Regular inspection must not create split candidates")
+
+    monkeypatch.setattr(restructure, "prepare_split_proposals", forbidden)
+    monkeypatch.setattr(overlay, "build_analyzer", build_analyzer)
+    monkeypatch.setattr(overlay, "build_analysis_policy", lambda _path: AnalysisPolicy())
+    saved = []
+    monkeypatch.setattr(overlay, "build_report_repository", lambda: SimpleNamespace(save=saved.append))
+    outputs = []
+    controller = SimpleNamespace(completed=SimpleNamespace(emit=outputs.append))
+    overlay.OverlayController._process_snapshot(controller, snapshot(revision(tmp_path / "deck.pptx")))
+    assert len(saved) == len(outputs) == 1
+
+
+def test_split_request_only_attempts_selected_slide_and_preserves_other_notes(tmp_path, monkeypatch):
+    from slideguard.adapters.powerpoint import restructure
+    from slideguard.domain.models import Finding
+    from slideguard.domain.policy import AnalysisPolicy
+    from slideguard.planning.splitting import SplitUnavailable
+
+    report = AnalysisReport(snapshot(revision(tmp_path / "deck.pptx")))
+    report.findings = [
+        Finding(f"typography:{n}:2", "typography", f"{n}:2", "warning", "small", 10, 20, "test")
+        for n in (1, 2, 3)
+    ]
+    report.proposal_notes[report.findings[0].id] = "Earlier slide note"
+    attempted = []
+
+    def draft(_deck, _findings, _policy, slide):
+        attempted.append(slide)
+        raise SplitUnavailable("Not enough body paragraphs")
+
+    monkeypatch.setattr(restructure, "build_draft", draft)
+    restructure.prepare_split_proposals(report, AnalysisPolicy(), slide_numbers=(2,))
+    assert attempted == [2]
+    assert report.proposal_notes[report.findings[0].id] == "Earlier slide note"
+    assert report.proposal_notes[report.findings[1].id] == "Not enough body paragraphs"
+    assert report.findings[2].id not in report.proposal_notes
+
+
 def deck_file(path, count=3):
     deck = Presentation()
     for number in range(count):
