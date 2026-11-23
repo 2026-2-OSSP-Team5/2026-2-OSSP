@@ -42,7 +42,8 @@ def box_height_for_font(
 
 # TODO(B·C·A) 새 검사/수정 항목 — 자세한 근거는 팀 문서
 #   - 양쪽 정렬 → 왼쪽 정렬: WCAG 1.4.8. B 검사(문단 정렬값) + Property.ALIGNMENT + patcher 적용 필요
-#   - 한 줄 길이: WCAG 1.4.8 (한국어 등 CJK 40자 이하). B 검사만 (수정은 사람이 판단)
+#   - 한 줄 길이: 완료. B의 layout.line_length 가 검사한다. 수정 후보는 만들지 않는다
+#              (줄을 어디서 끊을지는 사람이 판단)
 #   - 줄 간격: FixTargets.line_spacing 을 정하면 standards.min_line_spacing 으로 이미 연결됨.
 #              B가 줄 간격 측정값(line_spacing)과 판정을 내보내야 후보가 생김
 #   - 렌즈에서 대안 보여 주기: PlanResult.alternatives(예: 표준 팔레트 #333333)를

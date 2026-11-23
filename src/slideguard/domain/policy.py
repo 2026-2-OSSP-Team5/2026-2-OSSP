@@ -127,6 +127,17 @@ DENSITY_THRESHOLDS: dict[Purpose, DensityThreshold] = {
 }
 
 
+# 한 줄 길이: WCAG 2.2 SC 1.4.8 Visual Presentation (Level AAA)
+#   "Width is no more than 80 characters or glyphs (40 if CJK)."
+# 한국어는 CJK이므로 40이다. 다만 한 줄에 한글과 영문이 섞이므로, 전각 한 글자를 1,
+# 반각 한 글자를 0.5로 세어 40과 비교한다. 이러면 영문만 80자인 줄이 정확히 40이 되어
+# 기준의 두 숫자가 같은 척도로 맞는다.
+#
+# AAA는 의무가 아니라 권고이고 조건도 "조절할 수단이 있을 것"이므로, 판정은 경고가
+# 아니라 검토로 낸다. 줄을 어디서 끊을지는 사람이 정할 일이다.
+MAX_LINE_WIDTH_UNITS = 40.0
+
+
 def density_threshold(purpose: Purpose) -> DensityThreshold:
     return DENSITY_THRESHOLDS[purpose]
 
