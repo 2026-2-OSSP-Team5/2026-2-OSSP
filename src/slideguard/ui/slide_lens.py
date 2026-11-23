@@ -172,8 +172,8 @@ def build_marks(
     tables: set[str] = set()  # 칸 판정을 모아 표 하나로 보여 주는 표 주소
     for finding in report.findings:
         if _slide_of(finding.shape_key) == slide:
-            key = _table_key(finding)
-            if key != finding.shape_key:
+            key = f"{slide}:density" if finding.rule_id == "layout.density" else _table_key(finding)
+            if key != finding.shape_key and finding.rule_id != "layout.density":
                 tables.add(key)
             findings.setdefault(key, []).append(finding)
     proposals: dict[str, list[ChangeProposal]] = {}
@@ -346,7 +346,7 @@ def metric_text(finding: Finding) -> tuple[str, str]:
     if rule == "layout.density" and number:
         unit = "자" if finding.id.endswith(":chars") else "줄"
         # 슬라이드 전체 값임을 밝힌다 (이 상자 하나가 14줄인 것으로 오해하지 않게)
-        return f"슬라이드 {measured:g}{unit}", f"최대 {expected:g}{unit}" if limit else ""
+        return f"슬라이드 전체 {measured:g}{unit}", f"권장 {expected:g}{unit} 이하" if limit else ""
     if number and limit:
         return f"{measured:g}", f"기준 {expected:g}"
     return "확인 필요", ""

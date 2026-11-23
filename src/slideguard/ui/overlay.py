@@ -2829,6 +2829,8 @@ def start_overlay(app: QApplication) -> OverlayController:
 
 
 def finding_location_box(report: AnalysisReport, finding: Finding) -> Box | None:
+    if finding.rule_id == "layout.density":
+        return finding.box
     shape = next((item for item in report.deck.shapes if item.key == finding.shape_key), None)
     if shape is not None and shape.locator is not None and shape.locator.kind == "table_cell":
         if finding.rule_id == "layout.overlap":

@@ -136,8 +136,8 @@ def test_bundled_proposals_toggle_together(tmp_path):
     [
         ("typography.hierarchy.inferred", "typography:8:hierarchy", 20.0, 30.0, ("20pt", "필요 30pt")),
         ("layout.overflow", "layout.overflow:7:3", 13.2, 0.0, ("13.2pt", "")),
-        ("layout.density", "layout.density:2:lines", 19, 6, ("슬라이드 19줄", "최대 6줄")),
-        ("layout.density", "layout.density:2:chars", 358, 300, ("슬라이드 358자", "최대 300자")),
+        ("layout.density", "layout.density:2:lines", 19, 6, ("슬라이드 전체 19줄", "권장 6줄 이하")),
+        ("layout.density", "layout.density:2:chars", 358, 300, ("슬라이드 전체 358자", "권장 300자 이하")),
         ("layout.margin", "layout.margin:1:4", 10.0, 36.0, ("10pt", "여백 36pt 이상")),
     ],
 )
@@ -449,15 +449,15 @@ def test_idle_user_means_no_more_powerpoint_queries(controller, application):
     assert len(probes) == 2  # 처음 강제로 한 번 + 아직 보지 못한 입력 한 번, 그 뒤로는 묻지 않음
 
 
-def test_badge_shows_the_most_important_problem_not_the_margin(tmp_path):
-    """같은 '검토' 등급이면 정보 과다가 여백보다 먼저 (자바게티 22쪽: 배지에 여백만 보이던 문제)."""
+def test_density_has_a_separate_slide_wide_badge(tmp_path):
     report = _report(tmp_path / "d.pptx")
     report.findings += [
         _finding("layout.margin:1:9", "layout.margin", "1:9", "review", 4.4, 40.5),
         _finding("layout.density:1:lines", "layout.density", "1:9", "review", 9, 6),
     ]
-    mark = {m.key: m for m in build_marks(report, 1)}["1:9"]
-    assert mark.title == "정보 밀도" and mark.more == 1
+    marks = {m.key: m for m in build_marks(report, 1)}
+    assert marks["1:9"].title == "여백" and marks["1:9"].more == 0
+    assert marks["1:density"].title == "정보 밀도" and marks["1:density"].more == 0
 
 
 def test_slide_wide_density_does_not_hide_the_box_own_problem():
@@ -470,8 +470,9 @@ def test_slide_wide_density_does_not_hide_the_box_own_problem():
         ),
         (),
     )
-    [mark] = build_marks(report, 2)
-    assert mark.title == "명암비" and mark.more == 1
+    marks = {m.key: m for m in build_marks(report, 2)}
+    assert marks["2:7"].title == "명암비" and marks["2:7"].more == 0
+    assert marks["2:density"].title == "정보 밀도"
 
 
 def test_fill_change_reads_as_color_not_a_dict():

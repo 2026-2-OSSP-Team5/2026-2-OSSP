@@ -1,5 +1,6 @@
 """Overlap requires review and does not prove unintended placement."""
 
+import re
 from collections import defaultdict
 from itertools import combinations
 
@@ -36,7 +37,7 @@ class LayoutRule:
             slide_shapes = sorted(by_slide[slide_number], key=lambda s: s.shape_id)
             findings.extend(_check_overlap(slide_shapes))
             findings.extend(_check_card_off_slide(deck, slide_shapes))
-            findings.extend(_check_density(slide_number, slide_shapes, policy.density_limits))
+            findings.extend(_check_density(slide_number, slide_shapes, policy.density_limits, deck.height_pt))
         return findings
 
 
@@ -374,7 +375,7 @@ def _visible(line: str) -> bool:
     return bool(line.translate(_INVISIBLE).strip())
 
 
-def _counts_for_density(shape: Shape) -> bool:
+def _counts_for_density(shape: Shape, slide_height: float | None = None) -> bool:
     """청중이 '읽을 내용'으로 세는 글인지 (함정 PPT 3쪽: 그래프 축 눈금 12개가 12줄로 잡힘)."""
     if shape.locator is not None and shape.locator.kind not in _DENSITY_KINDS:
         return False
@@ -382,6 +383,16 @@ def _counts_for_density(shape: Shape) -> bool:
         return False
     # '01', '02.' 같은 번호 표시는 읽을 내용이 아니라 장식 (함정 PPT 각 쪽 왼쪽 위 번호)
     label = "".join(_text_of(shape).translate(_INVISIBLE).split())
+    page = re.fullmatch(r"(\d{1,4})/(\d{1,4})", label)
+    if (
+        page
+        and int(page[1]) == shape.slide_number
+        and int(page[2]) >= shape.slide_number
+        and slide_height
+        and shape.box
+        and (shape.box.y <= slide_height * 0.15 or shape.box.y >= slide_height * 0.85)
+    ):
+        return False
     return not (len(label) <= 3 and all(ch.isdigit() or ch in ".-#()" for ch in label))
 
 
@@ -406,8 +417,10 @@ def _density_severity(count: int, limit: int) -> Severity:
     return "warning" if count >= limit * DENSITY_WARNING_FACTOR else "review"
 
 
-def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThreshold) -> list[Finding]:
-    text_shapes = [s for s in shapes if _has_text(s) and _counts_for_density(s)]
+def _check_density(
+    slide_number: int, shapes: list[Shape], limits: DensityThreshold, slide_height: float | None = None
+) -> list[Finding]:
+    text_shapes = [s for s in shapes if _has_text(s) and _counts_for_density(s, slide_height)]
     if not text_shapes:
         return []
     chars_by_shape = {s.key: len("".join(_text_of(s).translate(_INVISIBLE).split())) for s in text_shapes}
@@ -416,6 +429,17 @@ def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThresh
     total_lines = sum(count for count, _ in counts)
     rendered_used = any(rendered for _, rendered in counts)
     heaviest = max(text_shapes, key=lambda s: chars_by_shape[s.key])  # 화면에서 가리킬 대표 도형
+    boxes = [box for s in text_shapes if (box := _effective_box(s)) is not None]
+    bounds = None
+    if boxes:
+        left, top = min(b.x for b in boxes), min(b.y for b in boxes)
+        bounds = Box(
+            left,
+            top,
+            max(b.x + b.width for b in boxes) - left,
+            max(b.y + b.height for b in boxes) - top,
+        )
+    breakdown = " · ".join(f"{s.name}: {count}줄" for s, (count, _) in zip(text_shapes, counts, strict=True))
 
     findings: list[Finding] = []
     if total_chars > limits.max_chars:
@@ -430,6 +454,7 @@ def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThresh
                 limits.max_chars,
                 f"슬라이드 {slide_number}: 공백 제외 {total_chars}자 > 기준 {limits.max_chars}자 "
                 f"(도형 {len(text_shapes)}개 합계)",
+                box=bounds,
             )
         )
     if total_lines > limits.max_lines:
@@ -444,7 +469,8 @@ def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThresh
                 limits.max_lines,
                 f"슬라이드 {slide_number}: {total_lines}줄 > 기준 {limits.max_lines}줄 "
                 f"(도형 {len(text_shapes)}개 합계, "
-                f"{'자동 줄바꿈 반영' if rendered_used else '원문 개행 기준'})",
+                f"{'자동 줄바꿈 반영' if rendered_used else '원문 개행 기준'}). {breakdown}",
+                box=bounds,
             )
         )
     return findings
