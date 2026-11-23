@@ -772,6 +772,7 @@ class OverlayWidget(QWidget):
     slide_requested = Signal(object)
     lock_requested = Signal(str)
     preview_state_changed = Signal()
+    geometry_changed = Signal()
     lens_toggled = Signal(bool)
     # 수정 후보 목록에서 사용자가 직접 체크/해제함: (같은 묶음 후보 ID들, 체크 여부)
     proposal_user_toggled = Signal(object, bool)
@@ -1154,6 +1155,22 @@ class OverlayWidget(QWidget):
             geometry = QRect(left, top, width, height)
             if self.geometry() != geometry:
                 self.setGeometry(geometry)
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self.geometry_changed.emit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.geometry_changed.emit()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.geometry_changed.emit()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.geometry_changed.emit()
 
     def show_progress(self, progress):
         self.status_label.setText(progress_text(progress))
@@ -1880,6 +1897,7 @@ class OverlayController(QObject):
         self.overlay.lock_requested.connect(self.show_settings)
         self.overlay.preview_state_changed.connect(self.schedule_preview)
         self.overlay.preview_state_changed.connect(self._redraw_lens)
+        self.overlay.geometry_changed.connect(self._sync_lens_exclusions)
         self.overlay.lens_toggled.connect(self.set_lens_enabled)
         self.overlay.proposal_user_toggled.connect(self._panel_proposal_toggled)
         self.settings_dialog.settings_saved.connect(self.restart_collection)
@@ -2664,6 +2682,7 @@ class OverlayController(QObject):
             probe.deleteLater()
 
     def _redraw_lens(self):
+        self._sync_lens_exclusions()
         target, view, report = self._lens_target, self._lens_view, self._lens_report()
         if (
             not self.lens_enabled
@@ -2691,14 +2710,26 @@ class OverlayController(QObject):
             self.overlay.selected_proposal_ids(),
             applied_ids=self.live_editor.applied_ids,
             locate=finding_location_box,
+            skip_reasons=self.overlay._skip_reasons,
         )
-        self.lens.set_scene(client, slide_rect, view.slide_size_pt, marks)
+        self.lens.set_scene(
+            client,
+            slide_rect,
+            view.slide_size_pt,
+            marks,
+            scene_key=(str(Path(report.deck.source_path).resolve()).casefold(), view.slide),
+        )
         if not self.lens.isVisible():
             self.lens.show()
         _raise_over_powerpoint(self.lens, target)  # PowerPoint 바로 위, SlideGuard 패널 아래
         for handle in self.lens.handles.values():
             if handle.isVisible():
                 _raise_over_powerpoint(handle, target)
+
+    def _sync_lens_exclusions(self):
+        toolbar = self.overlay
+        rectangles = (toolbar.geometry(),) if toolbar.isVisible() and not toolbar.collapsed else ()
+        self.lens.set_excluded_rects(rectangles)
 
     def _hide_lens(self):
         if self.lens.isVisible():
