@@ -196,7 +196,7 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
         settings.strength.setCurrentIndex(settings.strength.findData("strong"))
         settings.slides_edit.setText("1-2")
         settings.property_locks["font_color"].setChecked(True)
-        settings.shape_locks_edit.setText(f"2:{locked_id}")
+        settings.locked_objects.set_keys({f"2:{locked_id}"})
         settings.threshold_fields["minimum_font"].setText("15")
         settings.threshold_fields["recommended_font"].setText("15")
         settings.save()

@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QTableWidget,
@@ -63,6 +64,7 @@ from slideguard.domain.policy import (
 )
 from slideguard.planning.bindings import TeamBindings, is_recommended
 from slideguard.ui.analysis_tasks import progress_text
+from slideguard.ui.object_locks import ObjectLocksEditor
 from slideguard.ui.preview import render_slide_previews
 from slideguard.ui.slide_lens import InputActivity, SlideLens, SlideView, SlideViewProbe, build_marks
 
@@ -1519,9 +1521,15 @@ class SettingsDialog(QDialog):
         startup_hint.setWordWrap(True)
         layout.addWidget(startup_hint)
 
-        policy_page = QWidget()
+        policy_page = QWidget(objectName="policyPage")
         self.tabs = tabs
-        tabs.addTab(policy_page, "검사 기준·수정 범위")
+        policy_scroll = QScrollArea()
+        policy_scroll.setObjectName("policyScroll")
+        self.policy_scroll = policy_scroll
+        policy_scroll.setWidgetResizable(True)
+        policy_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        policy_scroll.setWidget(policy_page)
+        tabs.addTab(policy_scroll, "검사 기준·수정 범위")
         policy_form = QFormLayout(policy_page)
         self.purpose = QComboBox()
         self.purpose.addItem("발표용", Purpose.PRESENTATION.value)
@@ -1550,6 +1558,8 @@ class SettingsDialog(QDialog):
         self.font_goal.addItem("최소 크기까지", FontGoal.MINIMUM.value)
         self.font_goal.addItem("권장 크기까지", FontGoal.RECOMMENDED.value)
         policy_form.addRow("글자 크기 수정 목표", self.font_goal)
+        self.line_spacing_edit = QLineEdit(placeholderText="기본 1.2 · 1~3 사이")
+        policy_form.addRow("권장 줄 간격 (배)", self.line_spacing_edit)
         self.slides_edit = QLineEdit(placeholderText="비우면 전체 · 예 1, 3-5")
         policy_form.addRow("검사 슬라이드", self.slides_edit)
         locks = QHBoxLayout()
@@ -1567,8 +1577,8 @@ class SettingsDialog(QDialog):
         policy_form.addRow("고정할 속성", locks)
         self.document_label = QLabel()
         self.document_label.setWordWrap(True)
-        self.shape_locks_edit = QLineEdit(placeholderText="예 1:2, 3:4 · 결과에서 객체를 선택해 추가")
-        policy_form.addRow("고정할 객체", self.shape_locks_edit)
+        self.locked_objects = ObjectLocksEditor()
+        policy_form.addRow("고정할 객체", self.locked_objects)
         policy_form.addRow("", self.document_label)
 
         threshold_page = QWidget()
@@ -1628,6 +1638,9 @@ class SettingsDialog(QDialog):
             "" if policy.fix.contrast_ratio is None else f"{policy.fix.contrast_ratio:g}"
         )
         self.font_goal.setCurrentIndex(self.font_goal.findData(policy.fix.font_goal.value))
+        self.line_spacing_edit.setText(
+            "" if policy.fix.line_spacing is None else f"{policy.fix.line_spacing:g}"
+        )
         self._update_contrast_goal()
         self.slides_edit.setText(", ".join(map(str, policy.slides)))
         for key, checkbox in self.property_locks.items():
@@ -1635,7 +1648,6 @@ class SettingsDialog(QDialog):
         for key, editor in self.threshold_fields.items():
             value = getattr(policy.thresholds, key)
             editor.setText("" if value is None else str(value))
-        self.shape_locks_edit.setEnabled(self.document is not None)
         self.document_label.setText(
             f"{self.document.name}에만 적용"
             if self.document is not None
@@ -1645,7 +1657,9 @@ class SettingsDialog(QDialog):
         if lock_shape is not None and self.document is not None:
             keys.add(lock_shape)
             self.tabs.setCurrentIndex(1)
-        self.shape_locks_edit.setText(", ".join(sorted(keys)))
+        self.locked_objects.set_document(self.document, keys)
+        if lock_shape is not None:
+            QTimer.singleShot(0, lambda: self.policy_scroll.ensureWidgetVisible(self.locked_objects))
         self._update_threshold_placeholders()
         self.refresh_files()
 
@@ -1681,7 +1695,12 @@ class SettingsDialog(QDialog):
             except ValueError:
                 raise ValueError("명암비 수정 목표를 숫자로 입력하세요 (예 6).") from None
         return FixTargets(
-            contrast_goal=goal, contrast_ratio=ratio, font_goal=FontGoal(self.font_goal.currentData())
+            contrast_goal=goal,
+            contrast_ratio=ratio,
+            font_goal=FontGoal(self.font_goal.currentData()),
+            line_spacing=float(self.line_spacing_edit.text())
+            if self.line_spacing_edit.text().strip()
+            else None,
         )
 
     def refresh_files(self):
@@ -1700,11 +1719,7 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "설정 저장 실패", "접근 가능한 작업 폴더를 선택하세요.")
             return
         try:
-            shapes = frozenset(
-                part.strip() for part in self.shape_locks_edit.text().split(",") if part.strip()
-            )
-            if any(re.fullmatch(r"[1-9]\d*:[1-9]\d*", key) is None for key in shapes):
-                raise ValueError("고정할 객체는 슬라이드 번호:객체 ID 형식으로 입력하세요.")
+            shapes = self.locked_objects.keys
             overrides = {}
             for key, editor in self.threshold_fields.items():
                 raw = editor.text().strip()
