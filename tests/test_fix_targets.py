@@ -182,7 +182,6 @@ def _variant_report(path):
 
 
 def test_panel_offers_minimum_and_recommended_and_keeps_one_per_target(application, tmp_path):
-    from PySide6.QtCore import Qt
 
     from slideguard.ui import overlay
 
@@ -194,16 +193,20 @@ def test_panel_offers_minimum_and_recommended_and_keeps_one_per_target(applicati
         assert sum("최소 수정" in label for label in labels) == 2
         assert sum("권장 수정" in label for label in labels) == 2
 
-        widget._apply_all_proposals(recommended=True)  # 권장 수정 전체
+        requests = []
+        widget.apply_requested.connect(lambda: requests.append(set(widget.selected_proposal_ids())))
+        widget.apply_all_recommended_button.click()
         assert set(widget.selected_proposal_ids()) == {"font.color@1:5~rec", "font.color@1:5~rec~BFBFBF"}
+        assert requests == [{"font.color@1:5~rec", "font.color@1:5~rec~BFBFBF"}]
         assert (
             overlay._selection_conflicts(report, [p for p in report.proposals if is_recommended(p.id)]) == []
         )
 
-        widget.proposal_items["font.color@1:5"].setCheckState(Qt.CheckState.Checked)  # 한 줄만 최소로 바꿈
+        widget.proposal_items["font.color@1:5"].setSelected(True)  # 한 줄만 최소로 바꿈
         assert set(widget.selected_proposal_ids()) == {"font.color@1:5", "font.color@1:5~rec~BFBFBF"}
 
-        widget._apply_all_proposals(recommended=False)  # 최소 수정 전체
+        widget.apply_all_button.click()
         assert set(widget.selected_proposal_ids()) == {"font.color@1:5", "font.color@1:5~BFBFBF"}
+        assert requests[-1] == {"font.color@1:5", "font.color@1:5~BFBFBF"}
     finally:
         widget.close()

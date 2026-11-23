@@ -50,12 +50,13 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
     first_copy = tmp_path / "one.pptx"
     all_copy = tmp_path / "all.pptx"
     deck = Presentation()
-    title_slide = deck.slides.add_slide(deck.slide_layouts[1])
-    _set_run(title_slide.shapes.title, "Same size heading", 20)
-    _set_run(title_slide.placeholders[1], "Same size body", 20)
+    deck.slides.add_slide(deck.slide_layouts[6])
     slide = deck.slides.add_slide(deck.slide_layouts[6])
     small_id = _add_text(slide.shapes, "Small first text", 2.0, 10)
     locked_id = _add_text(slide.shapes, "Small locked text", 3.0, 11)
+    title_slide = deck.slides.add_slide(deck.slide_layouts[1])
+    _set_run(title_slide.shapes.title, "Same size heading", 20)
+    _set_run(title_slide.placeholders[1], "Same size body", 20)
     ignored = deck.slides.add_slide(deck.slide_layouts[6])
     _add_text(ignored.shapes, "Out of scope", 2.0, 9)
     deck.save(source)
@@ -194,14 +195,14 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
         settings.folder_edit.setText(str(workspace))
         settings.recursive.setChecked(True)
         settings.strength.setCurrentIndex(settings.strength.findData("strong"))
-        settings.slides_edit.setText("1-2")
+        settings.slides_edit.setText("1-3")
         settings.property_locks["font_color"].setChecked(True)
         settings.locked_objects.set_keys({f"2:{locked_id}"})
         settings.threshold_fields["minimum_font"].setText("15")
         settings.threshold_fields["recommended_font"].setText("15")
         settings.save()
         policy = build_analysis_policy(source)
-        assert policy.slides == (1, 2) and policy.strength == "strong"
+        assert policy.slides == (1, 2, 3) and policy.strength == "strong"
         assert policy.locked_properties == {"font_color"} and policy.locked_shapes == {f"2:{locked_id}"}
         assert not build_analysis_policy(first_copy).locked_shapes
         wait_for(report_for_saved_source, "initial analysis of previously unchecked nested file")
@@ -215,7 +216,7 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
         assert window.proposal_table.rowCount() == 2
         assert any(f.id.endswith(":hierarchy") for f in baseline.findings)
         assert any(f.shape_key == f"2:{locked_id}" for f in baseline.findings)
-        assert all(not f.shape_key.startswith("3:") for f in baseline.findings)
+        assert all(not f.shape_key.startswith("4:") for f in baseline.findings)
         assert all(p.shape_key != f"2:{locked_id}" for p in baseline.proposals)
         proposal = next(p for p in baseline.proposals if p.shape_key == f"2:{small_id}")
         assert proposal.after == 15
@@ -227,17 +228,18 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
         QTest.mouseClick(
             table.viewport(), Qt.MouseButton.LeftButton, pos=table.visualItemRect(table.item(row, 0)).center()
         )
-        assert active_document().Windows.Item(1).View.Slide.SlideIndex == 1
+        assert active_document().Windows.Item(1).View.Slide.SlideIndex == 3
         assert not widget.collapsed
         active_document().Windows.Item(1).View.GotoSlide(2)
         widget.locate_button.click()
-        assert active_document().Windows.Item(1).View.Slide.SlideIndex == 1
+        assert active_document().Windows.Item(1).View.Slide.SlideIndex == 3
         assert controller.outline.isVisible() and widget.collapsed, widget.location_label.text()
         assert widget._target.rect.contains(controller.outline.geometry().center())
 
         for _ in range(6):
             QTest.mouseClick(shield, Qt.MouseButton.LeftButton, pos=shield.rect().center())
             assert not widget.collapsed
+            widget.clear_proposals()
             widget.select_warning_button.click()
             assert widget.select_warning_button.property("selected") is True
             wait_for(
@@ -252,8 +254,9 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
             assert widget.collapsed and controller.outline.isVisible(), widget.location_label.text()
 
         widget.shield_button.click()
-        widget.proposals_list.setCurrentItem(widget.proposal_items[proposal.id])
-        widget.apply_one_button.click()
+        widget.clear_proposals()
+        widget.set_proposals_checked((proposal.id,), True)
+        widget.apply_button.click()
         wait_for(
             lambda: (
                 controller._last_copy_outcome is not None
@@ -283,7 +286,7 @@ def test_desktop_settings_save_locate_apply_recheck_and_history(
         assert _sizes(all_copy) == [15, 11] and source.read_bytes() == original
         assert report_for(first_copy) and report_for(all_copy)
 
-        widget.apply_original_button.click()
+        controller.apply_selected_to_original()
         wait_for(
             lambda: (
                 controller._apply_thread is None

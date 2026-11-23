@@ -64,6 +64,39 @@ def test_split_request_only_attempts_selected_slide_and_preserves_other_notes(tm
     assert report.findings[2].id not in report.proposal_notes
 
 
+def test_toolbar_progress_drag_and_fixes_are_explicit(tmp_path):
+    from PySide6.QtCore import QPoint, QRect
+    from PySide6.QtWidgets import QApplication
+
+    from slideguard.application.ports import AnalysisProgress
+    from slideguard.ui.overlay import PANEL_HEIGHT, PANEL_SIDE_PADDING, OverlayWidget, PowerPointWindow
+    from tests.test_overlay import _proposal_report
+
+    app = QApplication.instance() or QApplication([])
+    widget = OverlayWidget()
+    calls = []
+    widget.fixes_requested.connect(calls.append)
+    try:
+        widget.set_target(PowerPointWindow(0, QRect(0, 0, 1440, 900), "deck.pptx"))
+        widget.set_collapsed(False)
+        widget.show_report(_proposal_report(tmp_path / "deck.pptx", "hash"))
+        app.processEvents()
+        assert calls == []
+        widget.view_fixes_button.click()
+        assert calls == [widget._finding]
+        assert widget.height() <= PANEL_HEIGHT
+        widget._move_panel(QPoint(50, 240))
+        assert widget.pos() == QPoint(50, 240)
+        widget._move_panel(QPoint(10000, -10000))
+        assert widget.geometry().right() <= 1439 - PANEL_SIDE_PADDING
+        assert widget.geometry().top() >= 32
+        widget.show_progress(AnalysisProgress(tmp_path / "deck.pptx", "read:2", 2, 10, 1))
+        assert widget.progress_bar.maximum() == 10 and widget.progress_bar.value() == 2
+        assert "2/10" in widget.status_label.text()
+    finally:
+        widget.close()
+
+
 def deck_file(path, count=3):
     deck = Presentation()
     for number in range(count):

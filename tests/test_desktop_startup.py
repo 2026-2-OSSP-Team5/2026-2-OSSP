@@ -98,7 +98,9 @@ def test_local_activation_opens_existing_window(tmp_path):
 def test_management_window_can_close_while_resident_continues(monkeypatch):
     from PySide6.QtGui import QCloseEvent
 
-    window = SimpleNamespace(worker=None, keep_running_on_close=True, hide=lambda: hidden.append(True))
+    window = SimpleNamespace(
+        worker=None, _split_worker=None, keep_running_on_close=True, hide=lambda: hidden.append(True)
+    )
     hidden = []
     event = QCloseEvent()
     desktop.MainWindow.closeEvent(window, event)

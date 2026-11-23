@@ -1,11 +1,13 @@
 from dataclasses import replace
 
 import pytest
+from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QTextDocument
 from PySide6.QtWidgets import QApplication
 
-from slideguard.domain.models import ChangeProposal, Finding
+from slideguard.domain.models import AnalysisReport, ChangeProposal, DeckSnapshot, Finding
 from slideguard.ui.finding_details import describe_finding
+from slideguard.ui.overlay import OverlayWidget, PowerPointWindow
 from slideguard.ui.user_text import change_text, friendly_error, friendly_reason
 
 
@@ -66,6 +68,44 @@ def test_alignment_code_and_unknown_values_are_not_shown_as_readability_scores()
     assert not unknown.measurements
     assert "확인하지 못했습니다" in unknown.title
     assert "None" not in unknown.html()
+
+
+def test_readability_table_fits_every_column_with_vertical_scrollbar(application):
+    widget = OverlayWidget()
+    try:
+        widget.set_target(PowerPointWindow(1, QRect(0, 0, 1440, 900), "test.pptx - PowerPoint"))
+        widget.set_collapsed(False)
+        deck = DeckSnapshot("test.pptx", "hash", 30, 960, 540)
+        widget.show_report(AnalysisReport(deck, findings=[_sample()] * 40))
+        table = widget.findings_table
+        for width in (190, 220, 300, 420):
+            table.setFixedWidth(width)
+            application.processEvents()
+            assert table.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            assert table.horizontalScrollBar().maximum() == 0
+            assert abs(table.horizontalHeader().length() - table.viewport().width()) <= 1
+            for column in range(3):
+                label = table.horizontalHeaderItem(column).text()
+                assert table.columnWidth(column) >= table.fontMetrics().horizontalAdvance(label) + 12
+            assert table.verticalScrollBar().maximum() > 0
+    finally:
+        widget.close()
+
+
+def test_measurement_details_keep_original_evidence_available(application):
+    widget = OverlayWidget()
+    try:
+        widget.show_report(
+            AnalysisReport(DeckSnapshot("test.pptx", "hash", 3, 960, 540), findings=[_sample()])
+        )
+        assert "#FF0000" not in widget.detail_evidence.text()
+        widget.detail_evidence.linkActivated.emit("measurement-details")
+        dialog = widget._measurement_dialog
+        assert dialog.evidence.isReadOnly()
+        assert _sample().evidence in dialog.evidence.toPlainText()
+        dialog.close()
+    finally:
+        widget.close()
 
 
 def test_proposals_describe_direction_and_colors_instead_of_coordinates_and_codes():

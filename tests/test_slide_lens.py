@@ -295,6 +295,34 @@ def test_toolbar_area_stays_clear_when_lens_is_redrawn(controller, application):
     )
 
 
+def test_moving_and_collapsing_toolbar_updates_badge_hit_areas(controller, application):
+    from PySide6.QtCore import QPoint
+
+    assert _poll_until_lens(controller, application, 1)
+    controller.timer.stop()
+    handle = controller.lens.handles["1:2"]
+    anchor = QRect(handle.anchor)
+    toolbar = controller.overlay
+    toolbar.set_collapsed(False)
+    controller.preview_timer.stop()
+    toolbar._move_panel(QPoint(16, anchor.top() - 10))
+    application.processEvents()
+    assert toolbar.geometry().contains(handle.geometry())
+    assert handle.occluded and not handle.isVisible()
+    assert controller.lens.isVisible()
+
+    toolbar._move_panel(QPoint(16, anchor.bottom() + 30))
+    application.processEvents()
+    assert not handle.occluded and handle.isVisible()
+    toolbar._move_panel(QPoint(16, anchor.top() - 10))
+    application.processEvents()
+    assert handle.occluded
+    toolbar.set_collapsed(True)
+    controller.preview_timer.stop()
+    application.processEvents()
+    assert not handle.occluded and handle.isVisible() and handle.mask().isEmpty()
+
+
 def test_expanded_badge_cannot_paint_or_intercept_toolbar_area(application, tmp_path):
     from PySide6.QtCore import QPoint
 
@@ -365,7 +393,7 @@ def test_native_badge_hit_testing_leaves_toolbar_clickable(application, tmp_path
 
 def test_selecting_a_proposal_shows_the_change_on_the_slide(controller, application):
     assert _poll_until_lens(controller, application, 1)
-    controller.overlay.proposal_items["font.size@1:2"].setCheckState(overlay.Qt.CheckState.Checked)
+    controller.overlay.proposal_items["font.size@1:2"].setSelected(True)
     application.processEvents()
     mark = {mark.key: mark for mark in controller.lens.marks}["1:2"]
     assert (mark.kind, mark.title, mark.before, mark.after, mark.applied) == (
@@ -797,11 +825,11 @@ def test_panel_checkbox_goes_to_the_slide_and_applies_to_the_open_document(contr
     controller.live_editor = Editor()
     controller.slide_navigator = lambda path, slide: moved.append(slide) or True
     item = controller.overlay.proposal_items["font.size@1:2"]
-    item.setCheckState(Qt.CheckState.Checked)
+    item.setSelected(True)
     assert _wait_for(lambda: calls == [("apply", ("font.size@1:2",))], application)
     assert moved == [1]
     assert _wait_for(lambda: controller._live_task is None, application)
-    item.setCheckState(Qt.CheckState.Unchecked)
+    item.setSelected(False)
     assert _wait_for(lambda: calls[-1] == ("revert", ("font.size@1:2",)), application)
     assert moved == [1]  # 해제할 때는 이동하지 않음
 
