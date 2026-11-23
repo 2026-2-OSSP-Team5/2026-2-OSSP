@@ -518,6 +518,9 @@ def test_reader_session_integration_returns_plain_measurements_and_cleans_up(tmp
             "transparency": 0.0,
             "fill_kind": "solid",
             "fill_visible": True,
+            "font_family": None,
+            "italic": None,
+            "underline": None,
         }
     assert source.read_bytes() == original
     assert events == ["initialize", "close", "uninitialize"]

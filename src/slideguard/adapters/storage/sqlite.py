@@ -367,6 +367,7 @@ def _text_span(data: dict) -> TextSpan:
         index=data["index"],
         text=data["text"],
         box=_box(data.get("box")),
+        properties=_properties(data.get("properties")),
     )
 
 
@@ -402,6 +403,9 @@ def _report_from_json(payload: str) -> AnalysisReport:
                         transparency=run.get("transparency"),
                         fill_kind=run.get("fill_kind"),
                         fill_visible=run.get("fill_visible"),
+                        font_family=run.get("font_family"),
+                        italic=run.get("italic"),
+                        underline=run.get("underline"),
                     )
                     for run in shape_data.get("runs", [])
                 ),

@@ -19,6 +19,7 @@ from slideguard.application.ports import (
 )
 from slideguard.checks.contrast import ContrastRule
 from slideguard.checks.layout import LayoutRule
+from slideguard.checks.readability import ReadabilityRule
 from slideguard.checks.typography import TypographyRule
 from slideguard.domain.policy import AnalysisPolicy
 from slideguard.planning import MinimumChangePlanner
@@ -37,7 +38,7 @@ def build_analyzer(reader: DeckReader | None = None) -> AnalyzePresentation:
     """Use the same rules for saved COM snapshots and the metadata-only CLI."""
     return AnalyzePresentation(
         reader=reader or OoxmlDeckReader(),
-        rules=(ContrastRule(), TypographyRule(), LayoutRule()),
+        rules=(ContrastRule(), TypographyRule(), LayoutRule(), ReadabilityRule()),
         planner=MinimumChangePlanner(),
         finding_filter=exempt_special_slides,  # 표지·목차·출처·마무리 슬라이드의 의미 없는 판정 제외
     )

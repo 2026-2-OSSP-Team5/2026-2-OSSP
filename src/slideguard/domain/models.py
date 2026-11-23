@@ -27,6 +27,9 @@ class TextRun:
     transparency: float | None = None
     fill_kind: str | None = None
     fill_visible: bool | None = None
+    font_family: str | None = None
+    italic: bool | None = None
+    underline: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,7 @@ class TextSpan:
     index: int
     text: str
     box: Box | None = None
+    properties: tuple[tuple[str, str | int | float | bool], ...] = ()
 
 
 @dataclass(frozen=True)
