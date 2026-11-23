@@ -45,6 +45,7 @@ from slideguard.bootstrap import (
     build_workspace_settings_repository,
     report_database_path,
 )
+from slideguard.ui.analysis_tasks import progress_text
 
 LOGGER = logging.getLogger("slideguard.desktop")
 
@@ -240,6 +241,7 @@ class AnalysisWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
     storage_failed = Signal(str)
+    progress = Signal(object)
 
     def __init__(self, path: Path, parent=None):
         super().__init__(parent)
@@ -249,7 +251,9 @@ class AnalysisWorker(QThread):
         started = monotonic()
         try:
             analyzer = build_analyzer(build_powerpoint_reader(render=True))
-            report = analyzer.execute(self.path, build_analysis_policy(self.path))
+            report = analyzer.execute(
+                self.path, build_analysis_policy(self.path), incremental=True, on_progress=self.progress.emit
+            )
         except Exception as error:
             LOGGER.exception("ANALYSIS_FAILED | file=%s", self.path.name)
             self.failed.emit(f"{type(error).__name__}: {error}")
@@ -526,7 +530,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setMaximumWidth(520)
         layout.addWidget(self.progress_bar, alignment=Qt.AlignmentFlag.AlignCenter)
-        note = QLabel("검사가 끝나면 결과가 자동으로 표시됩니다.", objectName="muted")
+        note = self.progress_stage_label = QLabel(
+            "검사가 끝나면 결과가 자동으로 표시됩니다.", objectName="muted"
+        )
         note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(note)
         layout.addStretch(3)
@@ -860,6 +866,7 @@ class MainWindow(QMainWindow):
         self.settings_button.clicked.connect(lambda: controller.show_settings(parent=self))
         controller.settings_dialog.settings_saved.connect(self._reload_workspace)
         controller.file_activity.connect(self._on_file_activity)
+        controller.progress.connect(self.show_analysis_progress)
         controller.completed.connect(self._on_collection_report)
         controller.workspace_requested.connect(self._raise_window)
         self.closing.connect(controller.request_exit)
@@ -983,6 +990,8 @@ class MainWindow(QMainWindow):
         self.selected_file = path
         LOGGER.info("DESKTOP_ANALYSIS_REQUESTED | file=%s", path.name)
         self.progress_file_label.setText(f"검사 중 · {path.name}")
+        self.progress_bar.setRange(0, 0)
+        self.progress_stage_label.setText("우선 검사 대기 중")
         self.inspection_stack.setCurrentWidget(self.progress_page)
         self.statusBar().showMessage("검사 중")
         if self.controller is not None:
@@ -999,6 +1008,7 @@ class MainWindow(QMainWindow):
         self.worker.succeeded.connect(self.show_report)
         self.worker.failed.connect(self.show_analysis_error)
         self.worker.storage_failed.connect(self.show_storage_error)
+        self.worker.progress.connect(self.show_analysis_progress)
         self.worker.finished.connect(self.finish_analysis)
         self.worker.start()
 
@@ -1113,6 +1123,14 @@ class MainWindow(QMainWindow):
         expected = _display_value(finding.expected)
         self.detail_values.setText(f"측정값   {measured}\n검사 기준   {expected}")
         self.detail_reason.setText(f"판정 이유\n{finding.evidence}")
+
+    def show_analysis_progress(self, progress):
+        if self.selected_file != progress.source_path:
+            return
+        self.progress_stage_label.setText(progress_text(progress))
+        self.progress_bar.setRange(0, progress.total if progress.total else 0)
+        if progress.total:
+            self.progress_bar.setValue(progress.completed)
 
     def show_analysis_error(self, message):
         self.error_page.description_label.setText(message)

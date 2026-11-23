@@ -139,6 +139,8 @@ class DeckSnapshot:
     shapes: tuple[Shape, ...] = ()
     limitations: tuple[str, ...] = ()
     slides: tuple[SlideDetails, ...] = ()
+    slide_fingerprints: tuple[tuple[str, str], ...] = ()
+    measurement_key: str = ""
 
 
 @dataclass(frozen=True)

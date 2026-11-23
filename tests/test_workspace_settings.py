@@ -254,6 +254,7 @@ class ControlledWorker:
         self.succeeded = FakeSignal()
         self.failed = FakeSignal()
         self.storage_failed = FakeSignal()
+        self.progress = FakeSignal()
         self.finished = FakeSignal()
         self.started = False
 

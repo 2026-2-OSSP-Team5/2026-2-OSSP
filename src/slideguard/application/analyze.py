@@ -26,9 +26,12 @@ class AnalyzePresentation:
         self.planner = planner
         self.repository = repository
 
-    def execute(self, path: Path, policy: AnalysisPolicy) -> AnalysisReport:
+    def execute(
+        self, path: Path, policy: AnalysisPolicy, *, incremental=False, on_progress=None
+    ) -> AnalysisReport:
         started = perf_counter()
-        deck = self.reader.read(path)
+        read = getattr(self.reader, "read_incremental", None) if incremental else None
+        deck = read(path, on_progress=on_progress) if read is not None else self.reader.read(path)
         read_seconds = perf_counter() - started
         report = self.analyze_snapshot(deck, policy)
         LOGGER.info(

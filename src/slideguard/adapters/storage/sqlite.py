@@ -150,6 +150,18 @@ class SqliteReportRepository:
             ).fetchone()
         return row[0] if row else None
 
+    def latest_snapshot(self, path: Path) -> DeckSnapshot | None:
+        """Reuse measurements independently of policy; never create or migrate on this read."""
+        if not self.database_path.exists():
+            return None
+        with sqlite3.connect(self.database_path.as_uri() + "?mode=ro", uri=True) as connection:
+            row = connection.execute(
+                "SELECT report_json FROM analysis_reports WHERE source_path = ? AND status = 'analyzed' "
+                "ORDER BY id DESC LIMIT 1",
+                (str(path),),
+            ).fetchone()
+        return _report_from_json(row[0]).deck if row else None
+
     def list_recent(self, limit: int = 100) -> list[StoredReport]:
         if limit < 1:
             return []
@@ -427,6 +439,8 @@ def _report_from_json(payload: str) -> AnalysisReport:
         shapes=tuple(shapes),
         limitations=tuple(deck_data.get("limitations", [])),
         slides=tuple(_slide_details(item) for item in deck_data.get("slides", [])),
+        slide_fingerprints=tuple(tuple(item) for item in deck_data.get("slide_fingerprints", [])),
+        measurement_key=deck_data.get("measurement_key", ""),
     )
     findings = [
         Finding(

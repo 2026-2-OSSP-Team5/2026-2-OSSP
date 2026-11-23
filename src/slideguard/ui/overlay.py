@@ -62,6 +62,7 @@ from slideguard.domain.policy import (
     ThresholdOverrides,
 )
 from slideguard.planning.bindings import TeamBindings, is_recommended
+from slideguard.ui.analysis_tasks import progress_text
 from slideguard.ui.preview import render_slide_previews
 from slideguard.ui.slide_lens import InputActivity, SlideLens, SlideView, SlideViewProbe, build_marks
 
@@ -1152,6 +1153,9 @@ class OverlayWidget(QWidget):
             if self.geometry() != geometry:
                 self.setGeometry(geometry)
 
+    def show_progress(self, progress):
+        self.status_label.setText(progress_text(progress))
+
     def show_detected(self, path: Path):
         self.status_label.setText(f"검사 중 · {path.name}")
         self._report_stale = True
@@ -1781,6 +1785,7 @@ class OverlayController(QObject):
     failed = Signal(str)
     collection_failed = Signal(object)
     file_activity = Signal(object, str)
+    progress = Signal(object)
     workspace_requested = Signal()
 
     def __init__(
@@ -1867,6 +1872,7 @@ class OverlayController(QObject):
         self.completed.connect(self._on_completed)
         self.collection_failed.connect(self._on_collection_failure)
         self.file_activity.connect(self._track_file_activity)
+        self.progress.connect(self._on_progress)
         self.failed.connect(self.overlay.show_failure)
 
         self.timer = QTimer(self)
@@ -1904,7 +1910,10 @@ class OverlayController(QObject):
                 on_detected=self.detected.emit,
                 on_watch_event=self._watch_event,
                 on_collecting=lambda path: self.file_activity.emit(path, "검사 중"),
+                on_progress=self.progress.emit,
             )
+            if hasattr(collection.collector, "prioritize"):
+                collection.collector.prioritize(self.active_path or self.path_provider())
             collection.start()
             self.collection = collection
             LOGGER.info(
@@ -1972,6 +1981,8 @@ class OverlayController(QObject):
         if self.active_path == path:
             return
         self.active_path = path
+        if self.collection is not None and hasattr(self.collection.collector, "prioritize"):
+            self.collection.collector.prioritize(path)
         self._original_preview_cache.clear()
         self._clear_highlight()
         self.overlay.clear_report()
@@ -2085,6 +2096,12 @@ class OverlayController(QObject):
             (monotonic() - analyzed) * 1000,
         )
         self.completed.emit(AnalysisOutcome(report, skip_reasons))
+
+    def _on_progress(self, progress):
+        if progress.stage == "yielded":
+            self.file_activity.emit(progress.source_path, "검사 대기")
+        if self.active_path is not None and _same_path(progress.source_path, self.active_path):
+            self.overlay.show_progress(progress)
 
     def _watch_event(self, event):
         if isinstance(event, FileRemoved):
