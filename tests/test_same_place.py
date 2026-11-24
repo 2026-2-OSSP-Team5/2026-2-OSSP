@@ -76,3 +76,13 @@ def test_page_number_box_height_is_batched_too():
     extended = extend_same_place(deck, [height])
     assert [p.shape_key for p in extended] == ["1:9", "2:9", "3:9"]
     assert same_place_sets(deck, extended) == [("shape.height@1:9", "shape.height@2:9", "shape.height@3:9")]
+
+
+def test_colour_fix_is_not_copied_to_other_pages():
+    """글자색은 쪽마다 배경이 달라 복사하지 않음 (쪽 번호 일괄 적용으로 멀쩡한 쪽 색까지 바뀌던 문제)."""
+    from dataclasses import replace
+
+    black = [replace(_page_number(n), runs=(TextRun(str(n), 10.0, (0, 0, 0)),)) for n in range(1, 4)]
+    deck = _deck(*black)
+    colour = ChangeProposal("font.color@1:9", "contrast:1:9", "1:9", "font.color", "000000", "A3A3A3", 0.1)
+    assert extend_same_place(deck, [colour]) == [colour]

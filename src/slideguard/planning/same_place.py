@@ -24,7 +24,10 @@ POSITION_TOLERANCE_PT = 1.0
 #   위치 이동(shape.position)은 쪽마다 planner가 겹침을 확인해 만든 후보끼리만 묶는다
 #   (다른 쪽에 후보를 새로 복사하지는 않음: 쪽마다 주변 개체가 달라 겹칠 수 있음)
 BATCH_PROPERTIES = ("font.size", "font.color", "font.bold", "shape.height", "shape.width", "shape.position")
-COPY_PROPERTIES = ("font.size", "font.color", "font.bold", "shape.height", "shape.width")
+# 다른 쪽에 후보를 '복사'해 주는 속성: 배경과 상관없는 크기 관련만.
+#   글자색·굵게는 쪽마다 뒤 배경이 달라(사진·띠 색 등) 한 쪽에서 맞는 색이 다른 쪽에서는 오히려 안 보일 수 있음
+#   → 그 쪽에서 직접 검사해 같은 수정이 나온 경우에만 일괄로 묶는다 (복사하지 않음)
+COPY_PROPERTIES = ("font.size", "shape.height", "shape.width")
 _SIZE_PROPERTIES = {"shape.height": "height", "shape.width": "width"}
 RECOMMENDED_MARK = "~rec"
 
