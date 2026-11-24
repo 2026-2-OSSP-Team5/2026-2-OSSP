@@ -53,13 +53,16 @@ from slideguard.bootstrap import (
 )
 from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Finding
 from slideguard.domain.policy import (
+    CRITICAL_X_HEIGHT_DEG,
     AnalysisPolicy,
+    Audience,
     ContrastGoal,
     FixTargets,
     FontGoal,
     Purpose,
     Strength,
     ThresholdOverrides,
+    ViewingSetup,
 )
 from slideguard.planning.bindings import TeamBindings, is_recommended
 from slideguard.ui.preview import render_slide_previews
@@ -1524,6 +1527,32 @@ class SettingsDialog(QDialog):
         self.purpose.addItem("강의용", Purpose.LECTURE.value)
         self.purpose.addItem("보고서용", Purpose.REPORT.value)
         policy_form.addRow("검사 목적", self.purpose)
+        # 청중 맞춤: 글자 크기·정보량 기준을 청중에 맞춰 조정
+        self.audience = QComboBox()
+        self.audience.addItem("일반 (대학생·직장인)", Audience.GENERAL.value)
+        self.audience.addItem("어린이 (초등학생)", Audience.CHILDREN.value)
+        self.audience.addItem("고령 청중", Audience.OLDER.value)
+        policy_form.addRow("청중", self.audience)
+        # 환경 맞춤: 화면 크기와 맨 뒷줄 거리를 넣으면 그 자리에서 보이는 크기로 최소 글자 크기를 계산
+        viewing_row = QHBoxLayout()
+        self.screen_inches_edit = QLineEdit(placeholderText="화면 대각선 인치 (예 100)")
+        self.distance_edit = QLineEdit(placeholderText="맨 뒷줄 거리 m (예 10)")
+        viewing_row.addWidget(self.screen_inches_edit)
+        viewing_row.addWidget(self.distance_edit)
+        policy_form.addRow("발표 환경", viewing_row)
+        self.viewing_hint = QLabel(objectName="muted")
+        self.viewing_hint.setWordWrap(True)
+        policy_form.addRow("", self.viewing_hint)
+        self.screen_inches_edit.textChanged.connect(self._update_viewing_hint)
+        self.distance_edit.textChanged.connect(self._update_viewing_hint)
+        extra_checks = QHBoxLayout()
+        self.color_vision_check = QCheckBox("색약 맞춤 검사")
+        self.consistency_check = QCheckBox("슬라이드 간 일관성 검사")
+        self.image_text_check = QCheckBox("그림 속 글자 검사")
+        extra_checks.addWidget(self.color_vision_check)
+        extra_checks.addWidget(self.consistency_check)
+        extra_checks.addWidget(self.image_text_check)
+        policy_form.addRow("추가 검사", extra_checks)
         self.strength = QComboBox()
         self.strength.addItem("약하게", Strength.LIGHT.value)
         self.strength.addItem("표준", Strength.STANDARD.value)
@@ -1587,6 +1616,7 @@ class SettingsDialog(QDialog):
             self.threshold_fields[key] = field
             threshold_form.addRow(label, field)
         self.purpose.currentIndexChanged.connect(self._update_threshold_placeholders)
+        self.audience.currentIndexChanged.connect(self._update_threshold_placeholders)
         self.recursive.toggled.connect(self.refresh_files)
 
         actions = QHBoxLayout()
@@ -1625,6 +1655,14 @@ class SettingsDialog(QDialog):
         )
         self.font_goal.setCurrentIndex(self.font_goal.findData(policy.fix.font_goal.value))
         self._update_contrast_goal()
+        self.audience.setCurrentIndex(self.audience.findData(policy.audience.value))
+        screen, distance = policy.viewing.screen_inches, policy.viewing.distance_m
+        self.screen_inches_edit.setText("" if screen is None else f"{screen:g}")
+        self.distance_edit.setText("" if distance is None else f"{distance:g}")
+        self.color_vision_check.setChecked(policy.color_vision)
+        self.consistency_check.setChecked(policy.consistency)
+        self.image_text_check.setChecked(policy.image_text)
+        self._update_viewing_hint()
         self.slides_edit.setText(", ".join(map(str, policy.slides)))
         for key, checkbox in self.property_locks.items():
             checkbox.setChecked(key in policy.locked_properties)
@@ -1646,7 +1684,9 @@ class SettingsDialog(QDialog):
         self.refresh_files()
 
     def _update_threshold_placeholders(self):
-        policy = AnalysisPolicy(purpose=Purpose(self.purpose.currentData()))
+        policy = AnalysisPolicy(
+            purpose=Purpose(self.purpose.currentData()), audience=Audience(self.audience.currentData())
+        )
         defaults = (
             policy.font_limits.minimum_pt,
             policy.font_limits.recommended_pt,
@@ -1658,6 +1698,38 @@ class SettingsDialog(QDialog):
         )
         for editor, value in zip(self.threshold_fields.values(), defaults, strict=True):
             editor.setPlaceholderText(f"기본 {value:g}")
+
+    def _viewing(self) -> ViewingSetup:
+        """발표 환경 입력칸 → ViewingSetup. 둘 다 비우면 쓰지 않음."""
+        values = []
+        for editor, name in ((self.screen_inches_edit, "화면 크기"), (self.distance_edit, "거리")):
+            raw = editor.text().strip()
+            if not raw:
+                values.append(None)
+                continue
+            try:
+                values.append(float(raw))
+            except ValueError:
+                raise ValueError(f"발표 환경의 {name}를 숫자로 입력하세요.") from None
+        if (values[0] is None) != (values[1] is None):
+            raise ValueError("발표 환경은 화면 크기와 거리를 둘 다 입력하거나 둘 다 비워 두세요.")
+        return ViewingSetup(*values)
+
+    def _update_viewing_hint(self, *_args):
+        """입력한 환경에서 16:9 슬라이드의 최소 글자 크기를 바로 보여 준다."""
+        try:
+            viewing = self._viewing()
+        except ValueError as error:
+            self.viewing_hint.setText(str(error))
+            return
+        if not viewing.active:
+            self.viewing_hint.setText("비워 두면 화면 크기·거리를 따지지 않습니다.")
+            return
+        size = viewing.minimum_pt(960, 540, CRITICAL_X_HEIGHT_DEG)
+        self.viewing_hint.setText(
+            f"맨 뒷줄에서 읽히려면 16:9 슬라이드 기준 최소 약 {size:g}pt "
+            "(글자 높이가 0.2° 이상으로 보이는 크기, Legge & Bigelow 2011)"
+        )
 
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(self, "작업 폴더 선택", self.folder_edit.text())
@@ -1721,6 +1793,11 @@ class SettingsDialog(QDialog):
                 locked_shapes=shapes,
                 thresholds=ThresholdOverrides(**overrides),
                 fix=self._fix_targets(),
+                audience=Audience(self.audience.currentData()),
+                viewing=self._viewing(),
+                color_vision=self.color_vision_check.isChecked(),
+                consistency=self.consistency_check.isChecked(),
+                image_text=self.image_text_check.isChecked(),
             )
             build_workspace_settings_repository().save(
                 folder.resolve(), self.recursive.isChecked(), policy=policy, document=self.document
@@ -3035,7 +3112,15 @@ def _presentation_name(title: str) -> str:
 
 def _rule_name(rule_id: str) -> str:
     root = rule_id.partition(".")[0]
-    return {"contrast": "명암비", "typography": "글자 크기", "layout": "배치"}.get(root, rule_id)
+    names = {
+        "contrast": "명암비",
+        "typography": "글자 크기",
+        "layout": "배치",
+        "color_vision": "색약",
+        "consistency": "일관성",
+        "image_text": "그림 속 글자",
+    }
+    return names.get(root, rule_id)
 
 
 def _severity(value: str) -> str:

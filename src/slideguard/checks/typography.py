@@ -8,9 +8,7 @@ from slideguard.domain.policy import (
     TITLE_BODY_RATIO,
     TITLE_PLACEHOLDERS,
     AnalysisPolicy,
-    FontSizeThreshold,
     Purpose,
-    slide_scale,
 )
 
 from .scope import target_shapes
@@ -38,7 +36,9 @@ class TypographyRule:
         for shape in shapes:
             if not _has_text(shape):
                 continue
-            for number, result in enumerate(_evaluate_shape(shape, policy, deck.height_pt), start=1):
+            for number, result in enumerate(
+                _evaluate_shape(shape, policy, deck.height_pt, deck.width_pt), start=1
+            ):
                 findings.append(self._finding(f"{self.id}:{shape.key}:{number}", shape, result))
 
         by_slide: dict[int, list[Shape]] = {}
@@ -79,7 +79,9 @@ def _unknown(message: str, evidence: str) -> _Result:
     return ("unknown", message, None, None, evidence)
 
 
-def _evaluate_shape(shape: Shape, policy: AnalysisPolicy, slide_height: float | None = None) -> list[_Result]:
+def _evaluate_shape(
+    shape: Shape, policy: AnalysisPolicy, slide_height: float | None = None, slide_width: float | None = None
+) -> list[_Result]:
     if not shape.supported:
         reason = "; ".join(shape.notes) or "지원하지 않는 객체 유형"
         return [_unknown("이 객체는 글자 크기를 판정할 수 없습니다", reason)]
@@ -87,12 +89,12 @@ def _evaluate_shape(shape: Shape, policy: AnalysisPolicy, slide_height: float | 
     if not runs:
         return [_unknown("글자 크기 정보가 없어 판정할 수 없습니다", "텍스트 런(run) 정보 없음")]
 
-    base = policy.font_limits
-    scale = slide_scale(slide_height)
-    threshold = FontSizeThreshold(round(base.recommended_pt * scale, 1), round(base.minimum_pt * scale, 1))
+    # 용도·청중·슬라이드 크기·발표 환경(화면 크기·거리)을 모두 반영한 기준 (policy.slide_font_limits)
+    width = slide_width or (slide_height * 16 / 9 if slide_height else None)
+    threshold, notes = policy.slide_font_limits(width, slide_height)
     label = _PURPOSE_LABEL[policy.purpose]
-    if scale > 1.0:  # 큰 슬라이드: 기준도 같은 비율로 (근거를 함께 남김)
-        label = f"{label}, 슬라이드가 기본보다 {scale:g}배 커서 기준도 ×{scale:g}"
+    if notes:  # 기준을 바꾼 이유를 근거에 함께 남김
+        label = f"{label}, {notes}"
     results: list[_Result] = []
     unknown_reported = False
     seen_sizes: set[float] = set()

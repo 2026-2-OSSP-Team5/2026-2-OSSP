@@ -36,6 +36,8 @@ SEVERITY_ORDER = {"warning": 0, "review": 1, "unknown": 2}
 RULE_ORDER = (
     "layout.overflow",
     "contrast",
+    "color_vision",
+    "image_text",
     "typography",
     "layout.density",
     "layout.overlap",
@@ -56,7 +58,7 @@ def finding_rank(finding: Finding) -> tuple[int, int, int]:
 
 
 # 상자의 글 자체를 읽기 어렵게 하는 판정
-READING_RULES = ("layout.overflow", "contrast", "typography", "layout.overlap")
+READING_RULES = ("layout.overflow", "contrast", "color_vision", "image_text", "typography", "layout.overlap")
 
 
 def _rule_group(finding: Finding) -> str:
@@ -95,6 +97,12 @@ RULE_TITLES = {
     "layout.overlap": "겹침",
     "layout.margin": "여백",
     "layout.density": "정보 밀도",
+    "color_vision.contrast": "색약 명암비",
+    "color_vision.color_only": "색만으로 강조",
+    "consistency.title_position": "제목 위치",
+    "consistency.title_size": "제목 크기",
+    "consistency.body_size": "본문 크기",
+    "image_text": "그림 속 글자",
 }
 PROPERTY_TITLES = {
     "font.size": "글자 크기",
@@ -343,6 +351,16 @@ def metric_text(finding: Finding) -> tuple[str, str]:
         return (f"{measured:g}pt" if number else "가장자리"), (f"여백 {expected:g}pt 이상" if limit else "")
     if rule == "layout.overlap":
         return "겹침", ""
+    if rule.startswith("color_vision.contrast") and number:
+        return f"{measured:.1f}:1", f"최소 {expected:g}:1" if limit else ""
+    if rule == "color_vision.color_only":
+        return "구분 어려움", ""
+    if rule == "consistency.title_position":
+        return "위치 다름", ""
+    if rule.startswith("consistency.") and number:
+        return f"{measured:g}pt", f"다른 쪽 {expected:g}pt" if limit else ""
+    if rule.startswith("image_text") and number:
+        return f"약 {measured:g}pt", f"최소 {expected:g}pt" if limit else ""
     if rule == "layout.density" and number:
         unit = "자" if finding.id.endswith(":chars") else "줄"
         # 슬라이드 전체 값임을 밝힌다 (이 상자 하나가 14줄인 것으로 오해하지 않게)

@@ -22,7 +22,15 @@ from slideguard.domain.models import (
     TextRun,
     TextSpan,
 )
-from slideguard.domain.policy import AnalysisPolicy, FixTargets, Purpose, Strength, ThresholdOverrides
+from slideguard.domain.policy import (
+    AnalysisPolicy,
+    Audience,
+    FixTargets,
+    Purpose,
+    Strength,
+    ThresholdOverrides,
+    ViewingSetup,
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,11 @@ class WorkspaceSettings:
             locked_shapes=self._locked_shapes(document),
             thresholds=ThresholdOverrides(**options.get("thresholds", {})),
             fix=FixTargets(**options.get("fix", {})),
+            audience=Audience(options.get("audience", "general")),
+            viewing=ViewingSetup(**options.get("viewing", {})),
+            color_vision=bool(options.get("color_vision", True)),
+            consistency=bool(options.get("consistency", True)),
+            image_text=bool(options.get("image_text", True)),
         )
 
     def _locked_shapes(self, document: Path | None) -> frozenset[str]:
@@ -232,6 +245,11 @@ class SqliteWorkspaceSettingsRepository:
                             key: str(value) if hasattr(value, "value") else value
                             for key, value in asdict(policy.fix).items()
                         },
+                        "audience": policy.audience.value,
+                        "viewing": asdict(policy.viewing),
+                        "color_vision": policy.color_vision,
+                        "consistency": policy.consistency,
+                        "image_text": policy.image_text,
                     },
                 )
             elif purpose is not None:

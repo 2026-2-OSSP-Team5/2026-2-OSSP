@@ -17,7 +17,10 @@ from slideguard.application.ports import (
     SnapshotCallback,
     SuccessfulAnalysisHashes,
 )
+from slideguard.checks.color_vision import ColorVisionRule
+from slideguard.checks.consistency import ConsistencyRule
 from slideguard.checks.contrast import ContrastRule
+from slideguard.checks.image_text import ImageTextRule
 from slideguard.checks.layout import LayoutRule
 from slideguard.checks.typography import TypographyRule
 from slideguard.domain.policy import AnalysisPolicy
@@ -37,7 +40,14 @@ def build_analyzer(reader: DeckReader | None = None) -> AnalyzePresentation:
     """Use the same rules for saved COM snapshots and the metadata-only CLI."""
     return AnalyzePresentation(
         reader=reader or OoxmlDeckReader(),
-        rules=(ContrastRule(), TypographyRule(), LayoutRule()),
+        rules=(
+            ContrastRule(),
+            TypographyRule(),
+            LayoutRule(),
+            ColorVisionRule(),
+            ConsistencyRule(),
+            ImageTextRule(),
+        ),
         planner=MinimumChangePlanner(),
         finding_filter=exempt_special_slides,  # 표지·목차·출처·마무리 슬라이드의 의미 없는 판정 제외
     )

@@ -65,7 +65,14 @@ def _with_lightness(hex_color: str, lightness: float) -> str:
     return rgb_to_hex(round(nr * 255), round(ng * 255), round(nb * 255))
 
 
-def nearest_passing_color(fg: str, bg: str, required: float) -> str | None:
+def worst_vision_contrast(fg: str, bg: str) -> float:
+    """보통 눈과 적색약·녹색약·청색약 눈 가운데 가장 낮은 명암비 (색약 맞춤 수정용)."""
+    from slideguard.checks.color_vision import worst_cvd_contrast
+
+    return worst_cvd_contrast(hex_to_rgb(fg), hex_to_rgb(bg))[0]
+
+
+def nearest_passing_color(fg: str, bg: str, required: float, ratio_of=contrast_ratio) -> str | None:
     """글자색의 색상은 유지하고 밝기만 조절해 기준을 넘는 가장 가까운 색을 찾습니다.
 
     어둡게 하는 방향과 밝게 하는 방향을 모두 찾아 원래 색에 더 가까운 쪽을 고릅니다.
@@ -77,7 +84,7 @@ def nearest_passing_color(fg: str, bg: str, required: float) -> str | None:
     candidates = []
     for target_l in (0.0, 1.0):  # 0.0 = 어둡게, 1.0 = 밝게
         # 끝까지 가도 기준을 못 넘으면 이 방향은 불가능
-        if contrast_ratio(_with_lightness(fg, target_l), bg) < required:
+        if ratio_of(_with_lightness(fg, target_l), bg) < required:
             continue
 
         # 이분 탐색: 기준을 넘는 지점 중 원래 밝기에 가장 가까운 곳
@@ -85,7 +92,7 @@ def nearest_passing_color(fg: str, bg: str, required: float) -> str | None:
         high = target_l  # 기준 통과 쪽
         for _ in range(30):
             mid = (low + high) / 2
-            if contrast_ratio(_with_lightness(fg, mid), bg) >= required:
+            if ratio_of(_with_lightness(fg, mid), bg) >= required:
                 high = mid
             else:
                 low = mid
@@ -94,11 +101,11 @@ def nearest_passing_color(fg: str, bg: str, required: float) -> str | None:
         # 반올림 때문에 기준 바로 아래로 떨어지는 경우를 한 칸씩 보정
         step = 0.002 if target_l == 1.0 else -0.002
         lightness = high
-        while contrast_ratio(color, bg) < required and 0.0 <= lightness <= 1.0:
+        while ratio_of(color, bg) < required and 0.0 <= lightness <= 1.0:
             lightness += step
             color = _with_lightness(fg, min(1.0, max(0.0, lightness)))
 
-        if contrast_ratio(color, bg) >= required:
+        if ratio_of(color, bg) >= required:
             candidates.append(color)
 
     if not candidates:

@@ -47,6 +47,7 @@ from slideguard.planning.color import (
     relative_luminance,
     saturation,
     worst_contrast_over_unknown,
+    worst_vision_contrast,
 )
 from slideguard.planning.contracts import (
     Category,
@@ -199,7 +200,10 @@ class RuleBasedPlanner:
                 skip(self._review_reason(info, standards))
                 continue
             if info.status == Status.REVIEW and not (
-                _is_photo_text(info) or info.values.get("confirmed_hierarchy")
+                _is_photo_text(info)
+                or info.values.get("confirmed_hierarchy")
+                or info.values.get("color_vision")
+                or info.rule in CONSISTENCY_FIXES
             ):
                 skip("사람의 검토가 필요한 항목")
                 continue
@@ -467,6 +471,8 @@ class RuleBasedPlanner:
 
     def _candidates(self, info, shape, others, ctx, category, profile):
         s = ctx["standards"]
+        if info.rule in CONSISTENCY_FIXES:
+            return self._consistency(info, shape, others, ctx, category)
         if info.rule == Rule.CONTRAST:
             if _is_photo_text(info):
                 return self._scrim(info, shape, s, category)
@@ -586,7 +592,10 @@ class RuleBasedPlanner:
         bg = info.values.get("background")
         if fg is None or bg is None:
             return [], "명암비 측정값(글자색·배경색)이 없음"
-        ratio = info.values.get("ratio", contrast_ratio(fg, bg))
+        # 색약 맞춤 판정이면 '보통 눈과 세 가지 색약 눈 모두'에서 기준을 넘는 색을 찾는다
+        vision = bool(info.values.get("color_vision"))
+        ratio_of = worst_vision_contrast if vision else contrast_ratio
+        ratio = info.values.get("ratio", ratio_of(fg, bg))
         threshold = info.values.get("required_ratio", standards.contrast_normal.value)
         # 검사 기준(threshold)을 넘는 범위에서 얼마나 여유 있게 고칠지는 수정 목표(FixTargets)가 정한다
         required = contrast_goal(threshold, standards)
@@ -598,20 +607,19 @@ class RuleBasedPlanner:
 
         def color_option(new_color, label):
             harmony = harmony_score(new_color, bg)
-            new_ratio = contrast_ratio(new_color, bg)
-            note = (
-                f"{label} #{fg} → #{new_color} (명암비 {new_ratio:.2f}:1, {goal_text}, 조화 {harmony:+.2f})"
-            )
+            new_ratio = ratio_of(new_color, bg)
+            who = "색약 포함 최저 " if vision else ""
+            note = f"{label} #{fg} → #{new_color} ({who}명암비 {new_ratio:.2f}:1, {goal_text}, 조화 {harmony:+.2f})"
             cost = color_distance(fg, new_color)
             return self._proposal(
                 info, shape, Property.FONT_COLOR, fg, new_color, cost, category, note, harmony, new_ratio
             )
 
         # 후보 A
-        new_color = nearest_passing_color(fg, bg, required)
+        new_color = nearest_passing_color(fg, bg, required, ratio_of)
         if new_color is None:
             for fallback in ("000000", "FFFFFF"):
-                passes = contrast_ratio(fallback, bg) >= required
+                passes = ratio_of(fallback, bg) >= required
                 closer = new_color is None or color_distance(fg, fallback) < color_distance(fg, new_color)
                 if passes and closer:
                     new_color = fallback
@@ -620,14 +628,14 @@ class RuleBasedPlanner:
 
         # 후보 B
         palette = PALETTE_DARK if relative_luminance(bg) > 0.18 else PALETTE_LIGHT
-        if palette != new_color and contrast_ratio(palette, bg) >= required:
+        if palette != new_color and ratio_of(palette, bg) >= required:
             candidates.append(color_option(palette, "표준 팔레트 글자색"))
 
         # 후보 C
         large_ratio = standards.contrast_large.value
         # (큰 글자가 돼도 수정 목표를 넘어야 함: 목표가 4.5:1이면 크기만 키워서는 안 됨)
         large_goal = contrast_goal(large_ratio, standards, large=True)
-        if self.allow_large_text_option and required > large_goal and ratio >= large_goal:
+        if not vision and self.allow_large_text_option and required > large_goal and ratio >= large_goal:
             option = self._large_text_option(info, shape, fg, standards, category)
             if option is not None:
                 candidates.append(option)
@@ -865,6 +873,36 @@ class RuleBasedPlanner:
         note = f"상자 위치 ({shape.left:g}, {shape.top:g}) → ({after[0]:g}, {after[1]:g}) ({where} {distance:.0f}pt)"
         cost = distance / slide_h
         return [self._proposal(info, shape, Property.SHAPE_POSITION, before, after, cost, category, note)], ""
+
+    # ---- 슬라이드 간 일관성 → 다른 슬라이드의 중앙값에 맞추기 -----------------
+    # 제목 위치: 다른 본문 슬라이드 제목의 중앙 위치로 옮김 (다른 객체와 새로 겹치면 만들지 않음)
+    # 제목 크기: 다른 본문 슬라이드 제목의 중앙 크기로 (최소 글자 크기 아래로는 내리지 않음)
+
+    def _consistency(self, info, shape, others, ctx, category):
+        if not info.values.get("consistency"):
+            return [], "일관성 목표값이 없음"
+        if info.rule == "consistency.title_position":
+            if not shape.has_geometry:
+                return [], "상자 좌표를 알 수 없음"
+            new_left, new_top = info.values["target_left"], info.values["target_top"]
+            blocked = _new_collisions(shape, (new_left, new_top, shape.width, shape.height), others)
+            if blocked:
+                ids = ", ".join(str(o.shape_id) for o in blocked)
+                return [], f"다른 슬라이드 제목 위치로 옮기면 다른 객체(ID {ids})와 겹침 → 사람이 판단"
+            distance = math.hypot(new_left - shape.left, new_top - shape.top)
+            before, after = (shape.left, shape.top), (round(new_left, 2), round(new_top, 2))
+            note = f"제목 위치 ({shape.left:g}, {shape.top:g}) → ({after[0]:g}, {after[1]:g}) (다른 슬라이드 제목과 같은 자리)"
+            cost = distance / ctx["slide_h"]
+            return [
+                self._proposal(info, shape, Property.SHAPE_POSITION, before, after, cost, category, note)
+            ], ""
+        size, target = info.values["size_pt"], info.values["target_pt"]
+        floor = ctx["standards"].min_font_pt.value or 0
+        if target < floor:
+            return [], f"다른 슬라이드 크기 {target:g}pt가 최소 기준 {floor:g}pt보다 작음 → 사람이 판단"
+        note = f"제목 글자 크기 {size:g}pt → {target:g}pt (다른 슬라이드 제목과 같은 크기)"
+        cost = _ratio_cost(size, target)
+        return [self._proposal(info, shape, Property.FONT_SIZE, size, target, cost, category, note)], ""
 
     # ---- 슬라이드 밖으로 나간 카드 → 안쪽 글상자와 함께 줄이기 ------------------
     # 카드만 옮기면 옆 카드와 겹치고, 카드만 줄이면 안쪽 글상자가 카드 밖으로 삐져나온다.
@@ -1135,6 +1173,10 @@ def _overlaps(a: tuple, b: tuple) -> bool:
     overlap_w = min(ax + aw, bx + bw) - max(ax, bx)
     overlap_h = min(ay + ah, by + bh) - max(ay, by)
     return overlap_w > TOLERANCE and overlap_h > TOLERANCE
+
+
+# 일관성 판정 가운데 수정 후보를 만드는 것 (본문 크기는 내용 양 때문일 수 있어 사람이 판단)
+CONSISTENCY_FIXES = ("consistency.title_position", "consistency.title_size")
 
 
 def _new_collisions(shape: ShapeInfo, new_rect: tuple, others: list[ShapeInfo]) -> list[ShapeInfo]:

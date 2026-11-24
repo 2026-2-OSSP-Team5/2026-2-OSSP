@@ -374,3 +374,10 @@ def test_com_table_rows_grow_to_fit_bigger_text_but_never_shrink():
     assert [row.Height for row in rows] == [50.4, 60.0]  # 두 줄이 된 칸에 맞춰 늘고, 높던 행은 그대로
     shape.set_row_heights([30.0, 60.0])
     assert rows[0].Height == 30.0
+
+
+def test_shrinking_font_proposal_only_changes_text_of_that_size(original, tmp_path):
+    """슬라이드 간 일관성: 제목 40pt → 32pt. 40pt였던 글자만 바꾸고 다른 크기는 그대로."""
+    shape = DocShape(runs=[DocRun(40, "000000"), DocRun(20, "000000")])
+    result = run_apply(original, tmp_path, shape, [proposal(Property.FONT_SIZE, 40, 32)])
+    assert result.applied and [run.size for run in shape.runs()] == [32, 20]

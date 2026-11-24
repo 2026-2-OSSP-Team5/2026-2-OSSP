@@ -1256,7 +1256,15 @@ def _slide_number(shape_key: str) -> str:
 
 def _rule_name(rule_id: str) -> str:
     root = rule_id.partition(".")[0]
-    return {"contrast": "명암비", "typography": "글자 크기", "layout": "배치"}.get(root, rule_id)
+    names = {
+        "contrast": "명암비",
+        "typography": "글자 크기",
+        "layout": "배치",
+        "color_vision": "색약",
+        "consistency": "일관성",
+        "image_text": "그림 속 글자",
+    }
+    return names.get(root, rule_id)
 
 
 def _severity_name(severity: str) -> str:

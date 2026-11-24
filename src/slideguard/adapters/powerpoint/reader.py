@@ -7,6 +7,7 @@ from slideguard.domain.models import DeckSnapshot
 
 from .autofit import refresh_shrunk_text
 from .copies import saved_pptx_copy
+from .image_text import read_image_text
 from .render import render_evidence
 from .session import PowerPointReadSession
 from .snapshot import extract_snapshot
@@ -41,6 +42,10 @@ class PowerPointDeckReader:
                         presentation, snapshot, saved.copy_path.with_suffix(".png"), stats=stats
                     )
                     timing["render"] = perf_counter() - step
+                    # 그림 속 글자 (Windows 문자 인식): 그림이 있는 슬라이드만
+                    step = perf_counter()
+                    snapshot = read_image_text(presentation, snapshot, saved.copy_path.parent)
+                    timing["ocr"] = perf_counter() - step
                 step = perf_counter()
                 result = enrich_snapshot(snapshot, saved.copy_path)
                 timing["enrich"] = perf_counter() - step
@@ -51,10 +56,10 @@ class PowerPointDeckReader:
             else:
                 snapshot = self._session.read_copy(saved.copy_path, extract)
         total = perf_counter() - started
-        inside = sum(timing.get(key, 0.0) for key in ("extract", "render", "enrich"))
+        inside = sum(timing.get(key, 0.0) for key in ("extract", "render", "ocr", "enrich"))
         LOGGER.info(
             "READ_TIMING | file=%s | 복사=%.2fs PowerPoint열기·닫기=%.2fs 도형읽기=%.2fs "
-            "그리기=%.2fs(슬라이드 %s장, 내보내기 %s번, 표칸 측정 %s개) 파일보강=%.2fs 합계=%.2fs",
+            "그리기=%.2fs(슬라이드 %s장, 내보내기 %s번, 표칸 측정 %s개) 그림글자=%.2fs 파일보강=%.2fs 합계=%.2fs",
             Path(path).name,
             timing.get("copy", 0.0),
             max(total - timing.get("copy", 0.0) - inside, 0.0),
@@ -63,6 +68,7 @@ class PowerPointDeckReader:
             stats.get("slides", 0),
             stats.get("exports", 0),
             stats.get("cells", 0),
+            timing.get("ocr", 0.0),
             timing.get("enrich", 0.0),
             total,
         )

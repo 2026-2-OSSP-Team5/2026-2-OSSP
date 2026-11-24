@@ -379,9 +379,17 @@ def _apply_font_size(shape: ShapeHandle, p: ChangeProposal):
     if get_autofit is not None and get_autofit() == "shrink":
         return _resize_shrunk_text(shape, target)
     changed = 0
+    shrinking = _is_number(p.before) and target < float(p.before) - TOLERANCE
     for run in shape.runs():
         size = run.get_size()
-        if size is not None and size < target:  # 크기를 모르는 런은 건드리지 않음
+        if size is None:
+            continue  # 크기를 모르는 런은 건드리지 않음
+        if shrinking:
+            # 줄이는 후보(슬라이드 간 일관성: 제목 크기 맞추기)는 '그 크기였던 글자'만 바꾼다
+            if abs(size - float(p.before)) <= TOLERANCE:
+                run.set_size(target)
+                changed += 1
+        elif size < target:
             run.set_size(target)
             changed += 1
     fit_rows = getattr(shape, "fit_table_rows", None)
@@ -957,3 +965,7 @@ class OriginalDocumentSession(ComDocumentSession):
                 )
             return pres
         return super()._open(app)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
