@@ -490,7 +490,7 @@ def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThresh
                 f"{slide_number}:chars",
                 heaviest,
                 _density_severity(total_chars, limits.max_chars),
-                f"슬라이드의 글자 수가 많습니다 ({total_chars}자)",
+                f"슬라이드 전체 글자 수가 많습니다 ({total_chars}자, 글상자 {len(text_shapes)}개 합계)",
                 total_chars,
                 limits.max_chars,
                 f"슬라이드 {slide_number}: 공백 제외 {total_chars}자 > 기준 {limits.max_chars}자 "
@@ -504,7 +504,7 @@ def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThresh
                 f"{slide_number}:lines",
                 heaviest,
                 _density_severity(total_lines, limits.max_lines),
-                f"슬라이드의 줄(항목) 수가 많습니다 ({total_lines}줄)",
+                f"슬라이드 전체 줄(항목) 수가 많습니다 ({total_lines}줄, 글상자 {len(text_shapes)}개 합계)",
                 total_lines,
                 limits.max_lines,
                 f"슬라이드 {slide_number}: {total_lines}줄 > 기준 {limits.max_lines}줄 "
