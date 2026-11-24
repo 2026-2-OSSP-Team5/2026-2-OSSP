@@ -65,6 +65,7 @@ from slideguard.domain.policy import (
     ViewingSetup,
 )
 from slideguard.planning.bindings import TeamBindings, is_recommended
+from slideguard.planning.same_place import same_place_sets
 from slideguard.ui.preview import render_slide_previews
 from slideguard.ui.slide_lens import InputActivity, SlideLens, SlideView, SlideViewProbe, build_marks
 
@@ -788,6 +789,8 @@ class OverlayWidget(QWidget):
         self._report: AnalysisReport | None = None
         self._skip_reasons: dict[str, str] = {}
         self.proposal_items: dict[str, QListWidgetItem] = {}
+        # '같은 자리 일괄 적용' 체크 항목 → 그 항목이 함께 켜고 끄는 후보 id들 (planning/same_place.py)
+        self.batch_items: list[tuple[QListWidgetItem, tuple[str, ...]]] = []
         self._proposal_ids_by_severity: dict[str, set[str]] = {}
         self._syncing_proposals = False
         self._analysis_busy = False
@@ -1281,6 +1284,7 @@ class OverlayWidget(QWidget):
         self.proposals_list.blockSignals(True)
         self.proposals_list.clear()
         self.proposal_items.clear()
+        self.batch_items = []
         self._proposal_ids_by_severity.clear()
         findings = {item.id: item for item in report.findings}
         has_recommended = {_variant_target(item) for item in report.proposals if is_recommended(item.id)}
@@ -1303,11 +1307,75 @@ class OverlayWidget(QWidget):
                 item.setCheckState(Qt.CheckState.Unchecked)
                 self.proposals_list.addItem(item)
                 self.proposal_items[proposal.id] = item
+            self._add_batch_items(report)
         finally:
             self.proposals_list.blockSignals(False)
         self._update_apply_button()
 
+    def _add_batch_items(self, report: AnalysisReport):
+        """같은 자리(쪽 번호·머리글 등) 같은 수정 후보마다 '일괄 적용' 체크 항목을 첫 후보 바로 위에 넣는다."""
+        by_id = {proposal.id: proposal for proposal in report.proposals}
+        for members in same_place_sets(report.deck, list(report.proposals)):
+            first = by_id[members[0]]
+            slides = sorted({_slide_number(by_id[member].shape_key) for member in members})
+            shown = ", ".join(str(number) for number in slides[:6]) + (" …" if len(slides) > 6 else "")
+            label = (
+                f"같은 자리 일괄 적용 · {len(members)}개 슬라이드 ({shown})\n{proposal_change_text(first)}"
+            )
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole + 1, members)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setToolTip(
+                "같은 자리에 있는 같은 개체(쪽 번호·머리글 등)에 같은 수정을 한 번에 적용합니다. 하나씩 적용할 수도 있습니다."
+            )
+            row = self.proposals_list.row(self.proposal_items[members[0]])
+            self.proposals_list.insertItem(row, item)
+            self.batch_items.append((item, members))
+
+    def _refresh_batch_items(self):
+        """개별 후보를 체크·해제하면 '일괄 적용' 항목도 맞춘다 (모두 체크됐을 때만 체크)."""
+        self.proposals_list.blockSignals(True)
+        try:
+            for item, members in self.batch_items:
+                every = all(
+                    self.proposal_items[member].checkState() == Qt.CheckState.Checked for member in members
+                )
+                item.setCheckState(Qt.CheckState.Checked if every else Qt.CheckState.Unchecked)
+        finally:
+            self.proposals_list.blockSignals(False)
+
+    def _batch_toggled(self, item: QListWidgetItem, members: tuple[str, ...]):
+        """'일괄 적용' 체크: 같은 자리의 후보를 모두 체크·해제하고 열린 문서에도 바로 적용·해제."""
+        if self._syncing_proposals or self._report is None:
+            return
+        checked = item.checkState() == Qt.CheckState.Checked
+        by_id = {proposal.id: proposal for proposal in self._report.proposals}
+        released = []
+        self._syncing_proposals = True
+        try:
+            for member in members:
+                self.proposal_items[member].setCheckState(item.checkState())
+                if checked:
+                    for other in _counterparts(self._report, by_id[member]):
+                        if self.proposal_items[other.id].checkState() == Qt.CheckState.Checked:
+                            released.append(other.id)
+                        self.proposal_items[other.id].setCheckState(Qt.CheckState.Unchecked)
+        finally:
+            self._syncing_proposals = False
+        self._refresh_batch_items()
+        self._update_apply_button()
+        self.proposals_list.viewport().update()
+        self.preview_state_changed.emit()
+        if released:
+            self.proposal_user_toggled.emit(tuple(released), False)
+        self.proposal_user_toggled.emit(tuple(members), checked)
+
     def _proposal_item_changed(self, item: QListWidgetItem):
+        members = item.data(Qt.ItemDataRole.UserRole + 1)
+        if members:
+            self._batch_toggled(item, tuple(members))
+            return
         proposal = item.data(Qt.ItemDataRole.UserRole)
         if proposal is not None:
             self._proposal_toggled(proposal.id)
@@ -1336,6 +1404,7 @@ class OverlayWidget(QWidget):
                     self.proposal_items[other.id].setCheckState(Qt.CheckState.Unchecked)
         finally:
             self._syncing_proposals = False
+        self._refresh_batch_items()
         self._update_apply_button()
         self.proposals_list.viewport().update()
         self.preview_state_changed.emit()
@@ -1355,6 +1424,7 @@ class OverlayWidget(QWidget):
                     item.setCheckState(state)
         finally:
             self._syncing_proposals = False
+        self._refresh_batch_items()
         self._update_apply_button()
         self.proposals_list.viewport().update()
 
@@ -1377,6 +1447,7 @@ class OverlayWidget(QWidget):
                     self.proposal_items[proposal.id].setCheckState(Qt.CheckState.Checked)
         finally:
             self._syncing_proposals = False
+        self._refresh_batch_items()
         self._update_apply_button()
         self.preview_state_changed.emit()
 
@@ -1398,6 +1469,7 @@ class OverlayWidget(QWidget):
                 )
         finally:
             self.proposals_list.blockSignals(False)
+        self._refresh_batch_items()
         self._update_apply_button()
         self.preview_state_changed.emit()
         self.apply_requested.emit()
@@ -1409,6 +1481,7 @@ class OverlayWidget(QWidget):
                 item.setCheckState(Qt.CheckState.Unchecked)
         finally:
             self._syncing_proposals = False
+        self._refresh_batch_items()
         self._update_apply_button()
         self.preview_state_changed.emit()
 
@@ -3192,7 +3265,9 @@ def _variant_target(proposal: ChangeProposal) -> tuple:
     (한 상자에 회색이 두 가지면 두 후보를 함께 고를 수 있어야 함).
     """
     before = (
-        _normalized_value(proposal.before) if proposal.property in ("font.color", "font.family") else None
+        _normalized_value(proposal.before)
+        if proposal.property in ("font.color", "font.family", "font.bold")
+        else None
     )
     return (proposal.shape_key, proposal.property, before)
 
@@ -3239,6 +3314,8 @@ def _replaced_bundle(report: AnalysisReport, item: ChangeProposal, rec_targets: 
 
 
 def proposal_change_text(proposal: ChangeProposal) -> str:
+    if proposal.property == "font.bold":
+        return f"굵게 · {_value(proposal.before)} 글자"
     return f"{_property_name(proposal.property)} · {_value(proposal.before)} → {_value(proposal.after)}"
 
 
@@ -3247,6 +3324,7 @@ def _property_name(value: str) -> str:
         "font.size": "글자 크기",
         "font.color": "글자색",
         "font.family": "글꼴",
+        "font.bold": "굵게",
         "shape.height": "개체 높이",
         "shape.width": "개체 너비",
         "shape.position": "개체 위치",

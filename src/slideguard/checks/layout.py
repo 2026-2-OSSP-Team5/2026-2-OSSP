@@ -4,7 +4,13 @@ from collections import defaultdict
 from itertools import combinations
 
 from slideguard.domain.models import Box, DeckSnapshot, Finding, Severity, Shape
-from slideguard.domain.policy import GEOMETRY_TOLERANCE_PT, AnalysisPolicy, DensityThreshold
+from slideguard.domain.policy import (
+    BODY_PLACEHOLDERS,
+    GEOMETRY_TOLERANCE_PT,
+    TITLE_PLACEHOLDERS,
+    AnalysisPolicy,
+    DensityThreshold,
+)
 
 from .scope import target_shapes
 
@@ -32,11 +38,13 @@ class LayoutRule:
         by_slide: dict[int, list[Shape]] = defaultdict(list)
         for shape in shapes:
             by_slide[shape.slide_number].append(shape)
+        repeated = _repeated_on_slides(deck)
         for slide_number in sorted(by_slide):
             slide_shapes = sorted(by_slide[slide_number], key=lambda s: s.shape_id)
             findings.extend(_check_overlap(slide_shapes))
             findings.extend(_check_card_off_slide(deck, slide_shapes))
-            findings.extend(_check_density(slide_number, slide_shapes, policy.density_limits))
+            content = [shape for shape in slide_shapes if shape.key not in repeated]
+            findings.extend(_check_density(slide_number, content, policy.density_limits))
         return findings
 
 
@@ -404,6 +412,35 @@ DENSITY_WARNING_FACTOR = 2  # 기준의 2배 이상이면 '검토'가 아니라 
 
 def _density_severity(count: int, limit: int) -> Severity:
     return "warning" if count >= limit * DENSITY_WARNING_FACTOR else "review"
+
+
+def _repeated_on_slides(deck: DeckSnapshot, tolerance: float = 1.0) -> set[str]:
+    """여러 슬라이드의 같은 자리에 반복되는 작은 글상자(머리글·쪽 번호 등) — 정보 밀도에서 뺀다.
+
+    같은 자리 = 다른 슬라이드에 좌표(왼쪽·위·너비·높이)가 1pt 이내로 같은 글상자가 있고, 두 줄 이하.
+    본문 자리 표시자는 쪽마다 같은 자리라도 내용이므로 빼지 않는다.
+    """
+    candidates = [
+        shape
+        for shape in deck.shapes
+        if shape.box is not None
+        and _has_text(shape)
+        and shape.placeholder_type not in BODY_PLACEHOLDERS
+        and shape.placeholder_type not in TITLE_PLACEHOLDERS
+        and len([line for line in _text_of(shape).splitlines() if _visible(line)]) <= 2
+    ]
+    repeated = set()
+    for index, first in enumerate(candidates):
+        for second in candidates[index + 1 :]:
+            if first.slide_number == second.slide_number:
+                continue
+            a, b = first.box, second.box
+            if all(
+                abs(x - y) <= tolerance
+                for x, y in ((a.x, b.x), (a.y, b.y), (a.width, b.width), (a.height, b.height))
+            ):
+                repeated.update((first.key, second.key))
+    return repeated
 
 
 def _check_density(slide_number: int, shapes: list[Shape], limits: DensityThreshold) -> list[Finding]:

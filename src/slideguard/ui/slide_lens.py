@@ -28,6 +28,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetricsF, QGuiApplication, QPainte
 from PySide6.QtWidgets import QWidget
 
 from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Finding
+from slideguard.planning.same_place import same_place_sets
 
 # ------------------------------------------------------------------ 모양 정의
 
@@ -108,6 +109,7 @@ PROPERTY_TITLES = {
     "font.size": "글자 크기",
     "font.color": "글자색",
     "font.family": "글꼴",
+    "font.bold": "굵게",
     "shape.height": "개체 높이",
     "shape.width": "개체 너비",
     "shape.position": "개체 위치",
@@ -270,6 +272,18 @@ def _options(
         label = _option_label(members, own)
         ids = tuple(item.id for item in members)
         options.append(LensOption(group, ids, label, checked=all(item in applied for item in ids)))
+    # 같은 자리(쪽 번호·머리글 등) 같은 수정: 다른 슬라이드까지 한 번에 켜고 끄는 '일괄 적용' 항목
+    own_ids = {item.id for item in proposals}
+    by_id = {item.id: item for item in report.proposals}
+    for members in same_place_sets(report.deck, list(report.proposals)):
+        mine = [member for member in members if member in own_ids]
+        if not mine:
+            continue
+        label = f"[같은 자리 {len(members)}쪽 일괄] {_change_text(by_id[mine[0]])}"
+        if "~rec" in str(mine[0]).split("#", 1)[0]:
+            label = f"[권장] {label}"
+        checked = all(member in applied for member in members)
+        options.append(LensOption(f"same:{members[0]}", tuple(members), label, checked=checked))
     return tuple(options)
 
 
@@ -291,6 +305,8 @@ def _option_label(members: list[ChangeProposal], own_keys: set[str]) -> str:
 
 def _change_text(item: ChangeProposal) -> str:
     title = PROPERTY_TITLES.get(item.property, item.property)
+    if item.property == "font.bold":
+        return f"{_short(item.before, 'font.color')} 글자 굵게"  # before = 그 글자의 색
     if item.property == "shape.position" and _is_point(item.before) and _is_point(item.after):
         return f"{title} {_move_text(item.before, item.after)}"
     return f"{title} {_short(item.before, item.property)} → {_short(item.after, item.property)}"

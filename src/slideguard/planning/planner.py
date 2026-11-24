@@ -42,6 +42,8 @@ from slideguard.planning.bindings import TeamBindings, table_of_cell
 from slideguard.planning.color import (
     color_distance,
     contrast_ratio,
+    cud_color,
+    cud_distinct_colors,
     harmony_score,
     nearest_passing_color,
     relative_luminance,
@@ -61,6 +63,7 @@ from slideguard.planning.contracts import (
     Status,
 )
 from slideguard.planning.reflow import MIN_GROW, reflow_slide
+from slideguard.planning.same_place import extend_same_place
 from slideguard.planning.standards import Standards, build_standards
 
 # ======================================================================
@@ -72,6 +75,7 @@ PROPERTY_GROUP = {
     Property.FONT_SIZE: "글자 크기",
     Property.FONT_COLOR: "글자 색",
     Property.FONT_FAMILY: "글씨체",
+    Property.FONT_BOLD: "글씨체",
     Property.SHAPE_POSITION: "항목 위치",
     Property.SHAPE_HEIGHT: "항목 위치",
     Property.SHAPE_WIDTH: "항목 위치",
@@ -84,6 +88,7 @@ PROPERTY_GROUP = {
 _PASSIVE = frozenset({Property.FONT_SIZE, Property.FONT_COLOR})
 _BALANCED = _PASSIVE | {
     Property.FONT_FAMILY,
+    Property.FONT_BOLD,
     Property.SHAPE_POSITION,
     Property.SHAPE_HEIGHT,
     Property.SHAPE_WIDTH,
@@ -204,6 +209,7 @@ class RuleBasedPlanner:
                 or info.values.get("confirmed_hierarchy")
                 or info.values.get("color_vision")
                 or info.rule in CONSISTENCY_FIXES
+                or info.rule == COLOR_ONLY_RULE
             ):
                 skip("사람의 검토가 필요한 항목")
                 continue
@@ -445,6 +451,8 @@ class RuleBasedPlanner:
         if info.rule in (Rule.FONT_FAMILY, Rule.HIERARCHY):
             return Category.DESIGN
         if info.rule == Rule.CONTRAST:
+            if info.values.get("color_vision"):
+                return Category.READABILITY  # 색약 접근성: 강조색이라도 디자인 예산으로 막지 않음
             if _is_photo_text(info):
                 return Category.DESIGN
             fg = info.values.get("foreground")
@@ -473,6 +481,8 @@ class RuleBasedPlanner:
         s = ctx["standards"]
         if info.rule in CONSISTENCY_FIXES:
             return self._consistency(info, shape, others, ctx, category)
+        if info.rule == COLOR_ONLY_RULE:
+            return self._color_only(info, shape, category)
         if info.rule == Rule.CONTRAST:
             if _is_photo_text(info):
                 return self._scrim(info, shape, s, category)
@@ -603,6 +613,12 @@ class RuleBasedPlanner:
             f"기준 {threshold}:1" if required == threshold else f"기준 {threshold}:1, 목표 {required:g}:1"
         )
 
+        if vision:
+            # 색약: Okabe & Ito(CUD)는 '어두운 배경 위 빨간 글자'를 피하고 밝은 글자를 쓰라고 권한다.
+            # 기준선(큰 글자 3:1)만 겨우 넘기면 여전히 어둡게 보이므로 일반 글자 기준(4.5:1)까지 올린다.
+            required = max(required, standards.contrast_normal.value)
+            goal_text = f"기준 {threshold}:1, 색약 목표 {required:g}:1"
+
         candidates = []
 
         def color_option(new_color, label):
@@ -614,6 +630,12 @@ class RuleBasedPlanner:
             return self._proposal(
                 info, shape, Property.FONT_COLOR, fg, new_color, cost, category, note, harmony, new_ratio
             )
+
+        if vision:
+            # 색약 맞춤: 원래 색과 가장 가까운 색각 친화 색 (Okabe & Ito 팔레트, Wong 2011)
+            cud = cud_color(fg, bg, required)
+            if cud is not None:
+                return [color_option(cud, "색각 친화 색(Okabe·Ito)")], ""
 
         # 후보 A
         new_color = nearest_passing_color(fg, bg, required, ratio_of)
@@ -873,6 +895,57 @@ class RuleBasedPlanner:
         note = f"상자 위치 ({shape.left:g}, {shape.top:g}) → ({after[0]:g}, {after[1]:g}) ({where} {distance:.0f}pt)"
         cost = distance / slide_h
         return [self._proposal(info, shape, Property.SHAPE_POSITION, before, after, cost, category, note)], ""
+
+    # ---- 색만으로 구분한 글자 → 색각 친화 색으로 바꾸기 (Okabe & Ito CUD, Wong 2011) ----
+    # 판정 id 끝: <바꿀 색들>_<본문색> (color_vision.color_only:<슬라이드>:<도형>:D62728-2CA02C_222222)
+    # 빨강·초록처럼 색약 눈에 같아 보이는 색들을, 모든 눈에서 서로·본문과 구분되고 배경과 4.5:1 이상인
+    # 팔레트 색으로 함께 바꾼다 (한 묶음). 그런 조합이 없으면 그 글자들을 굵게 해 색 외의 표시를 더한다.
+
+    def _color_only(self, info, shape, category):
+        tail = info.finding_id.rsplit(":", 1)[-1]
+        marked_part, _sep, body = tail.partition("_")
+        colors = [part for part in marked_part.split("-") if len(part) == 6]
+        runs = list(getattr(shape, "runs", ()))
+        colors = [color for color in colors if any(run.color == color for run in runs)]
+        if not colors:
+            return [], "구분할 글자를 찾지 못함"
+        group = f"cud:{shape.slide_index}:{shape.shape_id}"
+        background = info.values.get("background") or "FFFFFF"
+        new_colors = cud_distinct_colors(colors, body or "000000", background)
+        if new_colors is not None:
+            bundle = [
+                self._proposal(
+                    info,
+                    shape,
+                    Property.FONT_COLOR,
+                    old,
+                    new,
+                    color_distance(old, new) / len(colors),
+                    category,
+                    f"#{old} → #{new} (모든 눈에서 구분되는 색각 친화 색: Okabe & Ito CUD, Wong 2011)",
+                    group=group,
+                )
+                for old, new in zip(colors, new_colors, strict=True)
+            ]
+            return [bundle], ""
+        targets = [color for color in colors if any(r.color == color and r.bold is not True for r in runs)]
+        if not targets:
+            return [], "구분할 글자가 이미 굵음 → 사람이 판단 (기호·밑줄 추가 등)"
+        bundle = [
+            self._proposal(
+                info,
+                shape,
+                Property.FONT_BOLD,
+                color,
+                True,
+                0.05,
+                category,
+                f"#{color} 글자를 굵게 (색만으로 구분하지 않게: Okabe & Ito CUD 원칙 2)",
+                group=group,
+            )
+            for color in targets
+        ]
+        return [bundle], ""
 
     # ---- 슬라이드 간 일관성 → 다른 슬라이드의 중앙값에 맞추기 -----------------
     # 제목 위치: 다른 본문 슬라이드 제목의 중앙 위치로 옮김 (다른 객체와 새로 겹치면 만들지 않음)
@@ -1175,6 +1248,8 @@ def _overlaps(a: tuple, b: tuple) -> bool:
     return overlap_w > TOLERANCE and overlap_h > TOLERANCE
 
 
+COLOR_ONLY_RULE = "color_vision.color_only"
+
 # 일관성 판정 가운데 수정 후보를 만드는 것 (본문 크기는 내용 양 때문일 수 있어 사람이 판단)
 CONSISTENCY_FIXES = ("consistency.title_position", "consistency.title_size")
 
@@ -1206,13 +1281,13 @@ def _merge_same_target(proposals: list[ChangeProposal], result: PlanResult) -> l
     order = []
     for p in proposals:
         key = (p.slide_index, p.shape_id, p.prop)
-        if p.prop in (Property.FONT_COLOR, Property.FONT_FAMILY):
+        if p.prop in (Property.FONT_COLOR, Property.FONT_FAMILY, Property.FONT_BOLD):
             # 글자 색·글씨체는 원래 값(before)이 같은 글자에만 적용된다 (patcher).
             # 한 상자에 회색이 두 가지면 후보도 두 개가 있어야 둘 다 고쳐진다.
             key = (p.slide_index, p.shape_id, p.prop, str(p.before).upper())
         if p.group is not None:
             # 묶음의 일부는 합치지 않고 그대로 둠 (함께 적용돼야 하므로)
-            key = (p.slide_index, p.shape_id, f"{p.prop}@{p.group}")
+            key = (p.slide_index, p.shape_id, f"{p.prop}@{p.group}", str(p.before).upper())
         if key not in merged:
             merged[key] = p
             order.append(key)
@@ -1255,4 +1330,11 @@ class MinimumChangePlanner:
                 team = replace(team, id=f"{head}~{str(p.before).upper()}{sep}{group}")
             seen.add(team.id)
             proposals.append(team)
-        return proposals
+        # 같은 자리(쪽 번호·머리글 등) 개체에도 같은 수정 후보 (고정한 객체·속성은 빼고)
+        extended = extend_same_place(report.deck, proposals)
+        kept = proposals[:]
+        for team in extended[len(proposals) :]:
+            slide, shape_id = (int(part) for part in team.shape_key.split(":"))
+            if not bindings.is_locked(policy, slide, shape_id, team.property):
+                kept.append(team)
+        return kept

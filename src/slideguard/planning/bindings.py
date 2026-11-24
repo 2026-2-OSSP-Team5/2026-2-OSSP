@@ -264,6 +264,7 @@ class TeamBindings:
         Property.FONT_COLOR: ("font_color",),
         Property.SHAPE_FILL: ("font_color",),  # 배경판도 글자와 배경의 색 관계를 바꿈
         Property.FONT_FAMILY: ("font_family",),
+        Property.FONT_BOLD: ("font_family",),
         Property.SHAPE_POSITION: ("position",),
         Property.Z_ORDER: ("position",),
         Property.SHAPE_HEIGHT: ("size",),
@@ -396,6 +397,10 @@ class TeamBindings:
                 values["required_count"] = expected
 
         values.update(consistency)
+        if rule_id == "color_vision.color_only":
+            # 색만으로 구분한 글자: 글자 뒤 배경색 (모르면 흰색으로 봄 — 대부분의 본문 슬라이드)
+            background = _normalize_color(getattr(shape, "background", None)) if shape is not None else None
+            values["background"] = background or "FFFFFF"
         return FindingInfo(
             rule=rule,
             slide_index=slide_index,

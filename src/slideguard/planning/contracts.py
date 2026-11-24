@@ -23,6 +23,7 @@ class Property:
     FONT_SIZE = "font.size"  # 글자 크기
     FONT_COLOR = "font.color"  # 글자색
     FONT_FAMILY = "font.family"  # 글씨체
+    FONT_BOLD = "font.bold"  # 굵게 (색만으로 구분한 글자에 색 외의 표시 더하기)
     SHAPE_HEIGHT = "shape.height"  # 상자 높이
     SHAPE_WIDTH = "shape.width"  # 상자 너비 (슬라이드 밖으로 나간 카드 줄이기)
     SHAPE_POSITION = "shape.position"  # 상자 위치 (슬라이드 밖 → 안)
@@ -53,7 +54,7 @@ class Rule:
 USER_LOCK_GROUPS = {
     "font_size": (Property.FONT_SIZE, Property.AUTOFIT),  # 자동 맞춤 해제도 표시 크기를 바꿈
     "layout": (Property.SHAPE_POSITION, Property.SHAPE_HEIGHT, Property.SHAPE_WIDTH, Property.Z_ORDER),
-    "font_family": (Property.FONT_FAMILY,),
+    "font_family": (Property.FONT_FAMILY, Property.FONT_BOLD),
     "color": (Property.FONT_COLOR, Property.SHAPE_FILL),
 }
 

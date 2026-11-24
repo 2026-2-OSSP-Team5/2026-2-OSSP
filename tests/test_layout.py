@@ -474,3 +474,25 @@ def test_density_ignores_blank_lines_chart_labels_and_footers():
     number = make_shape(text="02", shape_id=4)  # 쪽 왼쪽 위 번호 표시
     lines = make_shape(text="\n".join(["항목"] * 3), shape_id=5)
     assert only(run_rule(body, axis, page, number, lines), "layout.density") == []  # 2 + 3 = 5줄
+
+
+def test_header_and_page_number_repeated_on_every_slide_do_not_count_as_content():
+    """여러 쪽 같은 자리의 머리글·쪽 번호는 읽을 내용이 아니므로 정보 밀도에서 뺀다 (함정 PPT 2)."""
+    shapes = []
+    for slide in (1, 2):
+        shapes.append(
+            replace(
+                make_shape(x=60, y=120, w=800, h=300, text="\n".join(["항목"] * 6), shape_id=2),
+                slide_number=slide,
+            )
+        )
+        shapes.append(
+            replace(
+                make_shape(x=640, y=8, w=300, h=24, text="셔틀 2차 개편안", shape_id=4), slide_number=slide
+            )
+        )
+        shapes.append(
+            replace(make_shape(x=880, y=500, w=60, h=24, text=f"{slide} / 2", shape_id=5), slide_number=slide)
+        )
+    deck = DeckSnapshot("d.pptx", "0" * 64, 2, 960, 540, shapes=tuple(shapes))
+    assert [f for f in LayoutRule().evaluate(deck, AnalysisPolicy()) if f.rule_id == "layout.density"] == []

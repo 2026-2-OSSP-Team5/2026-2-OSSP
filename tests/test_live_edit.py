@@ -154,3 +154,15 @@ def test_table_rows_are_restored_after_the_text_size():
     _undo(Doc(shape), log)
     assert shape.rows == [30.0, 30.0] and runs[0].size == 10.0
     assert order == [("rows", [10.0])]  # 행은 글자를 10pt로 되돌린 뒤에
+
+
+def test_bold_change_is_undone():
+    from slideguard.adapters.powerpoint.live_edit import _RecordingShape, _undo
+
+    runs = [DocRun(20.0, "D62728")]
+    shape = DocShape(runs)
+    log = []
+    _RecordingShape(shape, 1, 5, log).runs()[0].set_bold(True)
+    assert runs[0].bold is True
+    _undo(Doc(shape), log)
+    assert runs[0].bold is False

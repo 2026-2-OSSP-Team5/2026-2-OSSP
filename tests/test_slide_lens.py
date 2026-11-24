@@ -577,3 +577,43 @@ def test_new_rules_have_short_badge_text():
     for rule, measured, expected, text, title in cases:
         finding = Finding(f"{rule}:1:2", rule, "1:2", "review", "", measured, expected, "")
         assert metric_text(finding) == text and rule_title(finding) == title
+
+
+def test_panel_batch_checkbox_checks_every_same_place_fix(controller, application):
+    """상단 패널: '같은 자리 일괄 적용' 체크 하나로 여러 슬라이드 후보를 함께 체크하고, 개별 체크도 그대로."""
+    from slideguard.domain.models import Shape, TextRun
+
+    page = [
+        Shape(
+            n,
+            9,
+            "쪽 번호",
+            Box(880, 500, 60, 24),
+            text=str(n),
+            runs=(TextRun(str(n), 10.0),),
+            supported=True,
+            placeholder_type=13,
+        )
+        for n in (1, 2)
+    ]
+    findings = tuple(
+        _finding(f"typography:{n}:9:1", "typography", f"{n}:9", "warning", 10.0, 14.0) for n in (1, 2)
+    )
+    proposals = tuple(
+        ChangeProposal(f"font.size@{n}:9", f"typography:{n}:9:1", f"{n}:9", "font.size", 10.0, 14.0, 0.1)
+        for n in (1, 2)
+    )
+    path = controller.overlay._report.deck.source_path
+    report = AnalysisReport(DeckSnapshot(path, "abc", 2, 960, 540, shapes=tuple(page)), findings, proposals)
+    calls = []
+    controller.toggle_live_edit = lambda ids, checked: calls.append((tuple(ids), checked))
+    controller.overlay.show_report(report)
+    panel = controller.overlay
+    [(batch, members)] = panel.batch_items
+    assert members == ("font.size@1:9", "font.size@2:9") and "같은 자리 일괄 적용" in batch.text()
+    batch.setCheckState(Qt.CheckState.Checked)
+    assert set(panel.selected_proposal_ids()) == {"font.size@1:9", "font.size@2:9"}
+    assert calls[-1] == (members, True)
+    panel.proposal_items["font.size@2:9"].setCheckState(Qt.CheckState.Unchecked)  # 하나만 해제
+    assert batch.checkState() == Qt.CheckState.Unchecked
+    assert panel.selected_proposal_ids() == ("font.size@1:9",)

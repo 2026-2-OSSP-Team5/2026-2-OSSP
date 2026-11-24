@@ -165,6 +165,11 @@ class ColorVisionRule:
         for run in runs:
             by_color.setdefault(run.color, []).append(run)
         colors = list(by_color)
+        if len(colors) < 2:
+            return []
+        # 본문색 = 글자 수가 가장 많은 색. 수정(굵게)은 본문색이 아닌 쪽에만 한다
+        body = max(colors, key=lambda color: sum(len(run.text.strip()) for run in by_color[color]))
+        confusing = []  # (첫 색, 둘째 색, 색약 종류, 보통 눈 색차, 색약 눈 색차)
         for index, first in enumerate(colors):
             for second in colors[index + 1 :]:
                 if any(_styled_differently(run, by_color[second]) for run in by_color[first]):
@@ -174,27 +179,37 @@ class ColorVisionRule:
                     continue  # 보통 눈에도 비슷한 색 (구분 의도가 아님)
                 for kind in CVD_MATRICES:
                     seen_as = delta_e(simulate(first, kind), simulate(second, kind))
-                    if seen_as >= DISTINCT_DELTA_E:
-                        continue
-                    words = [_short(by_color[color][0].text) for color in (first, second)]
-                    return [
-                        Finding(
-                            id=f"{self.id}.color_only:{shape.key}",
-                            rule_id=f"{self.id}.color_only",
-                            shape_key=shape.key,
-                            severity="review",
-                            message=f"{CVD_LABELS[kind]}이면 색으로 구분한 글자가 같은 색으로 보입니다",
-                            measured=round(seen_as, 1),
-                            expected=DISTINCT_DELTA_E,
-                            evidence=(
-                                f'"{words[0]}" {_hex(first)} 와 "{words[1]}" {_hex(second)} 의 색차가 '
-                                f"보통 눈 {normal:.0f} → {CVD_LABELS[kind]} {seen_as:.0f} (기준 {DISTINCT_DELTA_E:g}). "
-                                "굵게·밑줄·기호(✕ ○) 등 색 외의 표시도 함께 쓰세요 (WCAG 2.2 SC 1.4.1 색 사용)"
-                            ),
-                            box=shape.text_bounds or shape.box,
-                        )
-                    ]
-        return []
+                    if seen_as < DISTINCT_DELTA_E:
+                        confusing.append((first, second, kind, normal, seen_as))
+                        break
+        if not confusing:
+            return []
+        # 대표로 알릴 쌍: 본문색이 끼지 않은 쌍(강조색끼리, 예 '폐지' 빨강 / '유지' 초록)을 먼저
+        confusing.sort(key=lambda item: (body in item[:2], item[4]))
+        first, second, kind, normal, seen_as = confusing[0]
+        marked = sorted({color for pair in confusing for color in pair[:2] if color != body})
+        words = [_short(by_color[color][0].text) for color in (first, second)]
+        return [
+            Finding(
+                # id 끝: 바꿀 색들(본문색 제외) + "_" + 본문색 → 수정 후보가 '본문과도 구분되는 색'을 고를 때 씀
+                id=f"{self.id}.color_only:{shape.key}:"
+                + "-".join(_hex(color)[1:] for color in marked)
+                + f"_{_hex(body)[1:]}",
+                rule_id=f"{self.id}.color_only",
+                shape_key=shape.key,
+                severity="review",
+                message=f"{CVD_LABELS[kind]}이면 색으로 구분한 글자가 같은 색으로 보입니다",
+                measured=round(seen_as, 1),
+                expected=DISTINCT_DELTA_E,
+                evidence=(
+                    f'"{words[0]}" {_hex(first)} 와 "{words[1]}" {_hex(second)} 의 색차가 '
+                    f"보통 눈 {normal:.0f} → {CVD_LABELS[kind]} {seen_as:.0f} (기준 {DISTINCT_DELTA_E:g}). "
+                    "굵게·밑줄·기호(✕ ○) 등 색 외의 표시도 함께 쓰세요 "
+                    "(Okabe & Ito CUD 원칙 2, WCAG 2.2 SC 1.4.1 색 사용)"
+                ),
+                box=shape.text_bounds or shape.box,
+            )
+        ]
 
 
 def _short(text: str) -> str:

@@ -44,7 +44,32 @@ def test_fix_candidate_passes_for_every_kind_of_eye():
     findings = ColorVisionRule().evaluate(deck, AnalysisPolicy())
     result = RuleBasedPlanner().plan(deck, findings, AnalysisPolicy())
     colors = [p.after for p in result.proposals if p.prop == "font.color"]
-    assert colors and all(worst_vision_contrast(color, "202020") >= 3.0 for color in colors)
+    # 색약 수정은 큰 글자 기준(3:1)이 아니라 4.5:1까지, 빨강 대신 색각 친화 주황 계열(Okabe & Ito)
+    assert colors and all(worst_vision_contrast(color, "202020") >= 4.5 for color in colors)
+    assert all("Okabe" in p.note for p in result.proposals)
+
+
+def test_colour_only_fix_recolours_both_marks_to_cud_colours():
+    """'폐지' 빨강 / '유지' 초록 → 모든 눈에서 서로·본문과 구분되는 Okabe & Ito 계열 색으로 함께 바꿈."""
+    from slideguard.checks.color_vision import delta_e, simulate
+    from slideguard.planning.color import hex_to_rgb
+
+    dark = (0x22, 0x22, 0x22)
+    runs = (
+        TextRun("정문: ", 24.0, dark, False),
+        TextRun("폐지", 24.0, (0xD6, 0x27, 0x28), False),
+        TextRun(" 도서관: ", 24.0, dark, False),
+        TextRun("유지", 24.0, (0x2C, 0xA0, 0x2C), False),
+    )
+    deck = _deck(*runs, background=WHITE)
+    findings = ColorVisionRule().evaluate(deck, AnalysisPolicy())
+    result = RuleBasedPlanner().plan(deck, findings, AnalysisPolicy())
+    changes = {p.before: p.after for p in result.proposals}
+    assert set(changes) == {"D62728", "2CA02C"} and len({p.group for p in result.proposals}) == 1
+    red, green = (hex_to_rgb(changes[key]) for key in ("D62728", "2CA02C"))
+    for kind in ("protan", "deutan", "tritan"):
+        assert delta_e(simulate(red, kind), simulate(green, kind)) >= 30
+    assert all(worst_vision_contrast(color, "FFFFFF") >= 4.5 for color in changes.values())
 
 
 def test_colour_only_emphasis_that_vanishes_for_deutan_is_reviewed():

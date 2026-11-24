@@ -16,10 +16,17 @@ from tests.fakes import FakePolicy
 
 
 class DocRun:
-    def __init__(self, size, color, font="맑은 고딕"):
+    def __init__(self, size, color, font="맑은 고딕", bold=False):
         self.size = size
         self.color = color
         self.font = font
+        self.bold = bold
+
+    def get_bold(self):
+        return self.bold
+
+    def set_bold(self, value):
+        self.bold = value
 
     def get_size(self):
         return self.size
@@ -381,3 +388,10 @@ def test_shrinking_font_proposal_only_changes_text_of_that_size(original, tmp_pa
     shape = DocShape(runs=[DocRun(40, "000000"), DocRun(20, "000000")])
     result = run_apply(original, tmp_path, shape, [proposal(Property.FONT_SIZE, 40, 32)])
     assert result.applied and [run.size for run in shape.runs()] == [32, 20]
+
+
+def test_bold_proposal_only_bolds_text_of_that_colour(original, tmp_path):
+    """색만으로 구분한 글자: 그 색 글자만 굵게 (본문은 그대로)."""
+    shape = DocShape(runs=[DocRun(20, "222222"), DocRun(20, "D62728"), DocRun(20, "D62728", bold=True)])
+    result = run_apply(original, tmp_path, shape, [proposal(Property.FONT_BOLD, "D62728", True)])
+    assert result.applied and [run.bold for run in shape.runs()] == [False, True, True]

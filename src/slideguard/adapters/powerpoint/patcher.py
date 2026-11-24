@@ -335,6 +335,7 @@ def apply_proposal(doc: Document, p: ChangeProposal, result: ApplyResult) -> Non
         Property.FONT_SIZE: _apply_font_size,
         Property.FONT_COLOR: _apply_font_color,
         Property.FONT_FAMILY: _apply_font_family,
+        Property.FONT_BOLD: _apply_font_bold,
         Property.SHAPE_HEIGHT: _apply_height,
         Property.SHAPE_WIDTH: _apply_width,
         Property.SHAPE_POSITION: _apply_position,
@@ -433,6 +434,20 @@ def _apply_font_color(shape: ShapeHandle, p: ChangeProposal):
         color = run.get_color()
         if color is not None and color.upper() == before:
             run.set_color(after)
+            changed += 1
+    return changed
+
+
+def _apply_font_bold(shape: ShapeHandle, p: ChangeProposal):
+    """글자색이 p.before인 글자를 굵게 (색만으로 구분한 글자에 색 외의 표시를 더함: Okabe & Ito CUD 원칙 2)."""
+    target = str(p.before).upper().lstrip("#")
+    changed = 0
+    for run in shape.runs():
+        get_bold = getattr(run, "get_bold", None)
+        if get_bold is None or str(run.get_color() or "").upper() != target:
+            continue
+        if get_bold() is not True:
+            run.set_bold(bool(p.after))
             changed += 1
     return changed
 
@@ -661,6 +676,15 @@ class _ComRun:
     def set_font_name(self, name: str) -> None:
         self._tr.Font.Name = name
         self._tr.Font.NameFarEast = name
+
+    def get_bold(self) -> bool | None:
+        try:
+            return int(self._tr.Font.Bold) == MSO_TRUE
+        except _COM_ERRORS:
+            return None
+
+    def set_bold(self, bold: bool) -> None:
+        self._tr.Font.Bold = MSO_TRUE if bold else 0
 
 
 class _ComParagraph:
