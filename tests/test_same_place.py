@@ -67,3 +67,12 @@ def test_lens_card_offers_individual_and_batch_options():
     labels = [option.label for option in mark.options]
     assert labels[0].startswith("글자 크기") and labels[1].startswith("[같은 자리 3쪽 일괄]")
     assert mark.options[1].proposal_ids == ("font.size@1:9", "font.size@2:9", "font.size@3:9")
+
+
+def test_page_number_box_height_is_batched_too():
+    """쪽 번호 상자 높이 늘리기도 같은 자리 모든 쪽에 일괄 적용 (사용자 요청: 개체 높이 28.8pt → 46pt)."""
+    deck = _deck(*(_page_number(n) for n in range(1, 4)))
+    height = ChangeProposal("shape.height@1:9", "layout.overflow:1:9", "1:9", "shape.height", 24.0, 40.0, 0.1)
+    extended = extend_same_place(deck, [height])
+    assert [p.shape_key for p in extended] == ["1:9", "2:9", "3:9"]
+    assert same_place_sets(deck, extended) == [("shape.height@1:9", "shape.height@2:9", "shape.height@3:9")]

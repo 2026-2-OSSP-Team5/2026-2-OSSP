@@ -216,6 +216,7 @@ class RuleBasedPlanner:
                 or info.values.get("color_vision")
                 or info.rule in CONSISTENCY_FIXES
                 or info.rule == COLOR_ONLY_RULE
+                or info.rule == Rule.SAFE_MARGIN  # 안전 여백 침범: 가장 가까운 안쪽으로 옮기는 후보
             ):
                 skip("사람의 검토가 필요한 항목")
                 continue
@@ -871,23 +872,31 @@ class RuleBasedPlanner:
         ratio = ctx["standards"].safe_margin_ratio.value
         mx, my = slide_w * ratio, slide_h * ratio
 
-        fits_safe = (
-            shape.width <= slide_w - 2 * mx + TOLERANCE and shape.height <= slide_h - 2 * my + TOLERANCE
-        )
-        if fits_safe:
+        # 옮길 기준 = 글자가 실제로 그려진 영역 (검사도 이 영역으로 판정함).
+        # 상자가 넓어도(제목 자리 표시자 등) 글자만 안전 영역에 들어가면 되므로 글자 영역만큼만 옮긴다.
+        # 글자 영역을 모르면 상자 자체를 기준으로 한다.
+        text_box = info.values.get("text_box")
+        if text_box is not None:
+            tx, ty, tw, th = text_box
+        else:
+            tx, ty, tw, th = shape.left, shape.top, shape.width, shape.height
+
+        if tw <= slide_w - 2 * mx + TOLERANCE and th <= slide_h - 2 * my + TOLERANCE:
             area = (mx, my, slide_w - mx, slide_h - my)
             where = f"가장자리 여백 {ratio:.0%} 안쪽으로"
         elif info.rule == Rule.SAFE_MARGIN:
-            return [], "상자가 안전 영역보다 큼 → 크기 조정은 사람이 판단"
-        elif shape.width <= slide_w + TOLERANCE and shape.height <= slide_h + TOLERANCE:
+            return [], "글자 영역이 안전 영역보다 큼 → 크기 조정은 사람이 판단"
+        elif tw <= slide_w + TOLERANCE and th <= slide_h + TOLERANCE:
             area = (0.0, 0.0, slide_w, slide_h)
             where = "슬라이드 안으로"
         else:
-            return [], "상자가 슬라이드보다 큼 → 사람이 판단"
+            return [], "글자 영역이 슬라이드보다 큼 → 사람이 판단"
 
-        new_left = min(max(shape.left, area[0]), area[2] - shape.width)
-        new_top = min(max(shape.top, area[1]), area[3] - shape.height)
-        distance = math.hypot(new_left - shape.left, new_top - shape.top)
+        # 글자 영역이 안전 영역 안에 들어가는 가장 짧은 이동 (가로·세로 각각 가장 가까운 안쪽 경계로)
+        dx = min(max(tx, area[0]), area[2] - tw) - tx
+        dy = min(max(ty, area[1]), area[3] - th) - ty
+        new_left, new_top = shape.left + dx, shape.top + dy
+        distance = math.hypot(dx, dy)
         if distance <= TOLERANCE:
             return [], "이미 안쪽에 있음 (측정값 확인 필요)"
 

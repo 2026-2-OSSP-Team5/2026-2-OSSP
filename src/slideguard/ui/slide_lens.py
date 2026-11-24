@@ -193,6 +193,8 @@ def build_marks(
     selected = {str(item) for item in selected_ids}
     applied = {str(item) for item in applied_ids}
 
+    # 같은 자리 일괄 묶음은 슬라이드마다 한 번만 계산 (배지마다 다시 계산하면 큰 문서에서 화면이 멈춤)
+    batch_sets = same_place_sets(report.deck, list(report.proposals)) if proposals else []
     marks = []
     for key in sorted(set(findings) | set(proposals), key=_key_order):
         items = sorted(findings.get(key, []), key=finding_rank)
@@ -205,9 +207,17 @@ def build_marks(
             box = next((located for item in items if (located := locate(report, item)) is not None), None)
         if box is None:
             box = _shape_box(report, key)
-        options = _options(report, proposals.get(key, []), applied)
+        options = _options(report, proposals.get(key, []), applied, batch_sets)
         active = [item for item in proposals.get(key, []) if item.id in applied or item.id in selected]
-        message = items[0].message if items else ""
+        # 펼쳤을 때 이 개체의 판정을 모두 보여 줌 (전에는 가장 심한 것 하나만 보여 줘서
+        # 제목이 어느 쪽은 '안전 여백', 어느 쪽은 '본문과 크기 차이'만 말하는 것처럼 보였음)
+        texts = list(dict.fromkeys(item.message for item in items if item.message))  # 같은 설명은 한 번만
+        if len(texts) > 1:
+            message = "\n".join(f"• {text}" for text in texts[:4])
+            if len(texts) > 4:
+                message += f"\n• 그 밖에 {len(texts) - 4}개"
+        else:
+            message = texts[0] if texts else ""
         if active:
             # 바꾸는 이유: '명암비 2.1:1 → 4.6:1 (기준 4.5:1)'처럼 수정 전후 수치를 판정 설명 뒤에 붙임
             reason = change_reason(
@@ -261,7 +271,10 @@ def build_marks(
 
 
 def _options(
-    report: AnalysisReport, proposals: list[ChangeProposal], applied: set[str]
+    report: AnalysisReport,
+    proposals: list[ChangeProposal],
+    applied: set[str],
+    batch_sets: list[tuple[str, ...]] | None = None,
 ) -> tuple[LensOption, ...]:
     """한 개체의 수정 후보를 체크 항목으로. 같은 묶음(id의 #뒤)은 함께 켜고 끈다."""
     groups: dict[str, list[ChangeProposal]] = {}
@@ -281,7 +294,9 @@ def _options(
     # 같은 자리(쪽 번호·머리글 등) 같은 수정: 다른 슬라이드까지 한 번에 켜고 끄는 '일괄 적용' 항목
     own_ids = {item.id for item in proposals}
     by_id = {item.id: item for item in report.proposals}
-    for members in same_place_sets(report.deck, list(report.proposals)):
+    if batch_sets is None:
+        batch_sets = same_place_sets(report.deck, list(report.proposals))
+    for members in batch_sets:
         mine = [member for member in members if member in own_ids]
         if not mine:
             continue
@@ -421,7 +436,11 @@ def metric_text(finding: Finding) -> tuple[str, str]:
     if rule == "layout.margin":
         if number and measured < 0:
             return "슬라이드 밖", ""
-        return (f"{measured:g}pt" if number else "가장자리"), (f"여백 {expected:g}pt 이상" if limit else "")
+        # 메시지 끝의 '(왼쪽)' 같은 방향을 붙여 어느 가장자리인지 보이게 (예: "왼쪽 55.2pt · 72pt 이상")
+        side = finding.message.rsplit("(", 1)[-1].rstrip(")") if finding.message.endswith(")") else ""
+        side = side if side in ("왼쪽", "오른쪽", "위", "아래") else ""
+        value = f"{side} {measured:g}pt".strip() if number else "가장자리"
+        return value, (f"여백 {expected:g}pt 이상" if limit else "")
     if rule == "layout.overlap":
         return "겹침", ""
     if rule.startswith("color_vision.contrast") and number:
@@ -892,7 +911,7 @@ class BadgeHandle(QWidget):
         y = BADGE_HEIGHT + 8.0
         message = None
         if self.mark is not None and self.mark.message:
-            lines = min(6, max(1, _wrapped_lines(self.mark.message, font, inner)))  # 판정 설명 + 바꾸는 이유
+            lines = min(9, max(1, _wrapped_lines(self.mark.message, font, inner)))  # 판정 설명 + 바꾸는 이유
             message = QRectF(12, y, inner, lines * QFontMetricsF(font).lineSpacing())
             y = message.bottom() + 8
         rows = []

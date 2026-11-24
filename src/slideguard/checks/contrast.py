@@ -133,11 +133,39 @@ MIN_BACKGROUND_SAMPLES = 4
 SAMPLE_OUTLIER_SHARE = 0.2
 
 
+# 글자 둘레 픽셀 중 글자 자신의 획(잉크)으로 볼 수 있는 픽셀은 이 비율까지만 빼 준다.
+# 글자가 상자 밖으로 삐져나오면(위로 넘침 등) 둘레에서 뽑은 픽셀이 글자 획 위에 떨어진다.
+# 그 픽셀을 배경으로 보면 '검은 글씨 뒤 배경도 검정'이 되어, 회녹색 배경의 검은 쪽 번호(5.5:1)를
+# 회색(1.5:1)으로 바꾸라는 엉뚱한 후보가 나온다.
+TEXT_INK_MAX_SHARE = 0.5
+
+
+def without_text_ink(color: Color, samples: list[Color]) -> list[Color]:
+    """주변 픽셀에서 글자 획으로 보이는 픽셀(글자색 쪽에 가까운 픽셀)을 뺀 목록.
+
+    기준: 픽셀들의 중간 밝기(대표 배경)와 글자 밝기의 '중간점'보다 글자 쪽에 있는 픽셀 = 글자 획·번진 가장자리.
+    그런 픽셀이 절반 이상이면 정말 배경이 글자색과 비슷한 것일 수 있으므로 빼지 않는다.
+    """
+    if len(samples) < MIN_BACKGROUND_SAMPLES:
+        return list(samples)
+    text = relative_luminance(color)
+    middle = sorted(relative_luminance(sample) for sample in samples)[len(samples) // 2]
+    halfway = abs(middle - text) / 2
+    if halfway <= 0:
+        return list(samples)
+    kept = [sample for sample in samples if abs(relative_luminance(sample) - text) >= halfway]
+    dropped = len(samples) - len(kept)
+    if dropped >= len(samples) * TEXT_INK_MAX_SHARE or len(kept) < MIN_BACKGROUND_SAMPLES:
+        return list(samples)
+    return kept
+
+
 def sample_contrast(color: Color, samples: list[Color]) -> tuple[float, Color]:
     """주변 픽셀 대비 명암비: 가장 나쁜 쪽에서 SAMPLE_OUTLIER_SHARE만큼 뺀 뒤 가장 나쁜 값 (근사).
 
     planner(bindings)도 이 함수로 어떤 글자색의 판정인지 찾는다.
     """
+    samples = without_text_ink(color, samples)  # 상자 밖으로 나온 글자 획은 배경이 아님
     ranked = sorted(samples, key=lambda sample: contrast_ratio(color, sample))
     pick = ranked[min(len(ranked) - 1, int(len(ranked) * SAMPLE_OUTLIER_SHARE))]
     return contrast_ratio(color, pick), pick
@@ -149,6 +177,7 @@ def best_sample_contrast(color: Color, samples: list[Color]) -> float:
     이 값조차 기준 미달이면 배경 어디에 놓여도 읽기 어렵다는 뜻이라 '근사'가 아니라 확정 문제다.
     (예: 흰 카드 위 연회색 글자 → 주변 픽셀이 전부 흰색이라 가장 유리한 값도 2.6:1)
     """
+    samples = without_text_ink(color, samples)
     ranked = sorted(samples, key=lambda sample: contrast_ratio(color, sample))
     pick = ranked[max(0, len(ranked) - 1 - int(len(ranked) * SAMPLE_OUTLIER_SHARE))]
     return contrast_ratio(color, pick)

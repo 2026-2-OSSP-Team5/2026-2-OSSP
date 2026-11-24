@@ -397,6 +397,16 @@ class TeamBindings:
                 values["required_count"] = expected
 
         values.update(consistency)
+        if rule_id == "layout.margin":
+            # 여백 검사는 글자가 실제로 그려진 영역(글자 상자)으로 판정한다 → 옮길 거리도 그 영역으로 계산
+            text_box = getattr(finding, "box", None)
+            if text_box is not None:
+                values["text_box"] = (
+                    float(text_box.x),
+                    float(text_box.y),
+                    float(text_box.width),
+                    float(text_box.height),
+                )
         if rule_id == "color_vision.color_only":
             # 색만으로 구분한 글자: 글자 뒤 배경색 (모르면 흰색으로 봄 — 대부분의 본문 슬라이드)
             background = _normalize_color(getattr(shape, "background", None)) if shape is not None else None
@@ -466,6 +476,11 @@ class TeamBindings:
                 if min(abs(worst - ratio), abs(best - ratio)) <= _RATIO_TOLERANCE:
                     foreground = color
                     break
+        # 글자 획 위에 떨어진 픽셀은 배경이 아니므로 빼고 본다 (B의 판정과 같은 방법)
+        from slideguard.checks.contrast import without_text_ink
+
+        background_only = without_text_ink(_rgb(foreground), [_rgb(color) for color in samples])
+        samples = ["{:02X}{:02X}{:02X}".format(*pixel) for pixel in background_only]
         plain = _plain_background(samples)
         if plain is not None:
             # 렌더링해 보니 글자 뒤가 사실상 한 가지 색 (흰 슬라이드 위 연회색 출처 글씨 등)

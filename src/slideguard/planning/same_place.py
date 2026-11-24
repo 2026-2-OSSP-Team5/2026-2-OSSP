@@ -18,8 +18,14 @@ from __future__ import annotations
 from dataclasses import replace
 
 POSITION_TOLERANCE_PT = 1.0
-# 일괄 적용하는 속성: 글자 서식만 (위치·크기를 한꺼번에 옮기는 것은 쪽마다 주변이 달라 위험)
-BATCH_PROPERTIES = ("font.size", "font.color", "font.bold")
+# 일괄 적용하는 속성: 글자 서식 + 상자 높이·너비
+#   같은 자리의 쪽 번호·머리글은 상자 크기도 같으므로 높이·너비도 똑같이 바꾸는 게 맞다
+#   (쪽마다 따로 늘리면 쪽 번호 상자 크기가 쪽마다 달라짐).
+#   위치 이동(shape.position)은 쪽마다 planner가 겹침을 확인해 만든 후보끼리만 묶는다
+#   (다른 쪽에 후보를 새로 복사하지는 않음: 쪽마다 주변 개체가 달라 겹칠 수 있음)
+BATCH_PROPERTIES = ("font.size", "font.color", "font.bold", "shape.height", "shape.width", "shape.position")
+COPY_PROPERTIES = ("font.size", "font.color", "font.bold", "shape.height", "shape.width")
+_SIZE_PROPERTIES = {"shape.height": "height", "shape.width": "width"}
 RECOMMENDED_MARK = "~rec"
 
 
@@ -69,6 +75,13 @@ def _norm(value):
 
 def _has_value(shape, proposal) -> bool:
     """이 개체에 같은 수정을 해도 되는지 (지금 값이 원래 값과 같은지)."""
+    if proposal.property in _SIZE_PROPERTIES:
+        # 상자 높이·너비: 그 개체의 지금 크기가 원래 값과 같을 때만 (같은 자리면 보통 같음)
+        size = getattr(shape.box, _SIZE_PROPERTIES[proposal.property], None)
+        try:
+            return size is not None and abs(float(size) - float(proposal.before)) <= POSITION_TOLERANCE_PT
+        except (TypeError, ValueError):
+            return False
     runs = [run for run in shape.runs if run.text.strip()]
     if not runs:
         return False
@@ -112,13 +125,13 @@ def extend_same_place(deck, proposals: list) -> list:
     extra = []
     for proposal in proposals:
         source = shapes.get(proposal.shape_key)
-        if source is None or not _batchable(proposal):
+        if source is None or not _batchable(proposal) or proposal.property not in COPY_PROPERTIES:
             continue
         for key, shape in shapes.items():
             if not _simple_key(key) or not _same_place(source, shape):
                 continue
             existing = by_target.get((key, proposal.property, RECOMMENDED_MARK in _base_id(proposal)), [])
-            if proposal.property != "font.size":
+            if proposal.property not in ("font.size", *_SIZE_PROPERTIES):
                 existing = [item for item in existing if _norm(item.before) == _norm(proposal.before)]
             if existing or not _has_value(shape, proposal):
                 continue  # 이미 후보가 있음(같든 다르든 그 후보를 존중) 또는 값이 달라 같은 서식이 아님
@@ -135,25 +148,38 @@ def extend_same_place(deck, proposals: list) -> list:
 
 
 def same_place_sets(deck, proposals: list) -> list[tuple[str, ...]]:
-    """'같은 자리 · 같은 수정' 후보 id 묶음들 (2개 이상, 서로 다른 슬라이드). 첫 후보 순서대로."""
+    """'같은 자리 · 같은 수정' 후보 id 묶음들 (2개 이상, 서로 다른 슬라이드). 첫 후보 순서대로.
+
+    속도: 후보가 수천 개여도 빠르도록 '같은 수정'(속성·전·후 값)끼리 먼저 나눈 뒤 그 안에서만 자리를 비교한다.
+    (전에는 모든 후보 쌍을 비교해서 24쪽 문서에서 렌즈를 그릴 때마다 몇 초씩 화면이 멈췄음)
+    """
     shapes = {shape.key: shape for shape in getattr(deck, "shapes", ()) if _usable(shape)}
-    candidates = [item for item in proposals if _batchable(item) and item.shape_key in shapes]
+    by_signature: dict[tuple, list] = {}
+    for item in proposals:
+        if _batchable(item) and item.shape_key in shapes:
+            by_signature.setdefault(_signature(item), []).append(item)
     seen: set[str] = set()
     sets = []
-    for proposal in candidates:
-        if proposal.id in seen:
+    for candidates in by_signature.values():
+        if len(candidates) < 2:
             continue
-        source = shapes[proposal.shape_key]
-        members = [proposal]
-        for other in candidates:
-            if other.id == proposal.id or other.id in seen or _signature(other) != _signature(proposal):
+        for proposal in candidates:
+            if proposal.id in seen:
                 continue
-            if other.shape_key in {m.shape_key for m in members}:
-                continue  # 한 개체에는 하나만 (같은 개체의 다른 후보는 묶지 않음)
-            if _same_place(source, shapes[other.shape_key]):
-                members.append(other)
-        slides = {shapes[m.shape_key].slide_number for m in members}
-        if len(slides) >= 2:
-            sets.append(tuple(m.id for m in members))
-            seen.update(m.id for m in members)
+            source = shapes[proposal.shape_key]
+            members = [proposal]
+            used_keys = {proposal.shape_key}
+            for other in candidates:
+                if other.id == proposal.id or other.id in seen or other.shape_key in used_keys:
+                    continue  # 한 개체에는 하나만 (같은 개체의 다른 후보는 묶지 않음)
+                if _same_place(source, shapes[other.shape_key]):
+                    members.append(other)
+                    used_keys.add(other.shape_key)
+            slides = {shapes[m.shape_key].slide_number for m in members}
+            if len(slides) >= 2:
+                sets.append(tuple(m.id for m in members))
+                seen.update(m.id for m in members)
+    # 원래 순서(첫 후보가 목록에 나온 순서)대로
+    order = {item.id: index for index, item in enumerate(proposals)}
+    sets.sort(key=lambda ids: order.get(ids[0], 0))
     return sets
