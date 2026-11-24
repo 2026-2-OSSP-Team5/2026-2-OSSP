@@ -102,3 +102,34 @@ def test_ocr_timeout_kills_powershell_and_skips_later_files(tmp_path, monkeypatc
     with pytest.raises(RuntimeError):
         image_text._run_ocr([tmp_path / "a.png"], tmp_path)
     assert image_text._disabled_reason is not None
+
+
+def test_reader_reuses_the_snapshot_of_the_same_file_content(tmp_path):
+    """설정만 바꿔 다시 검사할 때는 PowerPoint로 다시 읽지 않음 (같은 내용 → 같은 스냅샷)."""
+    import hashlib
+
+    from slideguard.adapters.powerpoint import reader as reader_module
+    from slideguard.domain.models import DeckSnapshot
+
+    path = tmp_path / "deck.pptx"
+    path.write_bytes(b"one")
+    reads = []
+    ocr = {"on": False}
+
+    class Fake(reader_module.PowerPointDeckReader):
+        def _read_with_powerpoint(self, target):
+            reads.append(target)
+            sha = hashlib.sha256(target.read_bytes()).hexdigest()
+            return DeckSnapshot(str(target), sha, 1, 960, 540)
+
+    reader_module.clear_snapshot_cache()
+    reader = Fake(None, render=True, wants_image_text=lambda _path: ocr["on"])
+    first = reader.read(path)
+    assert reader.read(path) is first and len(reads) == 1  # 설정만 바뀜 → 다시 안 읽음
+    ocr["on"] = True
+    reader.read(path)
+    assert len(reads) == 2  # 그림 속 글자 검사를 새로 켜면 문자 인식 때문에 다시 읽음
+    path.write_bytes(b"two")
+    reader.read(path)
+    assert len(reads) == 3  # 내용이 바뀌면 다시 읽음
+    reader_module.clear_snapshot_cache()

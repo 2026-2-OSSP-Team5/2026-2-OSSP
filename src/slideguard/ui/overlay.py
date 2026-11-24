@@ -2026,7 +2026,7 @@ class OverlayController(QObject):
         self.overlay.preview_state_changed.connect(self._redraw_lens)
         self.overlay.lens_toggled.connect(self.set_lens_enabled)
         self.overlay.proposal_user_toggled.connect(self._panel_proposal_toggled)
-        self.settings_dialog.settings_saved.connect(self.restart_collection)
+        self.settings_dialog.settings_saved.connect(self._settings_saved)
         self.detected.connect(self._on_detected)
         self.completed.connect(self._on_completed)
         self.collection_failed.connect(self._on_collection_failure)
@@ -2042,6 +2042,15 @@ class OverlayController(QObject):
         self.preview_timer.setInterval(300)
         self.preview_timer.timeout.connect(self._start_preview)
         self.restart_collection()
+
+    def _settings_saved(self):
+        """설정 저장 → 폴더 감시를 다시 시작하고, 지금 보고 있는 문서를 맨 먼저 다시 검사."""
+        self.restart_collection()
+        path = self.active_path
+        if self.collection is not None and path is not None and self._in_workspace(path):
+            # 수동 요청은 대기열 맨 앞으로 간다 (폴더의 다른 파일을 다 검사할 때까지 기다리지 않게).
+            # 같은 내용은 이미 읽어 둔 스냅샷을 다시 쓰므로 PowerPoint로 다시 열지 않고 판정만 새로 한다
+            self.request_path(path)
 
     def restart_collection(self):
         if self.collection is not None:
