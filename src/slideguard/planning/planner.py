@@ -895,15 +895,44 @@ class RuleBasedPlanner:
         # 글자 영역이 안전 영역 안에 들어가는 가장 짧은 이동 (가로·세로 각각 가장 가까운 안쪽 경계로)
         dx = min(max(tx, area[0]), area[2] - tw) - tx
         dy = min(max(ty, area[1]), area[3] - th) - ty
-        new_left, new_top = shape.left + dx, shape.top + dy
-        distance = math.hypot(dx, dy)
-        if distance <= TOLERANCE:
+        if math.hypot(dx, dy) <= TOLERANCE:
             return [], "이미 안쪽에 있음 (측정값 확인 필요)"
 
-        blocked = _new_collisions(shape, (new_left, new_top, shape.width, shape.height), others)
-        if blocked:
-            ids = ", ".join(str(o.shape_id) for o in blocked)
-            return [], f"안으로 옮기면 다른 객체(ID {ids})와 겹침 → 사람이 판단"
+        # 가로·세로를 함께 옮기는 게 안 되면 한쪽만 옮긴다 (예: 머리 띠 안의 제목은 오른쪽으로 들여쓰기만).
+        # 안 되는 경우: 다른 객체와 새로 겹침, 또는 지금 글자를 담고 있는 띠·카드 밖으로 글자가 나감
+        # → 같은 모양의 슬라이드들이 쪽마다 다른 후보(어디는 이동, 어디는 없음)를 받지 않도록 같은 규칙으로 고름
+        text_rect = (tx, ty, tw, th)
+        holders = [
+            other
+            for other in others
+            if other.shape_id != shape.shape_id
+            and other.kind != "text"
+            and other.has_geometry
+            and _rect_inside(text_rect, (other.left, other.top, other.width, other.height))
+        ]
+        tried, partial = [], ""
+        for mx_, my_, label in ((dx, dy, ""), (dx, 0.0, "가로만"), (0.0, dy, "세로만")):
+            if math.hypot(mx_, my_) <= TOLERANCE:
+                continue
+            moved_text = (tx + mx_, ty + my_, tw, th)
+            leaves = [h for h in holders if not _rect_inside(moved_text, (h.left, h.top, h.width, h.height))]
+            rect = (shape.left + mx_, shape.top + my_, shape.width, shape.height)
+            blocked = _new_collisions(shape, rect, others)
+            if leaves:
+                tried.append(f"{label or '그대로'}: 글자를 담은 띠·카드(ID {leaves[0].shape_id}) 밖으로 나감")
+                continue
+            if blocked:
+                ids = ", ".join(str(o.shape_id) for o in blocked)
+                tried.append(f"{label or '그대로'}: 다른 객체(ID {ids})와 겹침")
+                continue
+            dx, dy, partial = mx_, my_, label
+            break
+        else:
+            return [], "안으로 옮기면 " + " / ".join(tried) + " → 사람이 판단"
+        new_left, new_top = shape.left + dx, shape.top + dy
+        distance = math.hypot(dx, dy)
+        if partial:
+            where = f"{where} ({partial}: 다른 방향은 겹침·띠 밖이라 그대로)"
 
         before = (shape.left, shape.top)
         after = (round(new_left, 2), round(new_top, 2))
@@ -1267,6 +1296,16 @@ COLOR_ONLY_RULE = "color_vision.color_only"
 
 # 일관성 판정 가운데 수정 후보를 만드는 것 (본문 크기는 내용 양 때문일 수 있어 사람이 판단)
 CONSISTENCY_FIXES = ("consistency.title_position", "consistency.title_size")
+
+
+def _rect_inside(inner: tuple, outer: tuple) -> bool:
+    """(왼, 위, 너비, 높이) inner가 outer 안에 들어가는지 (허용 오차 포함)."""
+    return (
+        outer[0] - TOLERANCE <= inner[0]
+        and outer[1] - TOLERANCE <= inner[1]
+        and inner[0] + inner[2] <= outer[0] + outer[2] + TOLERANCE
+        and inner[1] + inner[3] <= outer[1] + outer[3] + TOLERANCE
+    )
 
 
 def _new_collisions(shape: ShapeInfo, new_rect: tuple, others: list[ShapeInfo]) -> list[ShapeInfo]:
