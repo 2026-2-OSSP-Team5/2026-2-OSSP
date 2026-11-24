@@ -1477,7 +1477,7 @@ class SettingsDialog(QDialog):
         self.path_provider = path_provider
         self.document: Path | None = None
         self.setWindowTitle("SlideGuard 설정")
-        self.resize(590, 490)
+        self.resize(620, 600)
         self.setStyleSheet(OVERLAY_STYLE)
         outer = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -1538,7 +1538,9 @@ class SettingsDialog(QDialog):
         self.screen_inches_edit = QLineEdit(placeholderText="화면 대각선 인치 (예 100)")
         self.distance_edit = QLineEdit(placeholderText="맨 뒷줄 거리 m (예 10)")
         viewing_row.addWidget(self.screen_inches_edit)
+        viewing_row.addWidget(QLabel("인치"))
         viewing_row.addWidget(self.distance_edit)
+        viewing_row.addWidget(QLabel("m"))
         policy_form.addRow("발표 환경", viewing_row)
         self.viewing_hint = QLabel(objectName="muted")
         self.viewing_hint.setWordWrap(True)

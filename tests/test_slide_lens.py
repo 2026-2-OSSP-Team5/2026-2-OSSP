@@ -562,3 +562,18 @@ def test_unknown_cell_findings_join_the_table_badge():
     )
     report = AnalysisReport(DeckSnapshot("t.pptx", "0" * 64, 7, 960, 540), cells, ())
     assert sorted(mark.key for mark in build_marks(report, 7)) == ["7:5", "7:5:table_cell:1,2"]
+
+
+def test_new_rules_have_short_badge_text():
+    from slideguard.ui.slide_lens import metric_text, rule_title
+
+    cases = [
+        ("color_vision.contrast", 2.35, 3.0, ("2.4:1", "최소 3:1"), "색약 명암비"),
+        ("color_vision.color_only", 7.3, 15.0, ("구분 어려움", ""), "색만으로 강조"),
+        ("consistency.title_position", "100,72", "43,29", ("위치 다름", ""), "제목 위치"),
+        ("consistency.title_size", 24.0, 32.0, ("24pt", "다른 쪽 32pt"), "제목 크기"),
+        ("image_text.size", 11.2, 14.0, ("약 11.2pt", "최소 14pt"), "그림 속 글자"),
+    ]
+    for rule, measured, expected, text, title in cases:
+        finding = Finding(f"{rule}:1:2", rule, "1:2", "review", "", measured, expected, "")
+        assert metric_text(finding) == text and rule_title(finding) == title

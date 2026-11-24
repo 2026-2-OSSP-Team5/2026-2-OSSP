@@ -22,6 +22,7 @@ import sys
 import tempfile
 from dataclasses import replace
 from pathlib import Path
+from statistics import median
 from time import perf_counter
 
 from PIL import Image
@@ -33,7 +34,9 @@ PLACEHOLDER_TYPE = 14  # msoPlaceholder (그림 자리 표시자에 넣은 그�
 EXPORT_WIDTH = 2000  # 슬라이드를 내보낼 너비(px). 작은 글자도 읽히도록 넉넉히
 MIN_LINE_PX = 8  # 이보다 낮은 줄은 잡음으로 봄
 MIN_PICTURE_SHARE = 0.03  # 슬라이드 면적의 3% 미만인 그림(아이콘·로고)은 읽지 않음 (검사 시간 절약)
-GLYPH_PER_EM = 0.85  # 글자 줄 높이(잉크) ÷ 글자 크기: 한글·영문 평균 근사
+GLYPH_PER_EM = (
+    0.9  # 단어 높이(잉크) ÷ 글자 크기: 한글 약 0.9 (Noto Sans CJK 22px 글자 → 단어 높이 21px 로 확인)
+)
 OCR_TIMEOUT_SECONDS = 90
 
 _SCRIPT = r"""
@@ -64,13 +67,14 @@ foreach ($path in (Get-Content -LiteralPath $ListPath -Encoding UTF8)) {
     $ocr = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
     $lines = @()
     foreach ($line in $ocr.Lines) {
-        $left = 1e9; $top = 1e9; $right = 0; $bottom = 0
+        $left = 1e9; $top = 1e9; $right = 0; $bottom = 0; $heights = @()
         foreach ($word in $line.Words) {
             $r = $word.BoundingRect
             $left = [Math]::Min($left, $r.X); $top = [Math]::Min($top, $r.Y)
             $right = [Math]::Max($right, $r.X + $r.Width); $bottom = [Math]::Max($bottom, $r.Y + $r.Height)
+            $heights += $r.Height
         }
-        $lines += @{ text = $line.Text; x = $left; y = $top; w = $right - $left; h = $bottom - $top }
+        $lines += @{ text = $line.Text; x = $left; y = $top; w = $right - $left; h = $bottom - $top; hs = $heights }
     }
     $stream.Dispose()
     $results += @{ path = $path; lines = $lines }
@@ -224,10 +228,22 @@ def _measure_lines(path: Path, lines: list[dict], scale: float, box) -> list[dic
         for line in lines:
             text = str(line.get("text", "")).strip()
             x, y, w, h = (float(line.get(key, 0)) for key in ("x", "y", "w", "h"))
-            if len("".join(text.split())) < 2 or h < MIN_LINE_PX:
+            # 글자 높이는 단어 높이의 중앙값 (줄 전체 상자는 잘못 읽은 단어 하나로 커질 수 있음)
+            heights = line.get("hs")
+            heights = [heights] if isinstance(heights, (int, float)) else list(heights or [])
+            glyph = median(float(value) for value in heights) if heights else h
+            if len("".join(text.split())) < 2 or glyph < MIN_LINE_PX:
                 continue
-            size_pt = h / scale / GLYPH_PER_EM
-            area = image.crop((round(x), round(y), round(x + w), round(y + h)))
+            size_pt = glyph / scale / GLYPH_PER_EM
+            pad = max(2, round(glyph * 0.2))  # 글자 둘레의 배경까지 보이도록 조금 넓게
+            area = image.crop(
+                (
+                    max(0, round(x) - pad),
+                    max(0, round(y) - pad),
+                    min(image.width, round(x + w) + pad),
+                    min(image.height, round(y + h) + pad),
+                )
+            )
             measured.append(
                 {
                     "text": text[:40],
@@ -245,15 +261,28 @@ def _measure_lines(path: Path, lines: list[dict], scale: float, box) -> list[dic
 
 
 def _line_contrast(area) -> float | None:
-    """줄 영역에서 배경(가장 흔한 밝기)과 글자(배경에서 가장 먼 10%) 픽셀의 명암비 근사."""
-    raw = area.tobytes()  # RGB 바이트를 (r, g, b) 묶음으로
-    pixels = [tuple(raw[i : i + 3]) for i in range(0, len(raw) - 2, 3)]
-    if len(pixels) < 20:
+    """줄 영역의 글자·배경 명암비 근사.
+
+    배경 = 영역 테두리(가장자리 2px) 픽셀의 중앙 밝기 (글자 둘레는 대부분 배경이므로)
+    글자 = 안쪽 픽셀 가운데 배경과 밝기가 가장 많이 다른 10%
+    (굵은 글자는 글자 픽셀이 절반을 넘을 수 있어 '가장 흔한 밝기'를 배경으로 보면 틀린다)
+    """
+    width, height = area.size
+    if width < 6 or height < 6:
         return None
-    lum = [_luminance(pixel) for pixel in pixels]
-    ordered = sorted(lum)
-    background = ordered[len(ordered) // 2]  # 줄 영역의 대부분은 배경
-    far = sorted(lum, key=lambda value: abs(value - background), reverse=True)
+    raw = area.tobytes()  # RGB 바이트
+
+    def lum(x, y):
+        i = (y * width + x) * 3
+        return _luminance(raw[i : i + 3])
+
+    border = [lum(x, y) for y in (0, 1, height - 2, height - 1) for x in range(width)]
+    border += [lum(x, y) for x in (0, 1, width - 2, width - 1) for y in range(2, height - 2)]
+    background = median(border)
+    inner = [lum(x, y) for y in range(2, height - 2) for x in range(2, width - 2)]
+    if not inner:
+        return None
+    far = sorted(inner, key=lambda value: abs(value - background), reverse=True)
     ink = far[: max(1, len(far) // 10)]
     text = sum(ink) / len(ink)
     lighter, darker = max(text, background), min(text, background)

@@ -1141,7 +1141,7 @@ def _is_photo_text(info: FindingInfo) -> bool:
 
 def _ratio_cost(before: float, after: float) -> float:
     """증가 비율. 2배 이상이면 1.0."""
-    return min(1.0, (after - before) / before)
+    return min(1.0, abs(after - before) / before)  # 줄이는 후보(일관성)도 변화량만큼
 
 
 def _bundle_cost(bundle: list[ChangeProposal]) -> float:
