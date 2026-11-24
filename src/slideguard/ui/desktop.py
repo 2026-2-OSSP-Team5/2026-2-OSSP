@@ -564,6 +564,9 @@ class MainWindow(QMainWindow):
         self.result_table.horizontalHeader().resizeSection(2, 112)
         self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.result_table.currentCellChanged.connect(self.show_finding_details)
+        # 결과 행 더블클릭 → 그 PPT를 PowerPoint로 열고 그 슬라이드로 이동
+        self.result_table.cellDoubleClicked.connect(self._open_finding_slide)
+        self.result_table.setToolTip("더블클릭하면 PowerPoint에서 이 슬라이드를 엽니다")
         findings_layout.addWidget(self.result_table, 3)
 
         detail = QFrame(objectName="detailPanel")
@@ -606,6 +609,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         header.resizeSection(1, 150)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.proposal_table.cellDoubleClicked.connect(self._open_proposal_slide)  # 더블클릭 → 그 슬라이드
         layout.addWidget(self.proposal_table, 1)
 
         self.proposal_apply_hint = QLabel(
@@ -952,6 +956,60 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError):
                 return
 
+    # ---- 결과 더블클릭 → PowerPoint에서 그 슬라이드 열기 ---------------------------------
+    # 1) 이미 PowerPoint에 열려 있으면 그 창을 앞으로 가져와 슬라이드로 이동
+    # 2) 안 열려 있으면 파일을 열고(os.startfile), PowerPoint가 다 열릴 때까지 1초마다 다시 시도 (최대 30초)
+
+    def _open_finding_slide(self, row: int, _column: int):
+        item = self.result_table.item(row, 0)
+        finding = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if finding is not None:
+            self._open_slide_of(finding.shape_key)
+
+    def _open_proposal_slide(self, row: int, _column: int):
+        item = self.proposal_table.item(row, 0)
+        if item is not None and item.text().isdigit():
+            self._open_slide_of(f"{item.text()}:0")
+
+    def _open_slide_of(self, shape_key: str):
+        number = _slide_number(shape_key)
+        if self.current_report is None or not number.isdigit():
+            return
+        path = Path(self.current_report.deck.source_path)
+        slide = int(number)
+        if go_to_open_slide(path, slide):
+            LOGGER.info("SLIDE_OPENED | file=%s | slide=%d | already_open=True", path.name, slide)
+            return
+        try:
+            if not path.is_file():
+                raise FileNotFoundError(f"파일을 찾을 수 없습니다.\n{path}")
+            os.startfile(path)  # type: ignore[attr-defined]  # Windows 전용
+        except (AttributeError, OSError) as error:
+            LOGGER.warning("SLIDE_OPEN_FAILED | file=%s | reason=%s", path.name, error)
+            QMessageBox.warning(self, "PPTX 열기 실패", str(error))
+            return
+        self.statusBar().showMessage(f"{path.name} 여는 중… {slide}번 슬라이드로 이동합니다")
+        self._slide_open_tries = 0
+        self._slide_open_target = (path, slide)
+        if getattr(self, "_slide_open_timer", None) is None:
+            self._slide_open_timer = QTimer(self)
+            self._slide_open_timer.setInterval(1000)
+            self._slide_open_timer.timeout.connect(self._retry_open_slide)
+        self._slide_open_timer.start()
+
+    def _retry_open_slide(self):
+        path, slide = self._slide_open_target
+        self._slide_open_tries += 1
+        if go_to_open_slide(path, slide):
+            self._slide_open_timer.stop()
+            self.statusBar().showMessage(f"{path.name} {slide}번 슬라이드", 4000)
+            LOGGER.info(
+                "SLIDE_OPENED | file=%s | slide=%d | tries=%d", path.name, slide, self._slide_open_tries
+            )
+        elif self._slide_open_tries >= 30:
+            self._slide_open_timer.stop()
+            self.statusBar().showMessage("PowerPoint에서 슬라이드로 이동하지 못했습니다", 6000)
+
     def open_selected_file(self):
         path = Path(self.current_report.deck.source_path) if self.viewing_history else self.selected_file
         if path is None:
@@ -1247,6 +1305,40 @@ class MainWindow(QMainWindow):
             return
         super().closeEvent(event)
         self.closing.emit()
+
+
+def go_to_open_slide(path: Path, slide: int) -> bool:
+    """PowerPoint에 열려 있는 path 문서의 창을 앞으로 가져오고 slide번 슬라이드로 이동. 못 하면 False."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        try:
+            application = win32com.client.GetActiveObject("PowerPoint.Application")
+            target = os.path.normcase(os.path.abspath(path))
+            for index in range(1, application.Presentations.Count + 1):
+                presentation = application.Presentations.Item(index)
+                if os.path.normcase(os.path.abspath(str(presentation.FullName))) != target:
+                    continue
+                if presentation.Windows.Count < 1 or not 1 <= slide <= presentation.Slides.Count:
+                    return False
+                window = presentation.Windows.Item(1)
+                window.Activate()
+                if window.WindowState == 2:  # 최소화돼 있으면 원래 크기로
+                    window.WindowState = 1
+                if window.ViewType not in (1, 9):
+                    window.ViewType = 9  # 슬라이드 쇼·여러 슬라이드 보기면 기본(편집) 보기로
+                window.View.GotoSlide(slide)
+                return True
+            return False
+        finally:
+            pythoncom.CoUninitialize()
+    except Exception:  # noqa: BLE001 - PowerPoint가 아직 안 열렸거나 바쁨 → 다음에 다시 시도
+        LOGGER.debug("SLIDE_NAVIGATION_RETRY", exc_info=True)
+        return False
 
 
 def _slide_number(shape_key: str) -> str:

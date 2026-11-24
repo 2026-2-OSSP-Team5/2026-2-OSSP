@@ -647,3 +647,36 @@ def test_saved_analysis_purpose_builds_the_next_analysis_policy(tmp_path, monkey
     monkeypatch.setattr(bootstrap, "build_workspace_settings_repository", lambda: settings)
 
     assert bootstrap.build_analysis_policy().purpose is Purpose.LECTURE
+
+
+def test_double_clicking_a_result_opens_that_slide_in_powerpoint(tmp_path, monkeypatch, application):
+    """파일 선택 창의 검사 결과를 더블클릭 → 그 PPT를 열고 그 슬라이드로 이동 (열릴 때까지 다시 시도)."""
+    from slideguard.domain.models import AnalysisReport, Box, DeckSnapshot, Finding
+
+    path = tmp_path / "발표.pptx"
+    path.touch()
+    settings = FakeSettingsRepository(WorkspaceSettings(tmp_path, False))
+    opened, moves = [], []
+    ready = {"open": False}
+
+    def go(target, slide):
+        moves.append((target, slide))
+        return ready["open"]
+
+    monkeypatch.setattr(desktop, "build_workspace_settings_repository", lambda: settings)
+    monkeypatch.setattr(desktop, "build_report_repository", FakeReportRepository)
+    monkeypatch.setattr(desktop.os, "startfile", opened.append, raising=False)
+    monkeypatch.setattr(desktop, "go_to_open_slide", go)
+    finding = Finding("f", "contrast", "7:3", "warning", "명암비", 2.0, 4.5, "", Box(0, 0, 10, 10))
+    report = AnalysisReport(DeckSnapshot(str(path), "0" * 64, 9, 960, 540), [finding])
+
+    window = desktop.MainWindow()
+    try:
+        window.show_report(report)
+        window._open_finding_slide(0, 3)
+        assert opened == [path] and moves == [(path, 7)]  # 안 열려 있음 → 파일 열기
+        ready["open"] = True
+        window._retry_open_slide()  # PowerPoint가 다 열린 뒤 다시 시도 → 이동 성공
+        assert moves[-1] == (path, 7) and not window._slide_open_timer.isActive()
+    finally:
+        window.close()

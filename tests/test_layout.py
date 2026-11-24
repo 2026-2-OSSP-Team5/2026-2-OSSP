@@ -496,3 +496,31 @@ def test_header_and_page_number_repeated_on_every_slide_do_not_count_as_content(
         )
     deck = DeckSnapshot("d.pptx", "0" * 64, 2, 960, 540, shapes=tuple(shapes))
     assert [f for f in LayoutRule().evaluate(deck, AnalysisPolicy()) if f.rule_id == "layout.density"] == []
+
+
+def test_outline_only_card_in_front_of_text_does_not_hide_it():
+    """채우기 없는 둥근 테두리 카드가 글상자 앞에 있어도, 글자가 테두리 안쪽이면 가림이 아님 (자바게티 20쪽)."""
+    from slideguard.checks.layout import LayoutRule
+    from slideguard.domain.models import Box, DeckSnapshot, Shape, TextRun
+    from slideguard.domain.policy import AnalysisPolicy
+
+    text = Shape(
+        1,
+        3,
+        "TextBox 3",
+        Box(96, 211, 322, 123),
+        text="아파요(훼손)\\n등록 활성화",
+        runs=(TextRun("아파요(훼손) 등록 활성화", 32.0),),
+        supported=True,
+        z_order=3,
+        rendered_box=Box(103, 215, 195, 77),
+    )
+    card = Shape(
+        1, 5, "모서리가 둥근 직사각형 4", Box(82, 177, 348, 438), z_order=4, properties=(("no_fill", True),)
+    )
+    deck = DeckSnapshot("d.pptx", "0" * 64, 1, 1440, 810, shapes=(text, card))
+    overlaps = [f for f in LayoutRule().evaluate(deck, AnalysisPolicy()) if f.rule_id == "layout.overlap"]
+    assert overlaps == []
+    filled = Shape(1, 5, "가리는 도형", Box(82, 177, 348, 438), z_order=4)  # 채우기 모름 → 그대로 검토
+    deck = DeckSnapshot("d.pptx", "0" * 64, 1, 1440, 810, shapes=(text, filled))
+    assert [f for f in LayoutRule().evaluate(deck, AnalysisPolicy()) if f.rule_id == "layout.overlap"]

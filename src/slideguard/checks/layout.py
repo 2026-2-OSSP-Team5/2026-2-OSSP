@@ -307,6 +307,26 @@ def _owns_content(container: Shape, content: Shape) -> bool:
     )
 
 
+# 테두리 선이 그려지는 띠의 두께로 보는 값 (pt). 글자 줄이 테두리에서 이만큼 안쪽이면 선과 안 닿음
+OUTLINE_BAND_PT = 3.0
+
+
+def _outline_only(shape: Shape) -> bool:
+    """채우기가 없는 도형(테두리만 그려짐)인지 (reader가 확인한 경우만)."""
+    return ("no_fill", True) in shape.properties
+
+
+def _inside_outline(ink: list[Box], outline: Box) -> bool:
+    """글자 줄이 모두 테두리 선 안쪽(선 두께만큼 띄운 영역)에 있는지."""
+    inner = Box(
+        outline.x + OUTLINE_BAND_PT,
+        outline.y + OUTLINE_BAND_PT,
+        outline.width - 2 * OUTLINE_BAND_PT,
+        outline.height - 2 * OUTLINE_BAND_PT,
+    )
+    return inner.width > 0 and inner.height > 0 and all(_contains(inner, box) for box in ink)
+
+
 def _check_overlap(shapes: list[Shape]) -> list[Finding]:
     findings: list[Finding] = []
     for shape in shapes:
@@ -333,6 +353,14 @@ def _check_overlap(shapes: list[Shape]) -> list[Finding]:
             continue
         if not _has_text(other) and _behind(other, anchor) is True:
             # 글자 뒤에 깔린 도형(말풍선·카드·사진 등)은 배경이다. 글씨가 잘 보이는지는 명암비 검사가 본다.
+            continue
+        if (
+            not _has_text(other)
+            and _outline_only(other)
+            and _inside_outline(_ink_boxes(anchor, anchor_box), other_box)
+        ):
+            # 채우기 없는 테두리 카드가 글자 '앞'에 있어도 글자는 테두리 안쪽에 있으면 가려지지 않는다
+            # (자바게티 20쪽: 모서리가 둥근 카드 테두리 안의 '아파요(훼손) 등록 활성화')
             continue
 
         severity: Severity = "review"
