@@ -209,6 +209,12 @@ def build_marks(
         active = [item for item in proposals.get(key, []) if item.id in applied or item.id in selected]
         message = items[0].message if items else ""
         if active:
+            # 바꾸는 이유: '명암비 2.1:1 → 4.6:1 (기준 4.5:1)'처럼 수정 전후 수치를 판정 설명 뒤에 붙임
+            reason = change_reason(
+                report, sorted(active, key=lambda item: item.property == "shape.position")[0]
+            )
+            if reason:
+                message = f"{message}\n왜 바꾸나요? {reason}" if message else f"왜 바꾸나요? {reason}"
             # 위치 이동은 뒤로 (배지에는 글자 크기·상자 높이처럼 주된 변경을 보여 줌)
             active.sort(key=lambda item: item.property == "shape.position")
             first = active[0]
@@ -301,6 +307,57 @@ def _option_label(members: list[ChangeProposal], own_keys: set[str]) -> str:
     if any("~rec" in str(item.id).split("#", 1)[0] for item in members):
         label = f"[권장] {label}"
     return label
+
+
+def change_reason(report: AnalysisReport, proposal: ChangeProposal) -> str:
+    """수정 후보를 왜 고르는지 한 줄 설명 (수정 전 → 후 수치와 기준).
+
+    글자색: 배경과의 명암비가 기준(WCAG 1.4.3: 보통 글자 4.5:1, 큰 글자 3:1)보다 낮아서 바꾼다.
+            색약 판정이면 그 색약 눈으로 본 명암비로 보여 준다 (Machado 2009 시뮬레이션).
+    글자 크기: 최소 크기보다 작아서 키운다.
+    그 밖에는 판정 근거(evidence)를 그대로 보여 준다.
+    """
+    from slideguard.checks.color_vision import CVD_LABELS, worst_cvd_contrast
+    from slideguard.checks.contrast import contrast_ratio
+
+    finding = next((item for item in report.findings if item.id == proposal.finding_id), None)
+    if finding is None:
+        return ""
+    expected = finding.expected
+    if proposal.property == "font.color" and _is_hex(proposal.before) and _is_hex(proposal.after):
+        shape = next((item for item in report.deck.shapes if item.key == proposal.shape_key), None)
+        background = getattr(shape, "background", None)
+        if background is not None and _is_number(expected):
+            before, after = _rgb(proposal.before), _rgb(proposal.after)
+            # 판정 설명에 색약 종류가 적혀 있으면 그 눈으로 본 명암비
+            kinds = tuple(kind for kind, label in CVD_LABELS.items() if label in finding.message)
+            if finding.rule_id.startswith("color_vision") and kinds:
+                old = worst_cvd_contrast(before, background, kinds)[0]
+                new = worst_cvd_contrast(after, background, kinds)[0]
+                eye = f"{CVD_LABELS[kinds[0]]} 눈으로 본 "
+                # 색약 수정은 기준선만 겨우 넘기지 않고 보통 글자 기준 4.5:1까지 올림 (Okabe & Ito CUD)
+                goal = f"기준 {float(expected):g}:1, 색약은 여유 있게 4.5:1 목표"
+            else:
+                old, new, eye = contrast_ratio(before, background), contrast_ratio(after, background), ""
+                goal = f"기준 {float(expected):g}:1 이상이어야 읽기 쉬움"
+            return f"글자와 배경(#{_hex6(background)})의 {eye}명암비가 {old:.1f}:1 → {new:.1f}:1 ({goal}, WCAG 1.4.3)"
+        return finding.evidence or ""
+    if proposal.property == "font.size" and _is_number(proposal.after) and _is_number(expected):
+        return f"글자 크기 {_short(proposal.before, 'font.size')} → {_short(proposal.after, 'font.size')} (최소 {float(expected):g}pt)"
+    return finding.evidence or ""
+
+
+def _is_hex(value) -> bool:
+    return isinstance(value, str) and len(value.lstrip("#")) == 6
+
+
+def _rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def _hex6(color) -> str:
+    return "{:02X}{:02X}{:02X}".format(*color)
 
 
 def _change_text(item: ChangeProposal) -> str:
@@ -835,7 +892,7 @@ class BadgeHandle(QWidget):
         y = BADGE_HEIGHT + 8.0
         message = None
         if self.mark is not None and self.mark.message:
-            lines = min(3, max(1, _wrapped_lines(self.mark.message, font, inner)))
+            lines = min(6, max(1, _wrapped_lines(self.mark.message, font, inner)))  # 판정 설명 + 바꾸는 이유
             message = QRectF(12, y, inner, lines * QFontMetricsF(font).lineSpacing())
             y = message.bottom() + 8
         rows = []

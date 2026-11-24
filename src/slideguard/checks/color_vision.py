@@ -68,10 +68,12 @@ def simulate(color: Color, kind: str) -> Color:
     return (_to_srgb(mixed[0]), _to_srgb(mixed[1]), _to_srgb(mixed[2]))
 
 
-def worst_cvd_contrast(foreground: Color, background: Color) -> tuple[float, str | None]:
-    """보통 눈과 세 가지 색약 눈 가운데 가장 낮은 명암비와 그 눈 (보통 눈이면 None)."""
+def worst_cvd_contrast(
+    foreground: Color, background: Color, kinds: tuple[str, ...] | None = None
+) -> tuple[float, str | None]:
+    """보통 눈과 고른 색약 눈(kinds, 없으면 세 가지 모두) 가운데 가장 낮은 명암비와 그 눈 (보통 눈이면 None)."""
     worst, who = contrast_ratio(foreground, background), None
-    for kind in CVD_MATRICES:
+    for kind in CVD_MATRICES if kinds is None else kinds:
         ratio = contrast_ratio(simulate(foreground, kind), simulate(background, kind))
         if ratio < worst:
             worst, who = ratio, kind
@@ -107,17 +109,18 @@ class ColorVisionRule:
     id = "color_vision"
 
     def evaluate(self, deck: DeckSnapshot, policy: AnalysisPolicy) -> list[Finding]:
-        if not policy.color_vision:
-            return []
+        kinds = policy.vision_kinds  # 설정에서 고른 색각 유형만 본다 (예: 적록색약 → 적색약·녹색약)
+        if not kinds:
+            return []  # 기본값 '없음': 색약 검사 안 함
         findings: list[Finding] = []
         for shape in target_shapes(deck, policy):
             if not shape.supported or not shape.text.strip():
                 continue
-            findings.extend(self._contrast(shape, policy))
-            findings.extend(self._color_only(shape))
+            findings.extend(self._contrast(shape, policy, kinds))
+            findings.extend(self._color_only(shape, kinds))
         return findings
 
-    def _contrast(self, shape: Shape, policy: AnalysisPolicy) -> list[Finding]:
+    def _contrast(self, shape: Shape, policy: AnalysisPolicy, kinds: tuple[str, ...]) -> list[Finding]:
         """보통 눈에는 통과, 색약 눈에는 미달인 글자색 (색마다 한 번)."""
         background = shape.background
         if background is None:
@@ -132,7 +135,7 @@ class ColorVisionRule:
             normal = contrast_ratio(run.color, background)
             if normal < required:
                 continue  # 보통 눈에도 미달이면 기존 명암비 검사가 이미 알림
-            worst, who = worst_cvd_contrast(run.color, background)
+            worst, who = worst_cvd_contrast(run.color, background, kinds)
             if who is None or worst >= required:
                 continue
             found.append(
@@ -154,7 +157,7 @@ class ColorVisionRule:
             )
         return found
 
-    def _color_only(self, shape: Shape) -> list[Finding]:
+    def _color_only(self, shape: Shape, kinds: tuple[str, ...]) -> list[Finding]:
         """색만 다르게 써서 구분한 글자들이 색약 눈에는 같은 색으로 보이는지.
 
         같은 상자 안의 글자색 두 가지씩 비교한다 (본문색과 강조색, 강조색끼리: 예 '폐지'는 빨강, '유지'는 초록).
@@ -177,7 +180,7 @@ class ColorVisionRule:
                 normal = delta_e(first, second)
                 if normal < DISTINCT_DELTA_E:
                     continue  # 보통 눈에도 비슷한 색 (구분 의도가 아님)
-                for kind in CVD_MATRICES:
+                for kind in kinds:
                     seen_as = delta_e(simulate(first, kind), simulate(second, kind))
                     if seen_as < DISTINCT_DELTA_E:
                         confusing.append((first, second, kind, normal, seen_as))

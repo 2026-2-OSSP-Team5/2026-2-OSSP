@@ -69,6 +69,15 @@ from slideguard.planning.same_place import same_place_sets
 from slideguard.ui.preview import render_slide_previews
 from slideguard.ui.slide_lens import InputActivity, SlideLens, SlideView, SlideViewProbe, build_marks
 
+# 설정 창 '색약 맞춤' 목록: (저장 값, 보이는 이름). 저장 값은 domain/policy.py COLOR_VISION_KINDS의 키
+COLOR_VISION_CHOICES = (
+    ("none", "고려 안 함"),
+    ("red_green", "적록색약 (적색약 + 녹색약)"),
+    ("protan", "적색약 (1형, 빨강이 어둡게 보임)"),
+    ("deutan", "녹색약 (2형, 빨강·초록 구분 어려움)"),
+    ("tritan", "청색약 (3형, 파랑·노랑 구분 어려움)"),
+    ("all", "세 가지 모두"),
+)
 LOGGER = logging.getLogger("slideguard.overlay")
 
 OVERLAY_STYLE = """
@@ -1620,11 +1629,14 @@ class SettingsDialog(QDialog):
         policy_form.addRow("", self.viewing_hint)
         self.screen_inches_edit.textChanged.connect(self._update_viewing_hint)
         self.distance_edit.textChanged.connect(self._update_viewing_hint)
+        # 색약 맞춤: 색각 이상은 종류마다 헷갈리는 색이 달라서 종류를 고르게 한다 (기본은 '고려 안 함')
+        self.color_vision = QComboBox()
+        for key, label in COLOR_VISION_CHOICES:
+            self.color_vision.addItem(label, key)
+        policy_form.addRow("색약 맞춤", self.color_vision)
         extra_checks = QHBoxLayout()
-        self.color_vision_check = QCheckBox("색약 맞춤 검사")
         self.consistency_check = QCheckBox("슬라이드 간 일관성 검사")
         self.image_text_check = QCheckBox("그림 속 글자 검사")
-        extra_checks.addWidget(self.color_vision_check)
         extra_checks.addWidget(self.consistency_check)
         extra_checks.addWidget(self.image_text_check)
         policy_form.addRow("추가 검사", extra_checks)
@@ -1734,7 +1746,7 @@ class SettingsDialog(QDialog):
         screen, distance = policy.viewing.screen_inches, policy.viewing.distance_m
         self.screen_inches_edit.setText("" if screen is None else f"{screen:g}")
         self.distance_edit.setText("" if distance is None else f"{distance:g}")
-        self.color_vision_check.setChecked(policy.color_vision)
+        self.color_vision.setCurrentIndex(max(0, self.color_vision.findData(policy.color_vision)))
         self.consistency_check.setChecked(policy.consistency)
         self.image_text_check.setChecked(policy.image_text)
         self._update_viewing_hint()
@@ -1870,7 +1882,7 @@ class SettingsDialog(QDialog):
                 fix=self._fix_targets(),
                 audience=Audience(self.audience.currentData()),
                 viewing=self._viewing(),
-                color_vision=self.color_vision_check.isChecked(),
+                color_vision=self.color_vision.currentData() or "none",
                 consistency=self.consistency_check.isChecked(),
                 image_text=self.image_text_check.isChecked(),
             )

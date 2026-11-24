@@ -51,7 +51,7 @@ def test_children_get_bigger_text_and_less_per_slide_unless_overridden():
 def test_new_options_change_the_cache_key_and_survive_strings():
     assert AnalysisPolicy().cache_key != AnalysisPolicy(audience="older").cache_key
     assert AnalysisPolicy(audience="older").audience == Audience.OLDER
-    assert AnalysisPolicy().cache_key != AnalysisPolicy(color_vision=False).cache_key
+    assert AnalysisPolicy().cache_key != AnalysisPolicy(color_vision="red_green").cache_key
 
 
 def test_new_options_are_saved_with_the_workspace(tmp_path):
@@ -59,9 +59,17 @@ def test_new_options_are_saved_with_the_workspace(tmp_path):
 
     repository = SqliteWorkspaceSettingsRepository(tmp_path / "settings.sqlite3")
     policy = AnalysisPolicy(
-        audience=Audience.CHILDREN, viewing=ViewingSetup(80, 8), color_vision=False, consistency=False
+        audience=Audience.CHILDREN, viewing=ViewingSetup(80, 8), color_vision="tritan", consistency=False
     )
     repository.save(tmp_path, recursive=False, policy=policy)
     restored = SqliteWorkspaceSettingsRepository(tmp_path / "settings.sqlite3").load().policy_for()
     assert restored.audience == Audience.CHILDREN and restored.viewing == ViewingSetup(80, 8)
-    assert restored.color_vision is False and restored.consistency is False
+    assert restored.color_vision == "tritan" and restored.consistency is False
+
+
+def test_old_saved_on_off_colour_vision_setting_starts_as_none():
+    """예전 버전은 색약 검사를 True(기본)로 저장했다 → 새 버전에서는 '고려 안 함'으로 시작."""
+    from slideguard.adapters.storage.sqlite import _color_vision_option
+
+    assert _color_vision_option(True) == "none" and _color_vision_option("deutan") == "deutan"
+    assert _color_vision_option("weird") == "none" and _color_vision_option(None) == "none"

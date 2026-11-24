@@ -287,6 +287,19 @@ class FixTargets:
         return max(required, goal)  # 어떤 목표도 검사 기준보다 낮아지지 않음
 
 
+# 색약 맞춤 검사에서 고를 수 있는 색각 유형 → 실제로 시뮬레이션할 눈
+#   적록색약은 적색약(1형, protan)과 녹색약(2형, deutan)을 함께 부르는 말이라 둘 다 본다.
+#   청색약(3형, tritan)은 드물지만 파랑·노랑 구분이 어렵다.
+COLOR_VISION_KINDS: dict[str, tuple[str, ...]] = {
+    "none": (),
+    "red_green": ("protan", "deutan"),
+    "protan": ("protan",),
+    "deutan": ("deutan",),
+    "tritan": ("tritan",),
+    "all": ("protan", "deutan", "tritan"),
+}
+
+
 @dataclass(frozen=True)
 class AnalysisPolicy:
     purpose: Purpose = Purpose.PRESENTATION
@@ -298,7 +311,8 @@ class AnalysisPolicy:
     fix: FixTargets = field(default_factory=FixTargets)  # 수정 후보의 목표 (검사에는 영향 없음)
     audience: Audience = Audience.GENERAL  # 청중 맞춤
     viewing: ViewingSetup = field(default_factory=ViewingSetup)  # 환경 맞춤 (화면 크기·거리)
-    color_vision: bool = True  # 색약 맞춤 검사 (적색약·녹색약·청색약 시뮬레이션)
+    # 색약 맞춤 검사: 어떤 색각 이상을 고려할지 (COLOR_VISION_KINDS의 키). 기본은 "none" = 검사 안 함
+    color_vision: str = "none"
     consistency: bool = True  # 슬라이드 간 디자인 일관성 검사
     image_text: bool = True  # 그림 속 글자 검사 (Windows 문자 인식)
 
@@ -306,6 +320,13 @@ class AnalysisPolicy:
         if not isinstance(self.purpose, Purpose) or not isinstance(self.strength, Strength):
             raise ValueError("Use Purpose and Strength enum values")
         object.__setattr__(self, "audience", Audience(self.audience))  # 설정 파일의 문자열도 허용
+        # 예전 설정은 켜기/끄기(True/False)였다: True는 세 가지 모두, False는 없음으로 바꿔 받는다
+        if self.color_vision is True:
+            object.__setattr__(self, "color_vision", "all")
+        elif self.color_vision is False or self.color_vision is None:
+            object.__setattr__(self, "color_vision", "none")
+        if self.color_vision not in COLOR_VISION_KINDS:
+            raise ValueError("알 수 없는 색각 유형입니다.")
         if self.locked_properties - PROPERTIES:
             raise ValueError("Unknown locked property")
         if any(type(n) is not int or n < 1 for n in self.slides):
@@ -315,6 +336,11 @@ class AnalysisPolicy:
             raise ValueError("최소 글자 크기는 권장 크기 이하여야 합니다.")
         if self.large_contrast > self.normal_contrast:
             raise ValueError("대형 글자 명암비는 일반 글자 명암비 이하여야 합니다.")
+
+    @property
+    def vision_kinds(self) -> tuple[str, ...]:
+        """검사할 색각 이상 종류 (protan=적색약, deutan=녹색약, tritan=청색약). 비어 있으면 색약 검사 안 함."""
+        return COLOR_VISION_KINDS[self.color_vision]
 
     @property
     def font_limits(self) -> FontSizeThreshold:
@@ -378,7 +404,7 @@ class AnalysisPolicy:
     def cache_key(self) -> str:
         return json.dumps(
             {
-                "revision": 4,
+                "revision": 5,
                 "purpose": self.purpose,
                 "strength": self.strength,
                 "slides": sorted(set(self.slides)),

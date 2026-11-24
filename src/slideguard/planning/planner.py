@@ -48,8 +48,8 @@ from slideguard.planning.color import (
     nearest_passing_color,
     relative_luminance,
     saturation,
+    vision_ratio,
     worst_contrast_over_unknown,
-    worst_vision_contrast,
 )
 from slideguard.planning.contracts import (
     Category,
@@ -146,6 +146,8 @@ class RuleBasedPlanner:
         self.bindings = bindings or TeamBindings()
         # standards를 넘기면 그 기준을 쓰고, 없으면 정책의 용도로 B 기준을 가져옵니다.
         self.standards = standards
+        # 색약 맞춤 수정에서 고려할 눈 (설정의 색각 유형). plan()이 정책에서 읽어 채운다. None = 세 가지 모두
+        self.vision_kinds: tuple[str, ...] | None = None
         self.allow_large_text_option = allow_large_text_option
 
     # ==================================================================
@@ -159,6 +161,10 @@ class RuleBasedPlanner:
         권장 수정: 정책의 FixTargets 목표까지 고친 후보 중 최소 수정과 값이 다른 것 → result.recommended
         """
         standards = self.standards
+        if isinstance(policy, AnalysisPolicy) and policy.vision_kinds:
+            self.vision_kinds = policy.vision_kinds  # 예: 적록색약 → ("protan", "deutan")
+        else:
+            self.vision_kinds = None
         if standards is None:
             standards = build_standards(
                 self.bindings.purpose(policy), policy if isinstance(policy, AnalysisPolicy) else None
@@ -602,9 +608,9 @@ class RuleBasedPlanner:
         bg = info.values.get("background")
         if fg is None or bg is None:
             return [], "명암비 측정값(글자색·배경색)이 없음"
-        # 색약 맞춤 판정이면 '보통 눈과 세 가지 색약 눈 모두'에서 기준을 넘는 색을 찾는다
+        # 색약 맞춤 판정이면 '보통 눈과 설정에서 고른 색약 눈 모두'에서 기준을 넘는 색을 찾는다
         vision = bool(info.values.get("color_vision"))
-        ratio_of = worst_vision_contrast if vision else contrast_ratio
+        ratio_of = vision_ratio(self.vision_kinds) if vision else contrast_ratio
         ratio = info.values.get("ratio", ratio_of(fg, bg))
         threshold = info.values.get("required_ratio", standards.contrast_normal.value)
         # 검사 기준(threshold)을 넘는 범위에서 얼마나 여유 있게 고칠지는 수정 목표(FixTargets)가 정한다
@@ -633,7 +639,7 @@ class RuleBasedPlanner:
 
         if vision:
             # 색약 맞춤: 원래 색과 가장 가까운 색각 친화 색 (Okabe & Ito 팔레트, Wong 2011)
-            cud = cud_color(fg, bg, required)
+            cud = cud_color(fg, bg, required, self.vision_kinds)
             if cud is not None:
                 return [color_option(cud, "색각 친화 색(Okabe·Ito)")], ""
 
@@ -911,7 +917,7 @@ class RuleBasedPlanner:
             return [], "구분할 글자를 찾지 못함"
         group = f"cud:{shape.slide_index}:{shape.shape_id}"
         background = info.values.get("background") or "FFFFFF"
-        new_colors = cud_distinct_colors(colors, body or "000000", background)
+        new_colors = cud_distinct_colors(colors, body or "000000", background, kinds=self.vision_kinds)
         if new_colors is not None:
             bundle = [
                 self._proposal(

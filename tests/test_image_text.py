@@ -74,3 +74,31 @@ def test_small_and_faint_picture_text_is_reviewed():
     assert findings["image_text.contrast"].expected == 3.0  # 큰 글자 기준
     assert all(f.severity == "review" for f in findings.values())
     assert ImageTextRule().evaluate(deck, AnalysisPolicy(image_text=False)) == []
+
+
+def test_ocr_timeout_kills_powershell_and_skips_later_files(tmp_path, monkeypatch):
+    """문자 인식이 멈추면 제한 시간 뒤 끝내고, 이후 파일에서는 다시 기다리지 않음 (검사 대기 멈춤 방지)."""
+    import subprocess
+
+    from slideguard.adapters.powerpoint import image_text
+
+    class Hanging:
+        pid = 1
+
+        def __init__(self, *args, **kwargs):
+            assert kwargs["stdin"] is subprocess.DEVNULL  # 입력을 기다리며 멈추지 않도록
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("powershell", timeout)
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(image_text.subprocess, "Popen", Hanging)
+    monkeypatch.setattr(image_text, "_kill_tree", lambda process: None)
+    monkeypatch.setattr(image_text, "_disabled_reason", None)
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        image_text._run_ocr([tmp_path / "a.png"], tmp_path)
+    assert image_text._disabled_reason is not None

@@ -88,7 +88,11 @@ def build_powerpoint_reader(*, render: bool = False):
     from slideguard.adapters.powerpoint.reader import PowerPointDeckReader
     from slideguard.adapters.powerpoint.session import PowerPointReadSession
 
-    return PowerPointDeckReader(PowerPointReadSession(), render=render)
+    return PowerPointDeckReader(
+        PowerPointReadSession(),
+        render=render,
+        wants_image_text=lambda path: build_analysis_policy(path).image_text,
+    )
 
 
 class SnapshotCollection:

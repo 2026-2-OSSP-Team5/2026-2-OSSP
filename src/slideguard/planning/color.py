@@ -65,11 +65,20 @@ def _with_lightness(hex_color: str, lightness: float) -> str:
     return rgb_to_hex(round(nr * 255), round(ng * 255), round(nb * 255))
 
 
-def worst_vision_contrast(fg: str, bg: str) -> float:
-    """보통 눈과 적색약·녹색약·청색약 눈 가운데 가장 낮은 명암비 (색약 맞춤 수정용)."""
+def worst_vision_contrast(fg: str, bg: str, kinds: tuple[str, ...] | None = None) -> float:
+    """보통 눈과 고른 색약 눈(kinds, 없으면 적색약·녹색약·청색약 모두) 가운데 가장 낮은 명암비."""
     from slideguard.checks.color_vision import worst_cvd_contrast
 
-    return worst_cvd_contrast(hex_to_rgb(fg), hex_to_rgb(bg))[0]
+    return worst_cvd_contrast(hex_to_rgb(fg), hex_to_rgb(bg), kinds)[0]
+
+
+def vision_ratio(kinds: tuple[str, ...] | None):
+    """명암비 계산 함수 하나로 묶기: (글자색, 배경색) → 고른 눈 가운데 가장 낮은 명암비."""
+
+    def ratio(fg: str, bg: str) -> float:
+        return worst_vision_contrast(fg, bg, kinds)
+
+    return ratio
 
 
 # 색각 친화 팔레트 (Okabe & Ito, Color Universal Design 2008; Wong 2011 Nature Methods 8:441)
@@ -84,19 +93,20 @@ def _lab_hue(hex_color: str) -> float:
     return math.degrees(math.atan2(b, a)) % 360
 
 
-def cud_color(fg: str, bg: str, required: float) -> str | None:
+def cud_color(fg: str, bg: str, required: float, kinds: tuple[str, ...] | None = None) -> str | None:
     """원래 글자색과 색상(hue)이 가장 가까운 색각 친화 색.
 
     팔레트 색이 그대로는 명암비가 모자라면(흰 배경 위 노랑 등) 같은 색상에서 밝기만 조정한다.
     모든 눈(보통 + 적색약·녹색약·청색약)에서 required 이상이어야 후보가 된다.
     """
+    ratio = vision_ratio(kinds)  # 설정에서 고른 색약 눈(없으면 세 가지 모두)
     hue = _lab_hue(fg)
     best, best_score = None, None
     for base in CUD_PALETTE:
-        color = base if worst_vision_contrast(base, bg) >= required else None
+        color = base if ratio(base, bg) >= required else None
         adjusted = 0.0
         if color is None:
-            color = nearest_passing_color(base, bg, required, worst_vision_contrast)
+            color = nearest_passing_color(base, bg, required, ratio)
             if color is None:
                 continue
             adjusted = color_distance(base, color)  # 팔레트 색에서 멀어진 만큼 덜 선호
@@ -244,7 +254,9 @@ def harmony_score(color1: str, color2: str) -> float:
     return hc + hl_sum + hl_diff + hh
 
 
-def cud_distinct_colors(originals: list[str], body: str, bg: str, required: float = 4.5) -> list[str] | None:
+def cud_distinct_colors(
+    originals: list[str], body: str, bg: str, required: float = 4.5, kinds: tuple[str, ...] | None = None
+) -> list[str] | None:
     """색만으로 구분한 글자색들을 모든 눈(보통 + 세 가지 색약)에서 서로·본문과 구분되는 색각 친화 색으로.
 
     Okabe & Ito(CUD)와 Wong(2011)은 빨강·초록 짝 대신 팔레트의 서로 다른 색을 쓰라고 권한다.
@@ -256,13 +268,11 @@ def cud_distinct_colors(originals: list[str], body: str, bg: str, required: floa
 
     from slideguard.checks.color_vision import CVD_MATRICES, delta_e, simulate
 
+    ratio = vision_ratio(kinds)  # 설정에서 고른 색약 눈(없으면 세 가지 모두)
+    eyes = tuple(CVD_MATRICES) if kinds is None else kinds
     usable = []
     for base in CUD_PALETTE:
-        color = (
-            base
-            if worst_vision_contrast(base, bg) >= required
-            else nearest_passing_color(base, bg, required, worst_vision_contrast)
-        )
+        color = base if ratio(base, bg) >= required else nearest_passing_color(base, bg, required, ratio)
         if color is not None and color not in usable:
             usable.append(color)
     if len(usable) < len(originals):
@@ -271,7 +281,7 @@ def cud_distinct_colors(originals: list[str], body: str, bg: str, required: floa
     def separation(colors) -> float:
         everything = [hex_to_rgb(color) for color in (*colors, body)]
         worst = math.inf
-        for kind in CVD_MATRICES:
+        for kind in eyes:
             seen = [simulate(color, kind) for color in everything]
             for i in range(len(seen)):
                 for j in range(i + 1, len(seen)):

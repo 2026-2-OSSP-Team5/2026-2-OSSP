@@ -23,6 +23,7 @@ from slideguard.domain.models import (
     TextSpan,
 )
 from slideguard.domain.policy import (
+    COLOR_VISION_KINDS,
     AnalysisPolicy,
     Audience,
     FixTargets,
@@ -59,7 +60,8 @@ class WorkspaceSettings:
             fix=FixTargets(**options.get("fix", {})),
             audience=Audience(options.get("audience", "general")),
             viewing=ViewingSetup(**options.get("viewing", {})),
-            color_vision=bool(options.get("color_vision", True)),
+            # 예전 버전은 켜기/끄기(True/False)로 저장했고 기본이 켜기였다 → 모두 '없음'으로 시작
+            color_vision=_color_vision_option(options.get("color_vision")),
             consistency=bool(options.get("consistency", True)),
             image_text=bool(options.get("image_text", True)),
         )
@@ -482,3 +484,8 @@ def _report_from_json(payload: str) -> AnalysisReport:
         policy_key=data.get("policy_key"),
         comparison=FindingComparison(**data["comparison"]) if data.get("comparison") else None,
     )
+
+
+def _color_vision_option(value) -> str:
+    """저장된 색약 설정 → 색각 유형 키. 예전 True/False나 모르는 값은 'none'(검사 안 함)."""
+    return value if isinstance(value, str) and value in COLOR_VISION_KINDS else "none"

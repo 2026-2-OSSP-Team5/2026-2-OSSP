@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,7 +38,11 @@ MIN_PICTURE_SHARE = 0.03  # 슬라이드 면적의 3% 미만인 그림(아이콘
 GLYPH_PER_EM = (
     0.9  # 단어 높이(잉크) ÷ 글자 크기: 한글 약 0.9 (Noto Sans CJK 22px 글자 → 단어 높이 21px 로 확인)
 )
-OCR_TIMEOUT_SECONDS = 90
+OCR_TIMEOUT_SECONDS = 30  # 문자 인식 전체 제한 시간. 넘으면 PowerShell을 끝내고 그림 속 글자 검사만 건너뜀
+
+# 한 번 실패한 이유 (시간 초과·언어 팩 없음·PowerShell 없음 등). 앱을 다시 켤 때까지 문자 인식을 다시 시도하지 않음
+# → 실패하는 PC에서 파일을 검사할 때마다 30초씩 기다리지 않도록
+_disabled_reason: str | None = None
 
 _SCRIPT = r"""
 param([string]$ListPath)
@@ -86,6 +91,9 @@ ConvertTo-Json -InputObject @{ images = $results } -Depth 6 -Compress
 def read_image_text(presentation, snapshot, workdir: Path, *, runner=None):
     """그림 도형마다 그림 속 글자 줄을 찾아 properties에 넣은 스냅샷. 그림이 없거나 실패하면 그대로."""
     if sys.platform != "win32" and runner is None:
+        return snapshot
+    if _disabled_reason is not None and runner is None:
+        LOGGER.info("IMAGE_TEXT | 건너뜀 (이전 실패: %s)", _disabled_reason)
         return snapshot
     slide_area = snapshot.width_pt * snapshot.height_pt
     pictures = [
@@ -143,9 +151,8 @@ def read_image_text(presentation, snapshot, workdir: Path, *, runner=None):
         LOGGER.info("IMAGE_TEXT | 건너뜀: %s: %s", type(error).__name__, error)
         return snapshot
     finally:
-        for path in folder.glob("*"):
-            path.unlink(missing_ok=True)
-        folder.rmdir()
+        # 지우다 실패해도(파일이 잠깐 잠김 등) 오류를 내지 않음: 여기서 오류가 나면 검사 전체가 실패·재시도됨
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def _is_picture(shape) -> bool:
@@ -179,36 +186,63 @@ def _export_pictures_only(presentation, snapshot, number, folder):
         return None
     finally:
         for item in hidden:
-            item.Visible = -1
+            try:
+                item.Visible = -1
+            except Exception:  # noqa: BLE001 - 버리는 사본이라 되돌리기 실패는 무시
+                pass
 
 
 def _run_ocr(paths: list[Path], folder: Path) -> dict[str, list[dict]]:
-    """PowerShell로 Windows 문자 인식 실행 → {그림 경로: [줄 {text,x,y,w,h}]}"""
+    """PowerShell로 Windows 문자 인식 실행 → {그림 경로: [줄 {text,x,y,w,h,hs}]}
+
+    멈춤 방지:
+      - 입력(stdin)은 비워 둠: 창 없는 앱에서 PowerShell이 입력을 기다리며 멈추지 않도록
+      - 출력은 파이프 대신 파일로 받음: 시간 초과로 끝낼 때 파이프가 안 닫혀 같이 멈추는 일을 막음
+      - OCR_TIMEOUT_SECONDS가 지나면 PowerShell과 그 자식 프로세스까지 끝냄
+    """
+    global _disabled_reason
     script = folder / "ocr.ps1"
     listing = folder / "images.txt"
+    out_path = folder / "ocr_out.txt"
+    err_path = folder / "ocr_err.txt"
     script.write_text(_SCRIPT, encoding="utf-8-sig")
     listing.write_text("\n".join(str(path) for path in paths), encoding="utf-8")
-    completed = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(script),
-            str(listing),
-        ],
-        capture_output=True,
-        timeout=OCR_TIMEOUT_SECONDS,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        check=False,
-    )
-    output = completed.stdout.decode("utf-8", errors="replace").strip()
-    if completed.returncode != 0 or not output:
-        raise RuntimeError(completed.stderr.decode("utf-8", errors="replace")[-300:] or "문자 인식 실패")
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script),
+        str(listing),
+    ]
+    with open(out_path, "wb") as out_file, open(err_path, "wb") as err_file:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=out_file,
+                stderr=err_file,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as error:  # PowerShell이 없음 등
+            _disabled_reason = f"PowerShell 실행 불가: {error}"
+            raise
+        try:
+            returncode = process.wait(timeout=OCR_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            _kill_tree(process)
+            _disabled_reason = f"문자 인식 {OCR_TIMEOUT_SECONDS}초 초과"
+            raise RuntimeError(_disabled_reason) from None
+    output = out_path.read_bytes().decode("utf-8", errors="replace").strip()
+    if returncode != 0 or not output:
+        error_text = err_path.read_bytes().decode("utf-8", errors="replace")[-300:]
+        _disabled_reason = "문자 인식 실패"
+        raise RuntimeError(error_text or "문자 인식 실패")
     data = json.loads(output)
     if "error" in data:
+        _disabled_reason = str(data["error"])  # 예: no-ocr-language (언어 팩 없음)
         raise RuntimeError(data["error"])
     images = data.get("images") or []
     if isinstance(images, dict):  # 그림이 하나면 PowerShell이 목록 대신 하나만 줌
@@ -218,6 +252,27 @@ def _run_ocr(paths: list[Path], folder: Path) -> dict[str, list[dict]]:
         lines = image.get("lines") or []
         result[str(image.get("path"))] = [lines] if isinstance(lines, dict) else list(lines)
     return result
+
+
+def _kill_tree(process) -> None:
+    """PowerShell과 그 자식 프로세스를 모두 끝냄 (Windows: taskkill /T). 실패해도 무시."""
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        process.kill()
+        process.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _measure_lines(path: Path, lines: list[dict], scale: float, box) -> list[dict]:

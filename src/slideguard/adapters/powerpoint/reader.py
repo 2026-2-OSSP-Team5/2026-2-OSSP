@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from time import perf_counter
 
@@ -16,9 +17,17 @@ LOGGER = logging.getLogger("slideguard.reader")
 
 
 class PowerPointDeckReader:
-    def __init__(self, session: PowerPointReadSession, *, render: bool = False):
+    def __init__(
+        self,
+        session: PowerPointReadSession,
+        *,
+        render: bool = False,
+        wants_image_text: Callable[[Path], bool] | None = None,
+    ):
         self._session = session
         self._render = render
+        # 파일마다 '그림 속 글자 검사'를 할지 (설정에서 끄면 문자 인식 단계를 아예 건너뜀)
+        self._wants_image_text = wants_image_text
 
     def read(self, path: Path) -> DeckSnapshot:
         """읽기 단계별 시간을 slideguard.log에 READ_TIMING으로 남긴다 (어디가 느린지 찾기 위해)."""
@@ -44,7 +53,8 @@ class PowerPointDeckReader:
                     timing["render"] = perf_counter() - step
                     # 그림 속 글자 (Windows 문자 인식): 그림이 있는 슬라이드만
                     step = perf_counter()
-                    snapshot = read_image_text(presentation, snapshot, saved.copy_path.parent)
+                    if self._image_text_on(path):
+                        snapshot = read_image_text(presentation, snapshot, saved.copy_path.parent)
                     timing["ocr"] = perf_counter() - step
                 step = perf_counter()
                 result = enrich_snapshot(snapshot, saved.copy_path)
@@ -73,3 +83,11 @@ class PowerPointDeckReader:
             total,
         )
         return snapshot
+
+    def _image_text_on(self, path: Path) -> bool:
+        if self._wants_image_text is None:
+            return True
+        try:
+            return bool(self._wants_image_text(path))
+        except Exception:  # noqa: BLE001 - 설정을 못 읽으면 기본(검사함)
+            return True

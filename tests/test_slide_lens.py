@@ -84,7 +84,7 @@ def test_marks_offer_proposals_as_options_and_show_applied_ones(tmp_path):
     assert option.proposal_ids == ("font.size@1:2",) and option.checked
     assert option.label == "글자 크기 11pt → 14pt"
     assert marks["1:2"].kind == "change" and marks["1:2"].applied
-    assert marks["1:2"].message == "메시지"
+    assert marks["1:2"].message.startswith("메시지\n왜 바꾸나요? 글자 크기 11pt → 14pt")
     assert not marks["1:3"].options[0].checked and marks["1:3"].kind == "warning"
     assert marks["1:4"].options == ()
 
@@ -617,3 +617,29 @@ def test_panel_batch_checkbox_checks_every_same_place_fix(controller, applicatio
     panel.proposal_items["font.size@2:9"].setCheckState(Qt.CheckState.Unchecked)  # 하나만 해제
     assert batch.checkState() == Qt.CheckState.Unchecked
     assert panel.selected_proposal_ids() == ("font.size@1:9",)
+
+
+def test_change_badge_explains_why_the_colour_changes():
+    """글자색 수정을 고르면 배지 설명에 '명암비 전 → 후 (기준)'이 붙는다."""
+    from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, DeckSnapshot, Finding, Shape
+    from slideguard.ui.slide_lens import build_marks, change_reason
+
+    shape = Shape(1, 5, "쪽 번호", Box(800, 480, 100, 40), text="12/23", background=(0x80, 0x90, 0x80))
+    deck = DeckSnapshot("d.pptx", "0" * 64, 1, 960, 540, shapes=(shape,))
+    finding = Finding(
+        id="contrast:1:5",
+        rule_id="contrast",
+        shape_key="1:5",
+        severity="warning",
+        message="글자와 배경의 명암비가 낮습니다",
+        measured=1.4,
+        expected=4.5,
+        evidence="글자 #A0A8B0 / 배경 #809080",
+        box=shape.box,
+    )
+    proposal = ChangeProposal("prop@1:5", "contrast:1:5", "1:5", "font.color", "A0A8B0", "000000", 0.5)
+    report = AnalysisReport(deck, [finding], [proposal])
+    reason = change_reason(report, proposal)
+    assert "명암비" in reason and "→" in reason and "기준 4.5:1" in reason
+    [mark] = build_marks(report, 1, selected_ids={"prop@1:5"})
+    assert "왜 바꾸나요?" in mark.message
