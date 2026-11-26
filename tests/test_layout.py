@@ -554,8 +554,13 @@ def test_footer_and_chart_text_are_skipped():
         ("a" * 81, True),
         ("가" * 25 + "a" * 20, False),
         ("가" * 20 + "a" * 50, True),
-        ("https://example.com/" + "a" * 90, True),
-        ("가" * 50 + "=수식", True),
+        ("http://example.com/" + "a" * 90, False),
+        ("https://example.com/" + "a" * 90, False),
+        ("HTTPS://example.com/" + "a" * 90, False),
+        ("가" * 50 + "=수식", False),
+        ("∑" + "a" * 90, False),
+        ("∫" + "a" * 90, False),
+        ("√" + "a" * 90, False),
     ],
 )
 @pytest.mark.parametrize("placeholder_type", [None, 1])
@@ -573,6 +578,12 @@ def test_registered_analyzer_prioritizes_feature_line_length_without_duplicates_
         assert all(f.rule_id == "layout.line_length" and f.severity == "review" for f in findings)
         ids = {f.id for f in findings}
         assert not any(p.finding_id in ids for p in report.proposals)
+
+
+def test_exempt_url_or_formula_line_does_not_hide_a_long_normal_line():
+    shape = make_shape(lines=("https://example.com/" + "a" * 200, "가" * 100 + "=수식", "가" * 45))
+    findings = line_findings(run_rule(shape))
+    assert len(findings) == 1 and findings[0].measured == 45
 
 
 def test_header_and_page_number_repeated_on_every_slide_do_not_count_as_content():

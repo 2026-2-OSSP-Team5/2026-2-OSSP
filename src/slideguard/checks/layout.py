@@ -562,10 +562,17 @@ def _check_line_length(shape: Shape) -> list[Finding]:
     PowerPoint가 실제로 접은 줄(``TextSpan.kind == "line"``)이 있어야 판정한다.
     원문 개행은 화면에서 어디서 접히는지 알려 주지 않으므로 세지 않는다.
     줄마다 보고하면 한 도형이 결과를 뒤덮으므로 가장 긴 줄 하나만 보고한다.
+    제목도 검사하지만 URL이나 수식 표식이 있는 줄은 제외한다.
     """
     if not _has_text(shape) or not _counts_for_density(shape):
         return []
-    lines = [span.text for span in shape.spans if span.kind == "line" and _visible(span.text)]
+    lines = [
+        span.text
+        for span in shape.spans
+        if span.kind == "line"
+        and _visible(span.text)
+        and not re.search(r"https?://|[=∑∫√]", span.text, re.IGNORECASE)
+    ]
     if not lines:
         return []
 
