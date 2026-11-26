@@ -163,6 +163,13 @@ def describe_finding(finding):
             _pair(current, target, unit, f"현재 {noun}", f"권장 {noun}", " 이하"),
             "문단·목록 경계에서 여러 장으로 나눠 보세요. 분할 제안이 있으면 미리보기로 확인할 수 있습니다.",
         )
+    if rule == "layout.line_length":
+        return FindingExplanation(
+            "한 줄이 깁니다",
+            "실제로 표시된 줄을 전각 1자·반각 0.5자로 환산한 길이입니다.",
+            _pair(current, target, "자 분량", "현재 한 줄 길이(전각 환산)", "참고 길이", " 이하"),
+            "줄을 어디서 끊을지는 직접 판단해 주세요. 자동 수정안은 만들지 않습니다.",
+        )
     if rule.startswith("readability."):
         subtype = rule.split(".")[1]
         if subtype in ("graphic_contrast", "chart_contrast"):

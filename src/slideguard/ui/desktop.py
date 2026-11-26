@@ -1450,6 +1450,7 @@ def _rule_name(rule_id: str) -> str:
             "layout.overflow": "글 넘침",
             "layout.overlap": "겹침",
             "layout.density": "정보량",
+            "layout.line_length": "한 줄 길이",
         }.get(rule_id, "배치")
     root = rule_id.partition(".")[0]
     names = {

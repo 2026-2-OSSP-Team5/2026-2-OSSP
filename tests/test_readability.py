@@ -111,20 +111,10 @@ def test_lines_from_another_column_cannot_join_a_paragraph_by_y_position():
     assert not _evaluate(replace(shape, spans=(paragraph, own, other)))
 
 
-def test_line_length_boundary_and_math_url_title_exclusions():
-    for value, flagged in (
-        ("가" * 40, False),
-        ("가" * 41, True),
-        ("a" * 80, False),
-        ("a" * 81, True),
-        ("https://example.com/" + "a" * 90, False),
-        ("가" * 50 + "=수식", False),
-    ):
+def test_readability_does_not_duplicate_layout_line_length_findings():
+    for value in ("가" * 41, "a" * 81, "가" * 25 + "a" * 20):
         shape = _shape(value, spans=(TextSpan("line", 1, value),))
-        assert any(f.rule_id == "readability.line_length" for f in _evaluate(shape)) is flagged
-        assert not any(
-            f.rule_id == "readability.line_length" for f in _evaluate(replace(shape, placeholder_type=1))
-        )
+        assert not any(f.rule_id == "readability.line_length" for f in _evaluate(shape))
 
 
 def test_emphasis_requires_complete_positive_measurement():

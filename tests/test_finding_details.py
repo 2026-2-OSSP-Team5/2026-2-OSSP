@@ -50,6 +50,7 @@ def test_sample_contrast_explains_uncertainty_and_preserves_full_precision(appli
         ("layout.overflow", "layout.overflow:3:2", 7.2, 0, "2.54mm"),
         ("layout.density", "layout.density:3:lines", 12, 6, "12줄"),
         ("layout.density", "layout.density:3:chars", 180, 100, "180자"),
+        ("layout.line_length", "layout.line_length:3:2", 40.5, 40, "40.5자 분량"),
         ("readability.spacing.1", "spacing:3:2", 1, 1.2, "1.2배 이상"),
         ("readability.italic", "italic:3:2", 85, "핵심에만 강조", "85%"),
     ],

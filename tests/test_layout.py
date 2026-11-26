@@ -4,7 +4,7 @@ import pytest
 
 from slideguard.checks.layout import LayoutRule
 from slideguard.domain.models import Box, DeckSnapshot, ObjectLocator, Shape, TextRun, TextSpan
-from slideguard.domain.policy import AnalysisPolicy, Purpose
+from slideguard.domain.policy import AnalysisPolicy, Purpose, Strength
 
 # 슬라이드 960x540pt → 안전 여백: 좌우 48pt, 상하 27pt
 
@@ -487,6 +487,103 @@ def test_density_ignores_blank_lines_chart_labels_and_footers():
     number = make_shape(text="02", shape_id=4)  # 쪽 왼쪽 위 번호 표시
     lines = make_shape(text="\n".join(["항목"] * 3), shape_id=5)
     assert only(run_rule(body, axis, page, number, lines), "layout.density") == []  # 2 + 3 = 5줄
+
+
+# --- 한 줄 길이 (WCAG 1.4.8: 80자, CJK 40자) -----------------------------------
+
+
+def line_findings(findings):
+    return [f for f in findings if f.rule_id == "layout.line_length"]
+
+
+def test_short_korean_line_passes():
+    assert line_findings(run_rule(make_shape(lines=("가" * 40,)))) == []
+
+
+def test_long_korean_line_is_review():
+    findings = line_findings(run_rule(make_shape(lines=("가" * 41,))))
+    assert [f.severity for f in findings] == ["review"]
+    finding = findings[0]
+    assert finding.measured == 41
+    assert finding.expected == 40.0
+    assert "1.4.8" in finding.evidence
+
+
+def test_latin_counts_half_so_eighty_is_the_limit():
+    # WCAG의 두 숫자(80자 / CJK 40자)는 같은 폭을 가리킨다.
+    assert line_findings(run_rule(make_shape(lines=("a" * 80,)))) == []
+    assert len(line_findings(run_rule(make_shape(lines=("a" * 82,))))) == 1
+
+
+def test_mixed_script_line_is_measured_by_width():
+    # 한글 30자(30) + 영문 20자(10) = 40 → 경계값이라 통과
+    assert line_findings(run_rule(make_shape(lines=("가" * 30 + "a" * 20,)))) == []
+    assert len(line_findings(run_rule(make_shape(lines=("가" * 30 + "a" * 22,))))) == 1
+
+
+def test_only_the_widest_line_is_reported():
+    shape = make_shape(lines=("가" * 50, "가" * 45, "짧은 줄"))
+    findings = line_findings(run_rule(shape))
+    assert len(findings) == 1  # 줄마다 보고하지 않는다
+    assert findings[0].measured == 50
+
+
+def test_source_newlines_are_not_counted():
+    # 렌더링된 줄이 없으면 어디서 접히는지 알 수 없으므로 판정하지 않는다.
+    assert line_findings(run_rule(make_shape(text="가" * 100))) == []
+
+
+def test_trailing_spaces_do_not_make_a_line_long():
+    assert line_findings(run_rule(make_shape(lines=("가" * 38 + "    ",)))) == []
+
+
+def test_footer_and_chart_text_are_skipped():
+    # 쪽 번호·차트 글자는 읽을 내용이 아니라 정보 밀도에서 빼는 것과 같은 기준을 쓴다.
+    footer = replace(make_shape(lines=("가" * 60,)), placeholder_type=13)
+    assert line_findings(run_rule(footer)) == []
+    chart = replace(make_shape(lines=("가" * 60,)), locator=ObjectLocator((1,), "axis_title", (1, 1)))
+    assert line_findings(run_rule(chart)) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "flagged"),
+    [
+        ("가" * 40, False),
+        ("가" * 41, True),
+        ("a" * 80, False),
+        ("a" * 81, True),
+        ("가" * 25 + "a" * 20, False),
+        ("가" * 20 + "a" * 50, True),
+        ("http://example.com/" + "a" * 90, False),
+        ("https://example.com/" + "a" * 90, False),
+        ("HTTPS://example.com/" + "a" * 90, False),
+        ("가" * 50 + "=수식", False),
+        ("∑" + "a" * 90, False),
+        ("∫" + "a" * 90, False),
+        ("√" + "a" * 90, False),
+    ],
+)
+@pytest.mark.parametrize("placeholder_type", [None, 1])
+def test_registered_analyzer_prioritizes_feature_line_length_without_duplicates_or_fixes(
+    text, flagged, placeholder_type
+):
+    from slideguard.bootstrap import build_analyzer
+
+    shape = replace(make_shape(text=text, lines=(text,)), placeholder_type=placeholder_type)
+    deck = DeckSnapshot("body.pptx", "hash", 3, 960, 540, (shape,))
+    for strength in Strength:
+        report = build_analyzer().analyze_snapshot(deck, AnalysisPolicy(strength=strength))
+        findings = [f for f in report.findings if f.rule_id.endswith(".line_length")]
+        assert len(findings) == int(flagged)
+        assert all(f.rule_id == "layout.line_length" and f.severity == "review" for f in findings)
+        ids = {f.id for f in findings}
+        assert not any(p.finding_id in ids for p in report.proposals)
+
+
+def test_exempt_url_or_formula_line_does_not_hide_a_long_normal_line():
+    shape = make_shape(lines=("https://example.com/" + "a" * 200, "가" * 100 + "=수식", "가" * 45))
+    findings = line_findings(run_rule(shape))
+    assert len(findings) == 1 and findings[0].measured == 45
 
 
 def test_header_and_page_number_repeated_on_every_slide_do_not_count_as_content():

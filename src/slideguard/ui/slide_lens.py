@@ -100,6 +100,7 @@ RULE_TITLES = {
     "layout.overlap": "겹침",
     "layout.margin": "여백",
     "layout.density": "정보 밀도",
+    "layout.line_length": "한 줄 길이",
     "color_vision.contrast": "색약 명암비",
     "color_vision.color_only": "색만으로 강조",
     "consistency.title_position": "제목 위치",
@@ -471,6 +472,8 @@ def metric_text(finding: Finding) -> tuple[str, str]:
         return value, (f"여백 {expected:g}pt 이상" if limit else "")
     if rule == "layout.overlap":
         return "겹침", ""
+    if rule == "layout.line_length" and number:
+        return f"전각 {measured:g}자 분량", f"참고 {expected:g}자 이하" if limit else ""
     if rule.startswith("color_vision.contrast") and number:
         return f"{measured:.1f}:1", f"최소 {expected:g}:1" if limit else ""
     if rule == "color_vision.color_only":

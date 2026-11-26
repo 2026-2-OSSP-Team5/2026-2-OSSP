@@ -160,24 +160,6 @@ class ReadabilityRule:
                     "여러 줄 본문은 왼쪽 정렬로 시작 위치를 맞추면 읽기 쉽습니다. 제목·수식은 유지할 수 있습니다.",
                     box=paragraph.box,
                 )
-        for line in [s for s in shape.spans if s.kind == "line" and s.text.strip()]:
-            text = line.text.strip()
-            if re.search(r"https?://|[=∑∫√]", text):
-                continue
-            cjk = sum("\u2e80" <= ch <= "\ud7af" for ch in text)
-            limit = 40 if cjk >= len(text.replace(" ", "")) * 0.5 else 80
-            if len(text) > limit and not is_title:
-                _add(
-                    findings,
-                    shape,
-                    "line_length",
-                    "본문 한 줄이 길어 읽던 위치를 놓치기 쉽습니다",
-                    len(text),
-                    limit,
-                    "CJK 40자·그 외 80자는 웹 접근성의 참고 길이이며 PPT의 필수 통과 기준은 아닙니다. 문단 폭을 줄이거나 나눠 보세요.",
-                    box=line.box,
-                )
-                break
         count = sum(len(run.text.strip()) for run in shape.runs)
         if count < LONG_PARAGRAPH_CHARS or is_title:
             return

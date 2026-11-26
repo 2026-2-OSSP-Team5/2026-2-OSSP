@@ -1,6 +1,7 @@
 """Overlap requires review and does not prove unintended placement."""
 
 import re
+import unicodedata
 from collections import defaultdict
 from itertools import combinations
 
@@ -8,6 +9,7 @@ from slideguard.domain.models import Box, DeckSnapshot, Finding, Severity, Shape
 from slideguard.domain.policy import (
     BODY_PLACEHOLDERS,
     GEOMETRY_TOLERANCE_PT,
+    MAX_LINE_WIDTH_UNITS,
     TITLE_PLACEHOLDERS,
     AnalysisPolicy,
     DensityThreshold,
@@ -46,6 +48,8 @@ class LayoutRule:
             findings.extend(_check_card_off_slide(deck, slide_shapes))
             content = [shape for shape in slide_shapes if shape.key not in repeated]
             findings.extend(_check_density(slide_number, content, policy.density_limits, deck.height_pt))
+        for shape in shapes:
+            findings.extend(_check_line_length(shape))
         return findings
 
 
@@ -539,3 +543,57 @@ def _check_density(
             )
         )
     return findings
+
+
+# --- 한 줄 길이 -----------------------------------------------------------------
+def _line_width_units(line: str) -> float:
+    """한 줄의 폭을 글자 수로 센다. 전각 한 글자가 1, 반각 한 글자가 0.5.
+
+    WCAG 1.4.8은 한 줄을 "80자(CJK는 40자)"로 적는다. 두 숫자는 같은 폭을 가리키므로
+    전각·반각을 나누어 세면 하나의 기준으로 비교할 수 있다.
+    """
+    text = line.translate(_INVISIBLE).rstrip()
+    return sum(1.0 if unicodedata.east_asian_width(ch) in ("W", "F") else 0.5 for ch in text)
+
+
+def _check_line_length(shape: Shape) -> list[Finding]:
+    """렌더링된 줄 가운데 가장 긴 줄이 기준을 넘는지 본다.
+
+    PowerPoint가 실제로 접은 줄(``TextSpan.kind == "line"``)이 있어야 판정한다.
+    원문 개행은 화면에서 어디서 접히는지 알려 주지 않으므로 세지 않는다.
+    줄마다 보고하면 한 도형이 결과를 뒤덮으므로 가장 긴 줄 하나만 보고한다.
+    제목도 검사하지만 URL이나 수식 표식이 있는 줄은 제외한다.
+    """
+    if not _has_text(shape) or not _counts_for_density(shape):
+        return []
+    lines = [
+        span.text
+        for span in shape.spans
+        if span.kind == "line"
+        and _visible(span.text)
+        and not re.search(r"https?://|[=∑∫√]", span.text, re.IGNORECASE)
+    ]
+    if not lines:
+        return []
+
+    widest = max(lines, key=_line_width_units)
+    units = _line_width_units(widest)
+    if units <= MAX_LINE_WIDTH_UNITS:
+        return []
+
+    preview = widest.strip()
+    if len(preview) > 24:
+        preview = preview[:24] + "…"
+    return [
+        _finding(
+            "layout.line_length",
+            shape.key,
+            shape,
+            "review",
+            f"한 줄이 깁니다 (약 {units:g}자 분량)",
+            round(units, 1),
+            MAX_LINE_WIDTH_UNITS,
+            f'가장 긴 줄 "{preview}" 이 전각 {units:g}자 분량 > 기준 {MAX_LINE_WIDTH_UNITS:g}자 '
+            f"(WCAG 2.2 SC 1.4.8 AAA: 한 줄 80자, CJK는 40자). 줄을 어디서 끊을지는 사람이 판단합니다",
+        )
+    ]
