@@ -1,10 +1,11 @@
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtCore import QItemSelectionModel, QPoint, QRect, Qt
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -232,10 +233,10 @@ def test_collapsing_visible_overlay_keeps_one_visible_window(application, monkey
         assert widget.collapsed is False
         assert widget.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating) is False
         assert widget.mask().isEmpty() is True
-        assert widget.geometry().left() == 10
+        assert widget.geometry().left() == overlay.PANEL_SIDE_PADDING
         assert widget.geometry().top() == 32
-        assert widget.geometry().width() == 1180
-        assert widget.geometry().height() >= 340
+        assert widget.geometry().width() == 1120
+        assert widget.geometry().height() <= overlay.PANEL_HEIGHT
 
         geometry_calls = []
         monkeypatch.setattr(widget, "setGeometry", lambda *_args: geometry_calls.append(True))
@@ -261,11 +262,48 @@ def test_expanded_overlay_uses_real_minimum_height_and_stays_on_screen(applicati
         application.processEvents()
 
         geometry = widget.geometry()
-        assert geometry.height() >= widget.minimumSizeHint().height()
+        assert geometry.height() <= overlay.PANEL_HEIGHT
         assert geometry.left() >= available.left()
         assert geometry.top() >= available.top()
         assert geometry.right() <= available.right()
         assert geometry.bottom() <= available.bottom()
+    finally:
+        widget.close()
+
+
+def test_compact_overlay_keeps_populated_actions_visible_and_proposals_scrollable(application, tmp_path):
+    widget = overlay.OverlayWidget()
+    try:
+        widget.set_target(overlay.PowerPointWindow(1, QRect(0, 0, 1440, 900), "deck.pptx - PowerPoint"))
+        widget.set_collapsed(False)
+        report = _proposal_report(tmp_path / "deck.pptx", "source-hash")
+        report.proposals.extend(replace(report.proposals[0], id=f"scroll-row-{index}") for index in range(20))
+        widget.show_report(report)
+        for row in range(widget.findings_table.rowCount()):
+            widget.findings_table.setCurrentCell(row, 0)
+            application.processEvents()
+            widget._apply_geometry()
+            application.processEvents()
+
+            assert widget.geometry().height() < 300
+            for control in (
+                widget.detail_evidence,
+                widget.locate_button,
+                widget.lock_button,
+                widget.apply_all_button,
+                widget.apply_all_recommended_button,
+                widget.apply_button,
+            ):
+                bounds = QRect(control.mapTo(widget.expanded_page, QPoint(0, 0)), control.size())
+                assert control.isVisible()
+                assert widget.expanded_page.rect().contains(bounds)
+
+        proposals = widget.proposals_list
+        assert proposals.verticalScrollBar().maximum() > 0
+        last_item = proposals.item(proposals.count() - 1)
+        proposals.scrollToItem(last_item)
+        application.processEvents()
+        assert proposals.viewport().rect().contains(proposals.visualItemRect(last_item))
     finally:
         widget.close()
 
@@ -363,10 +401,10 @@ def test_proposal_selection_by_severity_and_bundle(application, tmp_path):
             "font.size@1:2#bundle-a",
             "shape.height@1:2#bundle-a",
         }
-        assert widget.apply_button.text().endswith("(2)")
+        assert widget.selected_count_label.text() == "선택 2건"
         assert warning.property("selected") is True and review.property("selected") is False
 
-        widget.proposal_items["font.size@1:2#bundle-a"].setCheckState(Qt.CheckState.Unchecked)
+        widget.proposal_items["font.size@1:2#bundle-a"].setSelected(False)
         assert widget.selected_proposal_ids() == ()
         assert warning.property("selected") is False
 
@@ -375,6 +413,16 @@ def test_proposal_selection_by_severity_and_bundle(application, tmp_path):
         assert review.property("selected") is True
         warning.click()
         assert review.property("selected") is True and warning.property("selected") is True
+        requests = []
+        widget.apply_requested.connect(lambda: requests.append(widget.selected_proposal_ids()))
+        widget.proposals_list.setCurrentItem(
+            widget.proposal_items["shape.position@1:3"], QItemSelectionModel.SelectionFlag.NoUpdate
+        )
+        selected = widget.selected_proposal_ids()
+        widget.apply_button.click()
+        assert len(selected) == 3
+        assert requests == [selected]
+        assert widget.selected_proposal_ids() == selected
         first_item = widget.proposals_list.item(0)
         assert widget.proposals_list.itemWidget(first_item) is None
         assert (
@@ -393,6 +441,100 @@ def test_proposal_selection_by_severity_and_bundle(application, tmp_path):
         widget.show_report(report)
         assert widget.manual_button.isEnabled() is True
         assert widget.apply_button.isEnabled() is False
+    finally:
+        widget.close()
+
+
+def test_severity_buttons_toggle_each_category_without_clearing_the_other(application, tmp_path):
+    widget = overlay.OverlayWidget()
+    try:
+        widget.show_report(_proposal_report(tmp_path / "deck.pptx", "hash"))
+        warning, review = widget.select_warning_button, widget.select_review_button
+        warning.click()
+        assert warning.isChecked() and len(widget.selected_proposal_ids()) == 2
+        warning.click()
+        assert not warning.isChecked() and widget.selected_proposal_ids() == ()
+        review.click()
+        warning.click()
+        assert review.isChecked() and warning.isChecked()
+        warning.click()
+        assert widget.selected_proposal_ids() == ("shape.position@1:3",)
+        assert review.isChecked() and not warning.isChecked()
+        review.click()
+        assert widget.selected_proposal_ids() == () and not review.isChecked()
+    finally:
+        widget.close()
+
+
+def test_whole_proposal_row_and_keyboard_toggle_without_checkbox(application, tmp_path):
+    widget = overlay.OverlayWidget()
+    events = []
+    widget.proposal_user_toggled.connect(lambda ids, checked: events.append((set(ids), checked)))
+    try:
+        widget.set_target(overlay.PowerPointWindow(0, QRect(0, 0, 1440, 900), "deck.pptx"))
+        widget.set_collapsed(False)
+        widget.show_report(_proposal_report(tmp_path / "deck.pptx", "hash"))
+        application.processEvents()
+        listing = widget.proposals_list
+        first = widget.proposal_items["font.size@1:2#bundle-a"]
+        assert not first.flags() & Qt.ItemFlag.ItemIsUserCheckable
+        assert first.data(Qt.ItemDataRole.CheckStateRole) is None
+        row = listing.visualItemRect(first)
+        # Click well away from the old indicator, including the empty row end.
+        point = QPoint(row.right() - 5, row.center().y())
+        QTest.mouseClick(listing.viewport(), Qt.MouseButton.LeftButton, pos=point)
+        selected = set(widget.selected_proposal_ids())
+        assert selected == {"font.size@1:2#bundle-a", "shape.height@1:2#bundle-a"}
+        assert first.isSelected() and events == [(selected, True)]
+        QTest.mouseClick(listing.viewport(), Qt.MouseButton.LeftButton, pos=point)
+        assert widget.selected_proposal_ids() == () and events[-1] == (selected, False)
+        listing.setCurrentItem(first, QItemSelectionModel.SelectionFlag.NoUpdate)
+        QTest.keyClick(listing, Qt.Key.Key_Space)
+        assert set(widget.selected_proposal_ids()) == selected
+        QTest.keyClick(listing, Qt.Key.Key_Space)
+        assert widget.selected_proposal_ids() == ()
+    finally:
+        widget.close()
+
+
+def test_details_get_more_width_and_wrap_long_titles(application, tmp_path):
+    widget = overlay.OverlayWidget()
+    try:
+        widget.set_target(overlay.PowerPointWindow(0, QRect(0, 0, 1440, 900), "deck.pptx"))
+        widget.set_collapsed(False)
+        widget.show_report(_proposal_report(tmp_path / "deck.pptx", "hash"))
+        widget.detail_title.setText("이 슬라이드의 글자와 배경을 함께 확인해야 합니다. " * 5)
+        application.processEvents()
+        assert widget.findings_table.width() <= 210
+        assert widget.detail_scroll.parentWidget().width() > widget.findings_table.width() * 2
+        assert widget.detail_title.wordWrap()
+        assert widget.detail_title.height() >= widget.detail_title.heightForWidth(widget.detail_title.width())
+        assert widget.detail_scroll.horizontalScrollBar().maximum() == 0
+        assert widget.detail_scroll.verticalScrollBar().maximum() > 0
+        assert widget.height() <= overlay.PANEL_HEIGHT
+    finally:
+        widget.close()
+
+
+def test_changing_finding_shows_details_from_the_top(application, tmp_path, monkeypatch):
+    from slideguard.ui.finding_details import FindingExplanation
+
+    explanation = FindingExplanation(
+        "긴 검사 제목 " * 8, "판정 근거와 설명 " * 40, (), "권장 수정 내용 " * 20
+    )
+    monkeypatch.setattr(overlay, "describe_finding", lambda _finding: explanation)
+    widget = overlay.OverlayWidget()
+    try:
+        widget.set_target(overlay.PowerPointWindow(0, QRect(0, 0, 1440, 900), "deck.pptx"))
+        widget.set_collapsed(False)
+        widget.show_report(_proposal_report(tmp_path / "deck.pptx", "hash"))
+        application.processEvents()
+        bar = widget.detail_scroll.verticalScrollBar()
+        assert bar.maximum() > 0
+        bar.setValue(bar.maximum())
+        widget.findings_table.setCurrentCell(1, 0)
+        application.processEvents()
+        assert bar.value() == 0
     finally:
         widget.close()
 
@@ -431,16 +573,34 @@ def test_completed_report_defaults_preview_to_after_tab(application, tmp_path):
         widget.close()
 
 
-def test_copy_and_original_apply_buttons_share_footer_and_style(application):
+def test_proposal_actions_use_header_and_right_rail_to_leave_list_space(application, tmp_path):
     widget = overlay.OverlayWidget()
     try:
-        copy_index = widget.apply_actions_layout.indexOf(widget.apply_button)
-        original_index = widget.apply_actions_layout.indexOf(widget.apply_original_button)
-
-        assert copy_index >= 0
-        assert original_index == copy_index + 1
+        actions = (widget.apply_button, widget.apply_all_button, widget.apply_all_recommended_button)
+        assert [button.text() for button in actions] == [
+            "선택 적용",
+            "최소안 적용",
+            "권장안 적용",
+        ]
+        proposal = widget.apply_button.parentWidget()
+        assert proposal.objectName() == "proposal"
+        assert all(button.parentWidget() is proposal for button in actions)
+        widget.set_target(overlay.PowerPointWindow(0, QRect(0, 0, 1440, 900), "deck.pptx"))
+        widget.set_collapsed(False)
+        widget.show_report(_proposal_report(tmp_path / "deck.pptx", "hash"))
+        application.processEvents()
+        listing = QRect(widget.proposals_list.mapTo(proposal, QPoint()), widget.proposals_list.size())
+        assert widget.proposals_list.viewport().height() >= 80
+        assert widget.proposals_list.viewport().height() >= 3 * widget.proposals_list.sizeHintForRow(0)
+        assert widget.proposals_list.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        for button in actions:
+            assert button.mapTo(proposal, QPoint()).x() > listing.right()
+        for button in (widget.select_warning_button, widget.select_review_button):
+            assert button.mapTo(proposal, QPoint()).y() < listing.top()
+        assert all(button.text() != "선택 해제" for button in proposal.findChildren(overlay.QPushButton))
+        assert widget.expanded_page.layout().count() == 2
+        assert widget.selected_count_label.parentWidget() is proposal
         assert widget.apply_button.objectName() == "primary"
-        assert widget.apply_original_button.objectName() == "primary"
     finally:
         widget.close()
 
@@ -548,8 +708,9 @@ def test_selection_conflicts_detect_alternatives_and_partial_bundles(tmp_path):
         [report.proposals[0], alternative],
     )
 
-    assert any("묶음" in message for message in conflicts)
-    assert any("서로 다른 변경값" in message for message in conflicts)
+    assert any("함께 적용" in message for message in conflicts)
+    assert any("서로 다른 글자 크기" in message for message in conflicts)
+    assert all("#alternative" not in message for message in conflicts)
 
 
 class _SettingsRepository:
@@ -986,12 +1147,12 @@ def test_copy_save_uses_selection_snapshot_from_button_click(application, tmp_pa
     try:
         controller.overlay.show_report(report)
         first = report.proposals[0].id
-        controller.overlay.proposal_items[first].setCheckState(Qt.CheckState.Checked)
+        controller.overlay.proposal_items[first].setSelected(True)
         snapshot = controller.overlay.selected_proposal_ids()
 
         def choose_output(*_args):
             controller.overlay.clear_proposals()
-            controller.overlay.proposal_items[report.proposals[2].id].setCheckState(Qt.CheckState.Checked)
+            controller.overlay.proposal_items[report.proposals[2].id].setSelected(True)
             return str(tmp_path / "saved.pptx"), ""
 
         monkeypatch.setattr(overlay.QFileDialog, "getSaveFileName", choose_output)
@@ -1124,7 +1285,7 @@ def test_unsaved_active_presentation_blocks_copy_apply(application, tmp_path, mo
     )
     try:
         controller.overlay.show_report(report)
-        controller.overlay.proposal_items[report.proposals[0].id].setCheckState(Qt.CheckState.Checked)
+        controller.overlay.proposal_items[report.proposals[0].id].setSelected(True)
 
         controller.apply_selected()
 
@@ -1163,7 +1324,7 @@ def test_changed_saved_file_marks_report_stale_and_reenables_manual_check(applic
     )
     try:
         controller.overlay.show_report(report)
-        controller.overlay.proposal_items[report.proposals[0].id].setCheckState(Qt.CheckState.Checked)
+        controller.overlay.proposal_items[report.proposals[0].id].setSelected(True)
         assert controller.overlay.apply_button.isEnabled() is True
         source.write_bytes(b"saved after analysis")
 

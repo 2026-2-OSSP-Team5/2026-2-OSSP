@@ -27,6 +27,9 @@ class TextRun:
     transparency: float | None = None
     fill_kind: str | None = None
     fill_visible: bool | None = None
+    font_family: str | None = None
+    italic: bool | None = None
+    underline: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,7 @@ class TextSpan:
     index: int
     text: str
     box: Box | None = None
+    properties: tuple[tuple[str, str | int | float | bool], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +143,8 @@ class DeckSnapshot:
     shapes: tuple[Shape, ...] = ()
     limitations: tuple[str, ...] = ()
     slides: tuple[SlideDetails, ...] = ()
+    slide_fingerprints: tuple[tuple[str, str], ...] = ()
+    measurement_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -163,6 +169,8 @@ class ChangeProposal:
     before: float | str | Color
     after: float | str | Color
     cost: float
+    payload: dict | None = None
+    explanation: str = ""
 
 
 @dataclass(frozen=True)
@@ -185,6 +193,7 @@ class AnalysisReport:
     schema_version: str = "0.3"
     policy_key: str | None = None
     comparison: FindingComparison | None = None
+    proposal_notes: dict[str, str] = field(default_factory=dict)
 
     def compare_with(self, before: "AnalysisReport") -> None:
         rank = {"review": 1, "warning": 2, "unknown": None}

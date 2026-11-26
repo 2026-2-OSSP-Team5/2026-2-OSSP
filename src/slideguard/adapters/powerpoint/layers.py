@@ -137,9 +137,12 @@ def resolve_backgrounds(shapes, slide):
     )
     resolved = {}
     for shape in top:
-        if shape.text and shape.background is None:
+        graphic = bool(dict(shape.properties).get("meaningful_graphic_color"))
+        if (shape.text or graphic) and shape.background is None:
             notes: list[str] = []
-            color = _uniform(shape, layers, slide, notes)
+            target = replace(shape, rendered_box=shape.box) if graphic and not shape.text else shape
+            tested_layers = [(s, item) for s, item in layers if not graphic or s.key != shape.key]
+            color = _uniform(target, tested_layers, slide, notes)
             if color is not None:
                 resolved[shape.key] = replace(
                     shape, background=color, notes=(*shape.notes, "Background resolved from the slide layers")

@@ -157,6 +157,12 @@ class PowerPointPatcher:
 
         하나도 적용하지 못하면 ApplyRejected. 거절 이유·경고는 self.last_result에 남습니다.
         """
+        proposal_ids = tuple(proposal_ids)
+        selected = [p for p in report.proposals if p.id in proposal_ids]
+        if any(p.property == Property.SLIDE_SPLIT for p in selected):
+            from .restructure import apply_structural_copy
+
+            return apply_structural_copy(self, report, proposal_ids, output, policy)
         proposals = self._selected_proposals(report, proposal_ids)
         deck = report.deck
         result = self.apply(deck.source_path, deck.source_sha256, proposals, policy, str(output))
@@ -176,6 +182,9 @@ class PowerPointPatcher:
         원본을 바꾸기 전에 backup_dir에 백업을 만듭니다. 하나도 적용하지 못하면
         원본은 그대로이고 백업도 지운 뒤 ApplyRejected. 상세 결과는 self.last_result.
         """
+        proposal_ids = tuple(proposal_ids)
+        if any(p.id in proposal_ids and p.property == Property.SLIDE_SPLIT for p in report.proposals):
+            raise ApplyRejected("본문 분할은 렌더링 검증을 거친 새 PPTX 사본에만 적용할 수 있습니다.")
         proposals = self._selected_proposals(report, proposal_ids)
         deck = report.deck
         result = self.apply_in_place(deck.source_path, deck.source_sha256, proposals, policy, str(backup_dir))
@@ -335,6 +344,7 @@ def apply_proposal(doc: Document, p: ChangeProposal, result: ApplyResult) -> Non
         Property.FONT_SIZE: _apply_font_size,
         Property.FONT_COLOR: _apply_font_color,
         Property.FONT_FAMILY: _apply_font_family,
+        Property.FONT_BOLD: _apply_font_bold,
         Property.SHAPE_HEIGHT: _apply_height,
         Property.SHAPE_WIDTH: _apply_width,
         Property.SHAPE_POSITION: _apply_position,
@@ -379,9 +389,17 @@ def _apply_font_size(shape: ShapeHandle, p: ChangeProposal):
     if get_autofit is not None and get_autofit() == "shrink":
         return _resize_shrunk_text(shape, target)
     changed = 0
+    shrinking = _is_number(p.before) and target < float(p.before) - TOLERANCE
     for run in shape.runs():
         size = run.get_size()
-        if size is not None and size < target:  # 크기를 모르는 런은 건드리지 않음
+        if size is None:
+            continue  # 크기를 모르는 런은 건드리지 않음
+        if shrinking:
+            # 줄이는 후보(슬라이드 간 일관성: 제목 크기 맞추기)는 '그 크기였던 글자'만 바꾼다
+            if abs(size - float(p.before)) <= TOLERANCE:
+                run.set_size(target)
+                changed += 1
+        elif size < target:
             run.set_size(target)
             changed += 1
     fit_rows = getattr(shape, "fit_table_rows", None)
@@ -425,6 +443,20 @@ def _apply_font_color(shape: ShapeHandle, p: ChangeProposal):
         color = run.get_color()
         if color is not None and color.upper() == before:
             run.set_color(after)
+            changed += 1
+    return changed
+
+
+def _apply_font_bold(shape: ShapeHandle, p: ChangeProposal):
+    """글자색이 p.before인 글자를 굵게 (색만으로 구분한 글자에 색 외의 표시를 더함: Okabe & Ito CUD 원칙 2)."""
+    target = str(p.before).upper().lstrip("#")
+    changed = 0
+    for run in shape.runs():
+        get_bold = getattr(run, "get_bold", None)
+        if get_bold is None or str(run.get_color() or "").upper() != target:
+            continue
+        if get_bold() is not True:
+            run.set_bold(bool(p.after))
             changed += 1
     return changed
 
@@ -653,6 +685,15 @@ class _ComRun:
     def set_font_name(self, name: str) -> None:
         self._tr.Font.Name = name
         self._tr.Font.NameFarEast = name
+
+    def get_bold(self) -> bool | None:
+        try:
+            return int(self._tr.Font.Bold) == MSO_TRUE
+        except _COM_ERRORS:
+            return None
+
+    def set_bold(self, bold: bool) -> None:
+        self._tr.Font.Bold = MSO_TRUE if bold else 0
 
 
 class _ComParagraph:
@@ -957,3 +998,7 @@ class OriginalDocumentSession(ComDocumentSession):
                 )
             return pres
         return super()._open(app)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)

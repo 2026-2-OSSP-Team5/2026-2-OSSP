@@ -4,7 +4,7 @@ import pytest
 
 from slideguard.checks.layout import LayoutRule
 from slideguard.domain.models import Box, DeckSnapshot, ObjectLocator, Shape, TextRun, TextSpan
-from slideguard.domain.policy import AnalysisPolicy, Purpose
+from slideguard.domain.policy import AnalysisPolicy, Purpose, Strength
 
 # 슬라이드 960x540pt → 안전 여백: 좌우 48pt, 상하 27pt
 
@@ -285,6 +285,19 @@ def test_density_sums_all_shapes_on_the_slide():
     assert findings[0].shape_key == "1:1"  # 가장 글자가 많은 도형
 
 
+def test_density_marks_all_counted_boxes_and_excludes_manual_page_number():
+    body = make_shape(x=100, y=100, w=200, h=100, text="\n".join(["항목"] * 6), shape_id=1)
+    page = make_shape(x=800, y=20, text="1 / 23", shape_id=2)
+    assert only(run_rule(body, page), "layout.density") == []
+    extra = make_shape(x=500, y=300, w=100, h=30, text="추가 항목", shape_id=3)
+    [finding] = only(run_rule(body, page, extra), "layout.density")
+    assert finding.measured == 7 and finding.box == Box(100, 100, 500, 230)
+    assert "6줄" in finding.evidence and "1줄" in finding.evidence
+    # A fraction in the body is content, even if its numerator matches the page.
+    fraction = replace(page, box=Box(800, 200, 100, 30))
+    assert only(run_rule(body, fraction), "layout.density")[0].measured == 7
+
+
 def test_density_is_counted_per_slide():
     a = make_shape(text="가" * 60, slide_number=1)
     b = make_shape(text="나" * 60, slide_number=2)
@@ -528,3 +541,85 @@ def test_footer_and_chart_text_are_skipped():
     # 쪽 번호·차트 글자는 읽을 내용이 아니라 정보 밀도에서 빼는 것과 같은 기준을 쓴다.
     footer = replace(make_shape(lines=("가" * 60,)), placeholder_type=13)
     assert line_findings(run_rule(footer)) == []
+    chart = replace(make_shape(lines=("가" * 60,)), locator=ObjectLocator((1,), "axis_title", (1, 1)))
+    assert line_findings(run_rule(chart)) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "flagged"),
+    [
+        ("가" * 40, False),
+        ("가" * 41, True),
+        ("a" * 80, False),
+        ("a" * 81, True),
+        ("가" * 25 + "a" * 20, False),
+        ("가" * 20 + "a" * 50, True),
+        ("https://example.com/" + "a" * 90, True),
+        ("가" * 50 + "=수식", True),
+    ],
+)
+@pytest.mark.parametrize("placeholder_type", [None, 1])
+def test_registered_analyzer_prioritizes_feature_line_length_without_duplicates_or_fixes(
+    text, flagged, placeholder_type
+):
+    from slideguard.bootstrap import build_analyzer
+
+    shape = replace(make_shape(text=text, lines=(text,)), placeholder_type=placeholder_type)
+    deck = DeckSnapshot("body.pptx", "hash", 3, 960, 540, (shape,))
+    for strength in Strength:
+        report = build_analyzer().analyze_snapshot(deck, AnalysisPolicy(strength=strength))
+        findings = [f for f in report.findings if f.rule_id.endswith(".line_length")]
+        assert len(findings) == int(flagged)
+        assert all(f.rule_id == "layout.line_length" and f.severity == "review" for f in findings)
+        ids = {f.id for f in findings}
+        assert not any(p.finding_id in ids for p in report.proposals)
+
+
+def test_header_and_page_number_repeated_on_every_slide_do_not_count_as_content():
+    """여러 쪽 같은 자리의 머리글·쪽 번호는 읽을 내용이 아니므로 정보 밀도에서 뺀다 (함정 PPT 2)."""
+    shapes = []
+    for slide in (1, 2):
+        shapes.append(
+            replace(
+                make_shape(x=60, y=120, w=800, h=300, text="\n".join(["항목"] * 6), shape_id=2),
+                slide_number=slide,
+            )
+        )
+        shapes.append(
+            replace(
+                make_shape(x=640, y=8, w=300, h=24, text="셔틀 2차 개편안", shape_id=4), slide_number=slide
+            )
+        )
+        shapes.append(
+            replace(make_shape(x=880, y=500, w=60, h=24, text=f"{slide} / 2", shape_id=5), slide_number=slide)
+        )
+    deck = DeckSnapshot("d.pptx", "0" * 64, 2, 960, 540, shapes=tuple(shapes))
+    assert [f for f in LayoutRule().evaluate(deck, AnalysisPolicy()) if f.rule_id == "layout.density"] == []
+
+
+def test_outline_only_card_in_front_of_text_does_not_hide_it():
+    """채우기 없는 둥근 테두리 카드가 글상자 앞에 있어도, 글자가 테두리 안쪽이면 가림이 아님 (자바게티 20쪽)."""
+    from slideguard.checks.layout import LayoutRule
+    from slideguard.domain.models import Box, DeckSnapshot, Shape, TextRun
+    from slideguard.domain.policy import AnalysisPolicy
+
+    text = Shape(
+        1,
+        3,
+        "TextBox 3",
+        Box(96, 211, 322, 123),
+        text="아파요(훼손)\\n등록 활성화",
+        runs=(TextRun("아파요(훼손) 등록 활성화", 32.0),),
+        supported=True,
+        z_order=3,
+        rendered_box=Box(103, 215, 195, 77),
+    )
+    card = Shape(
+        1, 5, "모서리가 둥근 직사각형 4", Box(82, 177, 348, 438), z_order=4, properties=(("no_fill", True),)
+    )
+    deck = DeckSnapshot("d.pptx", "0" * 64, 1, 1440, 810, shapes=(text, card))
+    overlaps = [f for f in LayoutRule().evaluate(deck, AnalysisPolicy()) if f.rule_id == "layout.overlap"]
+    assert overlaps == []
+    filled = Shape(1, 5, "가리는 도형", Box(82, 177, 348, 438), z_order=4)  # 채우기 모름 → 그대로 검토
+    deck = DeckSnapshot("d.pptx", "0" * 64, 1, 1440, 810, shapes=(text, filled))
+    assert [f for f in LayoutRule().evaluate(deck, AnalysisPolicy()) if f.rule_id == "layout.overlap"]

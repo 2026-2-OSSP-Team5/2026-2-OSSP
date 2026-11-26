@@ -142,6 +142,14 @@ def _layout_verified(item) -> bool:
     )
 
 
+def _fill_hidden(item) -> bool:
+    """도형 채우기가 '없음'으로 확인되면 True (모르면 False)."""
+    try:
+        return item.Fill.Visible == 0
+    except Exception:  # noqa: BLE001 - 채우기를 못 읽는 도형(선 등)은 모름으로 둠
+        return False
+
+
 def _walk(collection, number, slide, path=(), *, ancestor_verified=True, ancestor_visible=True, depth=0):
     if depth > 64:
         raise ValueError("Group nesting exceeds the supported traversal depth")
@@ -159,6 +167,9 @@ def _walk(collection, number, slide, path=(), *, ancestor_verified=True, ancesto
         if parent.z_order is not None and parent.shape_type in _SUPPORTED_TYPES and parent.supported:
             color, transparency = paint(item, [])
             parent = replace(parent, fill_color=color, fill_transparency=transparency)
+            if _fill_hidden(item):
+                # 채우기 없음(테두리만 있는 카드 등): 앞에 있어도 안쪽 글자를 가리지 않음 (겹침 검사에서 씀)
+                parent = replace(parent, properties=(*parent.properties, ("no_fill", True)))
         if not ancestor_verified:
             parent = replace(
                 parent,
@@ -195,7 +206,7 @@ def _walk(collection, number, slide, path=(), *, ancestor_verified=True, ancesto
             yield from smartart_nodes(item, parent, layout_verified=verified)
 
 
-def extract_snapshot(presentation: Any, saved: SavedPresentationCopy) -> DeckSnapshot:
+def extract_snapshot(presentation: Any, saved: SavedPresentationCopy, *, slide_numbers=None) -> DeckSnapshot:
     setup = presentation.PageSetup
     width = _point(setup.SlideWidth, "PageSetup.SlideWidth", minimum=0)
     height = _point(setup.SlideHeight, "PageSetup.SlideHeight", minimum=0)
@@ -205,7 +216,7 @@ def extract_snapshot(presentation: Any, saved: SavedPresentationCopy) -> DeckSna
     slide_count = _integer(slides.Count, "Slides.Count")
     shapes = []
     details = []
-    for number in range(1, slide_count + 1):
+    for number in range(1, slide_count + 1) if slide_numbers is None else slide_numbers:
         slide = slides.Item(number)
         hidden = tristate(
             optional(lambda slide=slide: slide.SlideShowTransition.Hidden, "Hidden slide", []), "Hidden", []

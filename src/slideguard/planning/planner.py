@@ -42,10 +42,13 @@ from slideguard.planning.bindings import TeamBindings, table_of_cell
 from slideguard.planning.color import (
     color_distance,
     contrast_ratio,
+    cud_color,
+    cud_distinct_colors,
     harmony_score,
     nearest_passing_color,
     relative_luminance,
     saturation,
+    vision_ratio,
     worst_contrast_over_unknown,
 )
 from slideguard.planning.contracts import (
@@ -60,6 +63,7 @@ from slideguard.planning.contracts import (
     Status,
 )
 from slideguard.planning.reflow import MIN_GROW, reflow_slide
+from slideguard.planning.same_place import extend_same_place
 from slideguard.planning.standards import Standards, build_standards
 
 # ======================================================================
@@ -71,6 +75,7 @@ PROPERTY_GROUP = {
     Property.FONT_SIZE: "글자 크기",
     Property.FONT_COLOR: "글자 색",
     Property.FONT_FAMILY: "글씨체",
+    Property.FONT_BOLD: "글씨체",
     Property.SHAPE_POSITION: "항목 위치",
     Property.SHAPE_HEIGHT: "항목 위치",
     Property.SHAPE_WIDTH: "항목 위치",
@@ -83,6 +88,7 @@ PROPERTY_GROUP = {
 _PASSIVE = frozenset({Property.FONT_SIZE, Property.FONT_COLOR})
 _BALANCED = _PASSIVE | {
     Property.FONT_FAMILY,
+    Property.FONT_BOLD,
     Property.SHAPE_POSITION,
     Property.SHAPE_HEIGHT,
     Property.SHAPE_WIDTH,
@@ -140,6 +146,8 @@ class RuleBasedPlanner:
         self.bindings = bindings or TeamBindings()
         # standards를 넘기면 그 기준을 쓰고, 없으면 정책의 용도로 B 기준을 가져옵니다.
         self.standards = standards
+        # 색약 맞춤 수정에서 고려할 눈 (설정의 색각 유형). plan()이 정책에서 읽어 채운다. None = 세 가지 모두
+        self.vision_kinds: tuple[str, ...] | None = None
         self.allow_large_text_option = allow_large_text_option
 
     # ==================================================================
@@ -153,6 +161,10 @@ class RuleBasedPlanner:
         권장 수정: 정책의 FixTargets 목표까지 고친 후보 중 최소 수정과 값이 다른 것 → result.recommended
         """
         standards = self.standards
+        if isinstance(policy, AnalysisPolicy) and policy.vision_kinds:
+            self.vision_kinds = policy.vision_kinds  # 예: 적록색약 → ("protan", "deutan")
+        else:
+            self.vision_kinds = None
         if standards is None:
             standards = build_standards(
                 self.bindings.purpose(policy), policy if isinstance(policy, AnalysisPolicy) else None
@@ -199,7 +211,12 @@ class RuleBasedPlanner:
                 skip(self._review_reason(info, standards))
                 continue
             if info.status == Status.REVIEW and not (
-                _is_photo_text(info) or info.values.get("confirmed_hierarchy")
+                _is_photo_text(info)
+                or info.values.get("confirmed_hierarchy")
+                or info.values.get("color_vision")
+                or info.rule in CONSISTENCY_FIXES
+                or info.rule == COLOR_ONLY_RULE
+                or info.rule == Rule.SAFE_MARGIN  # 안전 여백 침범: 가장 가까운 안쪽으로 옮기는 후보
             ):
                 skip("사람의 검토가 필요한 항목")
                 continue
@@ -441,6 +458,8 @@ class RuleBasedPlanner:
         if info.rule in (Rule.FONT_FAMILY, Rule.HIERARCHY):
             return Category.DESIGN
         if info.rule == Rule.CONTRAST:
+            if info.values.get("color_vision"):
+                return Category.READABILITY  # 색약 접근성: 강조색이라도 디자인 예산으로 막지 않음
             if _is_photo_text(info):
                 return Category.DESIGN
             fg = info.values.get("foreground")
@@ -467,6 +486,10 @@ class RuleBasedPlanner:
 
     def _candidates(self, info, shape, others, ctx, category, profile):
         s = ctx["standards"]
+        if info.rule in CONSISTENCY_FIXES:
+            return self._consistency(info, shape, others, ctx, category)
+        if info.rule == COLOR_ONLY_RULE:
+            return self._color_only(info, shape, category)
         if info.rule == Rule.CONTRAST:
             if _is_photo_text(info):
                 return self._scrim(info, shape, s, category)
@@ -586,7 +609,10 @@ class RuleBasedPlanner:
         bg = info.values.get("background")
         if fg is None or bg is None:
             return [], "명암비 측정값(글자색·배경색)이 없음"
-        ratio = info.values.get("ratio", contrast_ratio(fg, bg))
+        # 색약 맞춤 판정이면 '보통 눈과 설정에서 고른 색약 눈 모두'에서 기준을 넘는 색을 찾는다
+        vision = bool(info.values.get("color_vision"))
+        ratio_of = vision_ratio(self.vision_kinds) if vision else contrast_ratio
+        ratio = info.values.get("ratio", ratio_of(fg, bg))
         threshold = info.values.get("required_ratio", standards.contrast_normal.value)
         # 검사 기준(threshold)을 넘는 범위에서 얼마나 여유 있게 고칠지는 수정 목표(FixTargets)가 정한다
         required = contrast_goal(threshold, standards)
@@ -594,24 +620,35 @@ class RuleBasedPlanner:
             f"기준 {threshold}:1" if required == threshold else f"기준 {threshold}:1, 목표 {required:g}:1"
         )
 
+        if vision:
+            # 색약: Okabe & Ito(CUD)는 '어두운 배경 위 빨간 글자'를 피하고 밝은 글자를 쓰라고 권한다.
+            # 기준선(큰 글자 3:1)만 겨우 넘기면 여전히 어둡게 보이므로 일반 글자 기준(4.5:1)까지 올린다.
+            required = max(required, standards.contrast_normal.value)
+            goal_text = f"기준 {threshold}:1, 색약 목표 {required:g}:1"
+
         candidates = []
 
         def color_option(new_color, label):
             harmony = harmony_score(new_color, bg)
-            new_ratio = contrast_ratio(new_color, bg)
-            note = (
-                f"{label} #{fg} → #{new_color} (명암비 {new_ratio:.2f}:1, {goal_text}, 조화 {harmony:+.2f})"
-            )
+            new_ratio = ratio_of(new_color, bg)
+            who = "색약 포함 최저 " if vision else ""
+            note = f"{label} #{fg} → #{new_color} ({who}명암비 {new_ratio:.2f}:1, {goal_text}, 조화 {harmony:+.2f})"
             cost = color_distance(fg, new_color)
             return self._proposal(
                 info, shape, Property.FONT_COLOR, fg, new_color, cost, category, note, harmony, new_ratio
             )
 
+        if vision:
+            # 색약 맞춤: 원래 색과 가장 가까운 색각 친화 색 (Okabe & Ito 팔레트, Wong 2011)
+            cud = cud_color(fg, bg, required, self.vision_kinds)
+            if cud is not None:
+                return [color_option(cud, "색각 친화 색(Okabe·Ito)")], ""
+
         # 후보 A
-        new_color = nearest_passing_color(fg, bg, required)
+        new_color = nearest_passing_color(fg, bg, required, ratio_of)
         if new_color is None:
             for fallback in ("000000", "FFFFFF"):
-                passes = contrast_ratio(fallback, bg) >= required
+                passes = ratio_of(fallback, bg) >= required
                 closer = new_color is None or color_distance(fg, fallback) < color_distance(fg, new_color)
                 if passes and closer:
                     new_color = fallback
@@ -620,14 +657,14 @@ class RuleBasedPlanner:
 
         # 후보 B
         palette = PALETTE_DARK if relative_luminance(bg) > 0.18 else PALETTE_LIGHT
-        if palette != new_color and contrast_ratio(palette, bg) >= required:
+        if palette != new_color and ratio_of(palette, bg) >= required:
             candidates.append(color_option(palette, "표준 팔레트 글자색"))
 
         # 후보 C
         large_ratio = standards.contrast_large.value
         # (큰 글자가 돼도 수정 목표를 넘어야 함: 목표가 4.5:1이면 크기만 키워서는 안 됨)
         large_goal = contrast_goal(large_ratio, standards, large=True)
-        if self.allow_large_text_option and required > large_goal and ratio >= large_goal:
+        if not vision and self.allow_large_text_option and required > large_goal and ratio >= large_goal:
             option = self._large_text_option(info, shape, fg, standards, category)
             if option is not None:
                 candidates.append(option)
@@ -835,36 +872,154 @@ class RuleBasedPlanner:
         ratio = ctx["standards"].safe_margin_ratio.value
         mx, my = slide_w * ratio, slide_h * ratio
 
-        fits_safe = (
-            shape.width <= slide_w - 2 * mx + TOLERANCE and shape.height <= slide_h - 2 * my + TOLERANCE
-        )
-        if fits_safe:
+        # 옮길 기준 = 글자가 실제로 그려진 영역 (검사도 이 영역으로 판정함).
+        # 상자가 넓어도(제목 자리 표시자 등) 글자만 안전 영역에 들어가면 되므로 글자 영역만큼만 옮긴다.
+        # 글자 영역을 모르면 상자 자체를 기준으로 한다.
+        text_box = info.values.get("text_box")
+        if text_box is not None:
+            tx, ty, tw, th = text_box
+        else:
+            tx, ty, tw, th = shape.left, shape.top, shape.width, shape.height
+
+        if tw <= slide_w - 2 * mx + TOLERANCE and th <= slide_h - 2 * my + TOLERANCE:
             area = (mx, my, slide_w - mx, slide_h - my)
             where = f"가장자리 여백 {ratio:.0%} 안쪽으로"
         elif info.rule == Rule.SAFE_MARGIN:
-            return [], "상자가 안전 영역보다 큼 → 크기 조정은 사람이 판단"
-        elif shape.width <= slide_w + TOLERANCE and shape.height <= slide_h + TOLERANCE:
+            return [], "글자 영역이 안전 영역보다 큼 → 크기 조정은 사람이 판단"
+        elif tw <= slide_w + TOLERANCE and th <= slide_h + TOLERANCE:
             area = (0.0, 0.0, slide_w, slide_h)
             where = "슬라이드 안으로"
         else:
-            return [], "상자가 슬라이드보다 큼 → 사람이 판단"
+            return [], "글자 영역이 슬라이드보다 큼 → 사람이 판단"
 
-        new_left = min(max(shape.left, area[0]), area[2] - shape.width)
-        new_top = min(max(shape.top, area[1]), area[3] - shape.height)
-        distance = math.hypot(new_left - shape.left, new_top - shape.top)
-        if distance <= TOLERANCE:
+        # 글자 영역이 안전 영역 안에 들어가는 가장 짧은 이동 (가로·세로 각각 가장 가까운 안쪽 경계로)
+        dx = min(max(tx, area[0]), area[2] - tw) - tx
+        dy = min(max(ty, area[1]), area[3] - th) - ty
+        if math.hypot(dx, dy) <= TOLERANCE:
             return [], "이미 안쪽에 있음 (측정값 확인 필요)"
 
-        blocked = _new_collisions(shape, (new_left, new_top, shape.width, shape.height), others)
-        if blocked:
-            ids = ", ".join(str(o.shape_id) for o in blocked)
-            return [], f"안으로 옮기면 다른 객체(ID {ids})와 겹침 → 사람이 판단"
+        # 가로·세로를 함께 옮기는 게 안 되면 한쪽만 옮긴다 (예: 머리 띠 안의 제목은 오른쪽으로 들여쓰기만).
+        # 안 되는 경우: 다른 객체와 새로 겹침, 또는 지금 글자를 담고 있는 띠·카드 밖으로 글자가 나감
+        # → 같은 모양의 슬라이드들이 쪽마다 다른 후보(어디는 이동, 어디는 없음)를 받지 않도록 같은 규칙으로 고름
+        text_rect = (tx, ty, tw, th)
+        holders = [
+            other
+            for other in others
+            if other.shape_id != shape.shape_id
+            and other.kind != "text"
+            and other.has_geometry
+            and _rect_inside(text_rect, (other.left, other.top, other.width, other.height))
+        ]
+        tried, partial = [], ""
+        for mx_, my_, label in ((dx, dy, ""), (dx, 0.0, "가로만"), (0.0, dy, "세로만")):
+            if math.hypot(mx_, my_) <= TOLERANCE:
+                continue
+            moved_text = (tx + mx_, ty + my_, tw, th)
+            leaves = [h for h in holders if not _rect_inside(moved_text, (h.left, h.top, h.width, h.height))]
+            rect = (shape.left + mx_, shape.top + my_, shape.width, shape.height)
+            blocked = _new_collisions(shape, rect, others)
+            if leaves:
+                tried.append(f"{label or '그대로'}: 글자를 담은 띠·카드(ID {leaves[0].shape_id}) 밖으로 나감")
+                continue
+            if blocked:
+                ids = ", ".join(str(o.shape_id) for o in blocked)
+                tried.append(f"{label or '그대로'}: 다른 객체(ID {ids})와 겹침")
+                continue
+            dx, dy, partial = mx_, my_, label
+            break
+        else:
+            return [], "안으로 옮기면 " + " / ".join(tried) + " → 사람이 판단"
+        new_left, new_top = shape.left + dx, shape.top + dy
+        distance = math.hypot(dx, dy)
+        if partial:
+            where = f"{where} ({partial}: 다른 방향은 겹침·띠 밖이라 그대로)"
 
         before = (shape.left, shape.top)
         after = (round(new_left, 2), round(new_top, 2))
         note = f"상자 위치 ({shape.left:g}, {shape.top:g}) → ({after[0]:g}, {after[1]:g}) ({where} {distance:.0f}pt)"
         cost = distance / slide_h
         return [self._proposal(info, shape, Property.SHAPE_POSITION, before, after, cost, category, note)], ""
+
+    # ---- 색만으로 구분한 글자 → 색각 친화 색으로 바꾸기 (Okabe & Ito CUD, Wong 2011) ----
+    # 판정 id 끝: <바꿀 색들>_<본문색> (color_vision.color_only:<슬라이드>:<도형>:D62728-2CA02C_222222)
+    # 빨강·초록처럼 색약 눈에 같아 보이는 색들을, 모든 눈에서 서로·본문과 구분되고 배경과 4.5:1 이상인
+    # 팔레트 색으로 함께 바꾼다 (한 묶음). 그런 조합이 없으면 그 글자들을 굵게 해 색 외의 표시를 더한다.
+
+    def _color_only(self, info, shape, category):
+        tail = info.finding_id.rsplit(":", 1)[-1]
+        marked_part, _sep, body = tail.partition("_")
+        colors = [part for part in marked_part.split("-") if len(part) == 6]
+        runs = list(getattr(shape, "runs", ()))
+        colors = [color for color in colors if any(run.color == color for run in runs)]
+        if not colors:
+            return [], "구분할 글자를 찾지 못함"
+        group = f"cud:{shape.slide_index}:{shape.shape_id}"
+        background = info.values.get("background") or "FFFFFF"
+        new_colors = cud_distinct_colors(colors, body or "000000", background, kinds=self.vision_kinds)
+        if new_colors is not None:
+            bundle = [
+                self._proposal(
+                    info,
+                    shape,
+                    Property.FONT_COLOR,
+                    old,
+                    new,
+                    color_distance(old, new) / len(colors),
+                    category,
+                    f"#{old} → #{new} (모든 눈에서 구분되는 색각 친화 색: Okabe & Ito CUD, Wong 2011)",
+                    group=group,
+                )
+                for old, new in zip(colors, new_colors, strict=True)
+            ]
+            return [bundle], ""
+        targets = [color for color in colors if any(r.color == color and r.bold is not True for r in runs)]
+        if not targets:
+            return [], "구분할 글자가 이미 굵음 → 사람이 판단 (기호·밑줄 추가 등)"
+        bundle = [
+            self._proposal(
+                info,
+                shape,
+                Property.FONT_BOLD,
+                color,
+                True,
+                0.05,
+                category,
+                f"#{color} 글자를 굵게 (색만으로 구분하지 않게: Okabe & Ito CUD 원칙 2)",
+                group=group,
+            )
+            for color in targets
+        ]
+        return [bundle], ""
+
+    # ---- 슬라이드 간 일관성 → 다른 슬라이드의 중앙값에 맞추기 -----------------
+    # 제목 위치: 다른 본문 슬라이드 제목의 중앙 위치로 옮김 (다른 객체와 새로 겹치면 만들지 않음)
+    # 제목 크기: 다른 본문 슬라이드 제목의 중앙 크기로 (최소 글자 크기 아래로는 내리지 않음)
+
+    def _consistency(self, info, shape, others, ctx, category):
+        if not info.values.get("consistency"):
+            return [], "일관성 목표값이 없음"
+        if info.rule == "consistency.title_position":
+            if not shape.has_geometry:
+                return [], "상자 좌표를 알 수 없음"
+            new_left, new_top = info.values["target_left"], info.values["target_top"]
+            blocked = _new_collisions(shape, (new_left, new_top, shape.width, shape.height), others)
+            if blocked:
+                ids = ", ".join(str(o.shape_id) for o in blocked)
+                return [], f"다른 슬라이드 제목 위치로 옮기면 다른 객체(ID {ids})와 겹침 → 사람이 판단"
+            distance = math.hypot(new_left - shape.left, new_top - shape.top)
+            before, after = (shape.left, shape.top), (round(new_left, 2), round(new_top, 2))
+            note = f"제목 위치 ({shape.left:g}, {shape.top:g}) → ({after[0]:g}, {after[1]:g}) (다른 슬라이드 제목과 같은 자리)"
+            cost = distance / ctx["slide_h"]
+            return [
+                self._proposal(info, shape, Property.SHAPE_POSITION, before, after, cost, category, note)
+            ], ""
+        size, target = info.values["size_pt"], info.values["target_pt"]
+        floor = ctx["standards"].min_font_pt.value or 0
+        if target < floor:
+            return [], f"다른 슬라이드 크기 {target:g}pt가 최소 기준 {floor:g}pt보다 작음 → 사람이 판단"
+        note = f"제목 글자 크기 {size:g}pt → {target:g}pt (다른 슬라이드 제목과 같은 크기)"
+        cost = _ratio_cost(size, target)
+        return [self._proposal(info, shape, Property.FONT_SIZE, size, target, cost, category, note)], ""
 
     # ---- 슬라이드 밖으로 나간 카드 → 안쪽 글상자와 함께 줄이기 ------------------
     # 카드만 옮기면 옆 카드와 겹치고, 카드만 줄이면 안쪽 글상자가 카드 밖으로 삐져나온다.
@@ -1103,7 +1258,7 @@ def _is_photo_text(info: FindingInfo) -> bool:
 
 def _ratio_cost(before: float, after: float) -> float:
     """증가 비율. 2배 이상이면 1.0."""
-    return min(1.0, (after - before) / before)
+    return min(1.0, abs(after - before) / before)  # 줄이는 후보(일관성)도 변화량만큼
 
 
 def _bundle_cost(bundle: list[ChangeProposal]) -> float:
@@ -1137,6 +1292,22 @@ def _overlaps(a: tuple, b: tuple) -> bool:
     return overlap_w > TOLERANCE and overlap_h > TOLERANCE
 
 
+COLOR_ONLY_RULE = "color_vision.color_only"
+
+# 일관성 판정 가운데 수정 후보를 만드는 것 (본문 크기는 내용 양 때문일 수 있어 사람이 판단)
+CONSISTENCY_FIXES = ("consistency.title_position", "consistency.title_size")
+
+
+def _rect_inside(inner: tuple, outer: tuple) -> bool:
+    """(왼, 위, 너비, 높이) inner가 outer 안에 들어가는지 (허용 오차 포함)."""
+    return (
+        outer[0] - TOLERANCE <= inner[0]
+        and outer[1] - TOLERANCE <= inner[1]
+        and inner[0] + inner[2] <= outer[0] + outer[2] + TOLERANCE
+        and inner[1] + inner[3] <= outer[1] + outer[3] + TOLERANCE
+    )
+
+
 def _new_collisions(shape: ShapeInfo, new_rect: tuple, others: list[ShapeInfo]) -> list[ShapeInfo]:
     """바꾼 뒤 '새로' 겹치게 되는 객체 목록.
 
@@ -1164,13 +1335,13 @@ def _merge_same_target(proposals: list[ChangeProposal], result: PlanResult) -> l
     order = []
     for p in proposals:
         key = (p.slide_index, p.shape_id, p.prop)
-        if p.prop in (Property.FONT_COLOR, Property.FONT_FAMILY):
+        if p.prop in (Property.FONT_COLOR, Property.FONT_FAMILY, Property.FONT_BOLD):
             # 글자 색·글씨체는 원래 값(before)이 같은 글자에만 적용된다 (patcher).
             # 한 상자에 회색이 두 가지면 후보도 두 개가 있어야 둘 다 고쳐진다.
             key = (p.slide_index, p.shape_id, p.prop, str(p.before).upper())
         if p.group is not None:
             # 묶음의 일부는 합치지 않고 그대로 둠 (함께 적용돼야 하므로)
-            key = (p.slide_index, p.shape_id, f"{p.prop}@{p.group}")
+            key = (p.slide_index, p.shape_id, f"{p.prop}@{p.group}", str(p.before).upper())
         if key not in merged:
             merged[key] = p
             order.append(key)
@@ -1213,4 +1384,11 @@ class MinimumChangePlanner:
                 team = replace(team, id=f"{head}~{str(p.before).upper()}{sep}{group}")
             seen.add(team.id)
             proposals.append(team)
-        return proposals
+        # 같은 자리(쪽 번호·머리글 등) 개체에도 같은 수정 후보 (고정한 객체·속성은 빼고)
+        extended = extend_same_place(report.deck, proposals)
+        kept = proposals[:]
+        for team in extended[len(proposals) :]:
+            slide, shape_id = (int(part) for part in team.shape_key.split(":"))
+            if not bindings.is_locked(policy, slide, shape_id, team.property):
+                kept.append(team)
+        return kept

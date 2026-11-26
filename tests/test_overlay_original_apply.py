@@ -3,7 +3,6 @@
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from slideguard.adapters.powerpoint.patcher import ApplyResult
@@ -78,22 +77,6 @@ def test_original_worker_reports_backup_and_applied_ids(tmp_path):
     assert outcomes[0].was_open
 
 
-def test_original_button_follows_selection(application, tmp_path, monkeypatch):
-    source = tmp_path / "source.pptx"
-    source.write_bytes(b"original bytes")
-    report = _proposal_report(source, overlay._sha256(source))
-    controller = _controller(source, monkeypatch, tmp_path)
-    try:
-        controller.overlay.show_report(report)
-        assert not controller.overlay.apply_original_button.isEnabled()
-        controller.overlay.proposal_items[report.proposals[0].id].setCheckState(Qt.CheckState.Checked)
-        assert controller.overlay.apply_original_button.isEnabled()
-        count = len(controller.overlay.selected_proposal_ids())  # 묶음 제안은 함께 선택됨
-        assert f"({count})" in controller.overlay.apply_original_button.text()
-    finally:
-        _close(controller)
-
-
 def test_unsaved_presentation_blocks_original_apply_before_confirmation(application, tmp_path, monkeypatch):
     source = tmp_path / "source.pptx"
     source.write_bytes(b"original bytes")
@@ -104,7 +87,7 @@ def test_unsaved_presentation_blocks_original_apply_before_confirmation(applicat
     controller = _controller(source, monkeypatch, tmp_path, saved=False)
     try:
         controller.overlay.show_report(report)
-        controller.overlay.proposal_items[report.proposals[0].id].setCheckState(Qt.CheckState.Checked)
+        controller.overlay.proposal_items[report.proposals[0].id].setSelected(True)
         controller.apply_selected_to_original()
         assert "저장" in warnings[0] and controller._apply_thread is None
     finally:
@@ -120,7 +103,7 @@ def test_declined_confirmation_changes_nothing(application, tmp_path, monkeypatc
     controller = _controller(source, monkeypatch, tmp_path)
     try:
         controller.overlay.show_report(report)
-        controller.overlay.proposal_items[report.proposals[0].id].setCheckState(Qt.CheckState.Checked)
+        controller.overlay.proposal_items[report.proposals[0].id].setSelected(True)
         controller.apply_selected_to_original()
         assert controller._apply_thread is None and _OriginalPatcher.calls == []
         assert source.read_bytes() == b"original bytes"
@@ -139,7 +122,7 @@ def test_confirmed_original_apply_runs_patcher_and_marks_report_stale(applicatio
     controller = _controller(source, monkeypatch, tmp_path)
     try:
         controller.overlay.show_report(report)
-        controller.overlay.proposal_items[report.proposals[0].id].setCheckState(Qt.CheckState.Checked)
+        controller.overlay.proposal_items[report.proposals[0].id].setSelected(True)
         selected = controller.overlay.selected_proposal_ids()
         controller.apply_selected_to_original()
         thread = controller._apply_thread

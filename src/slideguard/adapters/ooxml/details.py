@@ -210,12 +210,18 @@ def _measurements(shape):
     )
 
 
-def enrich_snapshot(snapshot, path):
-    presentation = Presentation(str(path))
+def enrich_snapshot(snapshot, path, *, slide_numbers=None, presentation=None):
+    if presentation is None:
+        presentation = Presentation(str(path))
     existing = {slide.number: slide for slide in snapshot.slides}
     details = []
     indexed = {}
-    for number, slide in enumerate(presentation.slides, 1):
+    selected = (
+        enumerate(presentation.slides, 1)
+        if slide_numbers is None
+        else ((number, presentation.slides[number - 1]) for number in slide_numbers)
+    )
+    for number, slide in selected:
         index = dict(_shape_index(slide.shapes))
         indexed[number] = index
         title = slide.shapes.title

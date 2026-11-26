@@ -631,7 +631,7 @@ def test_bootstrap_real_watch_keeps_detecting_while_fake_reader_is_blocked(tmp_p
     delivered, detected = queue.Queue(), queue.Queue()
     calls = []
 
-    def read(self, path):
+    def read(self, path, **_options):
         version = catalog.current_revision(path)
         calls.append(version)
         if len(calls) == 1:
@@ -639,7 +639,7 @@ def test_bootstrap_real_watch_keeps_detecting_while_fake_reader_is_blocked(tmp_p
             assert release.wait(10)
         return snapshot(version)
 
-    monkeypatch.setattr(PowerPointDeckReader, "read", read)
+    monkeypatch.setattr(PowerPointDeckReader, "read_incremental", read)
     pipeline = bootstrap.build_snapshot_collection(tmp_path, delivered.put, settle_seconds=0.05)
     original = pipeline.monitor.on_event
 
@@ -686,7 +686,9 @@ def test_com_lifecycle_and_delivery_share_collector_worker(tmp_path, monkeypatch
         def open(self, path, **options):
             record("open")
             return SimpleNamespace(
-                Slides=SimpleNamespace(Count=0),
+                Slides=SimpleNamespace(
+                    Count=1, Item=lambda _n: SimpleNamespace(Shapes=SimpleNamespace(Count=0))
+                ),
                 PageSetup=SimpleNamespace(SlideWidth=960, SlideHeight=540),
                 Close=lambda: record("close"),
             )
@@ -726,7 +728,15 @@ def test_bootstrap_start_failure_cleans_up_and_existing_analyzer_stays_ooxml(tmp
     monkeypatch.setattr(session, "_load_runtime", forbidden)
     report = bootstrap.build_analyzer().execute(path, AnalysisPolicy())
     assert report.status == "analyzed"
-    assert report.executed_rules == ("contrast", "typography", "layout")
+    assert report.executed_rules == (
+        "contrast",
+        "typography",
+        "layout",
+        "readability",
+        "color_vision",
+        "consistency",
+        "image_text",
+    )
     assert all(finding.severity == "unknown" for finding in report.findings)
     assert report.deck.source_sha256 == sha256(path.read_bytes()).hexdigest()
 
