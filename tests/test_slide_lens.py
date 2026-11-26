@@ -276,7 +276,6 @@ def test_toolbar_area_stays_clear_when_lens_is_redrawn(controller, application):
     controller.timer.stop()
     toolbar = controller.overlay
     toolbar.set_collapsed(False)
-    controller.preview_timer.stop()
     application.processEvents()
     protected = toolbar.geometry().intersected(controller.lens.geometry())
     assert not protected.isEmpty()
@@ -305,7 +304,6 @@ def test_moving_and_collapsing_toolbar_updates_badge_hit_areas(controller, appli
     anchor = QRect(handle.anchor)
     toolbar = controller.overlay
     toolbar.set_collapsed(False)
-    controller.preview_timer.stop()
     toolbar._move_panel(QPoint(16, anchor.top() - 10))
     application.processEvents()
     assert toolbar.geometry().contains(handle.geometry())
@@ -319,7 +317,6 @@ def test_moving_and_collapsing_toolbar_updates_badge_hit_areas(controller, appli
     application.processEvents()
     assert handle.occluded
     toolbar.set_collapsed(True)
-    controller.preview_timer.stop()
     application.processEvents()
     assert not handle.occluded and handle.isVisible() and handle.mask().isEmpty()
 
