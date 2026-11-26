@@ -24,10 +24,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSizeF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetricsF, QGuiApplication, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QWidget
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QGuiApplication, QPainter, QPainterPath, QPen, QRegion
+from PySide6.QtWidgets import QApplication, QWidget
 
 from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Finding
+from slideguard.ui.finding_details import describe_finding
+from slideguard.ui.user_text import friendly_reason, readability_label
 
 # ------------------------------------------------------------------ 모양 정의
 
@@ -137,6 +139,7 @@ class LensMark:
     options: tuple[LensOption, ...] = ()  # 펼쳤을 때 보여 줄 수정 후보 체크 항목
     applied: bool = False  # 수정 후보가 문서에 실제로 적용되어 있음 (아니면 선택만 한 상태)
     quiet: bool = False  # 묶음 때문에 따라 움직이기만 하는 객체: 테두리만 그리고 배지는 띄우지 않음
+    unavailable_reason: str = ""  # 자동 수정 후보를 만들지 못한 이유
 
 
 @dataclass(frozen=True)
@@ -161,6 +164,7 @@ def build_marks(
     *,
     applied_ids: tuple[str, ...] | set[str] = (),
     locate=None,
+    skip_reasons: dict[str, str] | None = None,
 ) -> list[LensMark]:
     """slide 번호의 검사 결과를 개체별 표시로 묶는다. locate(report, finding) → Box | None.
 
@@ -168,17 +172,18 @@ def build_marks(
     applied_ids:  렌즈 체크로 문서에 이미 적용한 수정 후보 (실선으로 변경 표시)
     """
     locate = locate or (lambda _report, finding: finding.box)
+    skip_reasons = {**(skip_reasons or {}), **report.proposal_notes}
     findings: dict[str, list[Finding]] = {}
     tables: set[str] = set()  # 칸 판정을 모아 표 하나로 보여 주는 표 주소
     for finding in report.findings:
         if _slide_of(finding.shape_key) == slide:
-            key = _table_key(finding)
-            if key != finding.shape_key:
+            key = f"{slide}:density" if finding.rule_id == "layout.density" else _table_key(finding)
+            if key != finding.shape_key and finding.rule_id != "layout.density":
                 tables.add(key)
             findings.setdefault(key, []).append(finding)
     proposals: dict[str, list[ChangeProposal]] = {}
     for proposal in report.proposals:
-        if _slide_of(proposal.shape_key) == slide:
+        if _slide_of(proposal.shape_key) == slide and proposal.property != "slide.split":
             proposals.setdefault(proposal.shape_key, []).append(proposal)
     selected = {str(item) for item in selected_ids}
     applied = {str(item) for item in applied_ids}
@@ -196,8 +201,25 @@ def build_marks(
         if box is None:
             box = _shape_box(report, key)
         options = _options(report, proposals.get(key, []), applied)
+        reasons = dict.fromkeys(skip_reasons[item.id] for item in items if item.id in skip_reasons)
+        unavailable_reason = (
+            "\n".join(dict.fromkeys(friendly_reason(reason) for reason in reasons)) if not options else ""
+        )
+        if items and items[0].rule_id == "layout.density" and not unavailable_reason:
+            has_split = any(
+                p.property == "slide.split" and _slide_of(p.shape_key) == slide for p in report.proposals
+            )
+            unavailable_reason = (
+                "검증된 슬라이드 분할안이 있습니다. 상단 패널에서 미리보기를 확인하고 새 사본에 적용하세요."
+                if has_split
+                else "슬라이드 분할은 상단 패널에서 정보 밀도 항목을 선택한 뒤 ‘수정안 만들기’를 눌러 확인하세요."
+            )
         active = [item for item in proposals.get(key, []) if item.id in applied or item.id in selected]
-        message = items[0].message if items else ""
+        explanation = describe_finding(items[0]) if items else None
+        message = f"{explanation.summary}\n{explanation.guidance}" if explanation else ""
+        if explanation and items[0].rule_id == "layout.density":
+            value, target = metric_text(items[0])
+            message = f"{value} · {target}\n{message}"
         if active:
             # 위치 이동은 뒤로 (배지에는 글자 크기·상자 높이처럼 주된 변경을 보여 줌)
             active.sort(key=lambda item: item.property == "shape.position")
@@ -239,6 +261,7 @@ def build_marks(
                 more=len(items) - 1,
                 message=message,
                 options=options,
+                unavailable_reason=unavailable_reason,
             )
         )
     return marks
@@ -316,6 +339,8 @@ def _group_spans_other_shapes(report: AnalysisReport, proposal: ChangeProposal) 
 
 
 def rule_title(finding: Finding) -> str:
+    if finding.rule_id.startswith("readability."):
+        return readability_label(finding.rule_id)
     if finding.rule_id.startswith("typography.hierarchy") or finding.id.endswith(":hierarchy"):
         return "제목 크기"
     return RULE_TITLES.get(
@@ -346,7 +371,7 @@ def metric_text(finding: Finding) -> tuple[str, str]:
     if rule == "layout.density" and number:
         unit = "자" if finding.id.endswith(":chars") else "줄"
         # 슬라이드 전체 값임을 밝힌다 (이 상자 하나가 14줄인 것으로 오해하지 않게)
-        return f"슬라이드 {measured:g}{unit}", f"최대 {expected:g}{unit}" if limit else ""
+        return f"슬라이드 전체 {measured:g}{unit}", f"권장 {expected:g}{unit} 이하" if limit else ""
     if number and limit:
         return f"{measured:g}", f"기준 {expected:g}"
     return "확인 필요", ""
@@ -444,6 +469,8 @@ def paint_lens(
     bounds: QRectF,
     *,
     badges: bool = True,
+    focused_key: str | None = None,
+    focused_badge: QRectF | None = None,
 ):
     """slide_rect 위치에 보이는 슬라이드 위로 표시를 그린다. badges=False면 테두리·요약만."""
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -451,7 +478,14 @@ def paint_lens(
     shown = [mark for mark in marks if mark.box is not None]
     frames = [map_box(mark.box, slide_rect, slide_size_pt) for mark in shown]
     for mark, frame in zip(shown, frames, strict=True):
+        painter.save()
+        if focused_key is not None:
+            painter.setOpacity(0.15)
         _paint_frame(painter, frame, mark)
+        painter.restore()
+    focused = next(((m, f) for m, f in zip(shown, frames, strict=True) if m.key == focused_key), None)
+    if focused is not None:
+        _paint_focus(painter, focused[1], focused_badge)
     if badges:
         loud = [(mark, frame) for mark, frame in zip(shown, frames, strict=True) if not mark.quiet]
         sizes = [badge_size(mark, font) for mark, _frame in loud]
@@ -459,6 +493,40 @@ def paint_lens(
         for (mark, _frame), rect in zip(loud, placed, strict=True):
             _paint_badge(painter, rect, mark, font)
     _paint_summary(painter, slide_rect, marks, font, bounds)
+
+
+def _edge_point(rect: QRectF, point: QPointF) -> QPointF:
+    x = max(rect.left(), min(point.x(), rect.right()))
+    y = max(rect.top(), min(point.y(), rect.bottom()))
+    if rect.contains(point):
+        _, x, y = min(
+            (abs(point.x() - rect.left()), rect.left(), y),
+            (abs(point.x() - rect.right()), rect.right(), y),
+            (abs(point.y() - rect.top()), x, rect.top()),
+            (abs(point.y() - rect.bottom()), x, rect.bottom()),
+        )
+    return QPointF(x, y)
+
+
+def _paint_focus(painter: QPainter, frame: QRectF, badge: QRectF | None):
+    """Paint the hovered target last, with a leader to its movable label."""
+    painter.save()
+    color = QColor("#53B1FD")
+    path = QPainterPath()
+    path.addRoundedRect(frame.adjusted(-4, -4, 4, 4), 6, 6)
+    painter.fillPath(path, QColor(83, 177, 253, 48))
+    painter.setPen(QPen(QColor(255, 255, 255, 230), 6))
+    painter.drawPath(path)
+    painter.setPen(QPen(color, 3))
+    painter.drawPath(path)
+    if badge is not None and not badge.intersects(frame):
+        target = _edge_point(frame, badge.center())
+        start = _edge_point(badge, target)
+        painter.setPen(QPen(color, 2))
+        painter.drawLine(start, target)
+        painter.setBrush(color)
+        painter.drawEllipse(target, 4, 4)
+    painter.restore()
 
 
 def badge_rects(
@@ -565,6 +633,9 @@ def _paint_summary(painter: QPainter, slide_rect: QRectF, marks: list[LensMark],
     ]
     if not parts:
         parts = [(None, "이 슬라이드 문제 없음")]
+    elif marks:
+        actionable = sum(bool(mark.options) and not mark.quiet for mark in marks)
+        parts.append((None, f"수정 가능 {actionable}개"))
     bold = QFont(font)
     bold.setBold(True)
     metrics, bold_metrics = QFontMetricsF(font), QFontMetricsF(bold)
@@ -597,6 +668,13 @@ def _paint_summary(painter: QPainter, slide_rect: QRectF, marks: list[LensMark],
 # ------------------------------------------------------------------ 화면 창
 
 
+def _uncovered_region(geometry: QRect, exclusions: tuple[QRect, ...]) -> QRegion:
+    region = QRegion(QRect(0, 0, geometry.width(), geometry.height()))
+    for excluded in exclusions:
+        region -= QRegion(excluded.translated(-geometry.topLeft()))
+    return region
+
+
 class SlideLens(QWidget):
     """테두리·요약을 그리는 투명 창 (클릭은 PowerPoint로 통과).
 
@@ -623,6 +701,10 @@ class SlideLens(QWidget):
         self._handles: dict[str, BadgeHandle] = {}
         self._busy = False
         self._notes: dict[str, str] = {}
+        self._excluded_rects: tuple[QRect, ...] = ()
+        self._scene_key = None
+        self._badge_positions: dict[tuple[object, str], QPointF] = {}
+        self._focused_key: str | None = None
 
     @property
     def marks(self) -> list[LensMark]:
@@ -638,14 +720,28 @@ class SlideLens(QWidget):
         ids.update(int(handle.winId()) for handle in self._handles.values() if handle.isVisible())
         return ids
 
-    def set_scene(self, geometry: QRect, slide_rect: QRect, slide_size_pt, marks: list[LensMark]):
+    def set_excluded_rects(self, rectangles):
+        """Keep toolbar pixels clear, including independently raised badge windows."""
+        rectangles = tuple(QRect(rect) for rect in rectangles if not rect.isEmpty())
+        if rectangles == self._excluded_rects:
+            return
+        self._excluded_rects = rectangles
+        for handle in self._handles.values():
+            handle.set_excluded_rects(rectangles)
+        self.update()
+
+    def set_scene(
+        self, geometry: QRect, slide_rect: QRect, slide_size_pt, marks: list[LensMark], *, scene_key=None
+    ):
         """geometry: 창 위치(PowerPoint 안쪽 영역), slide_rect: 그 안에서 슬라이드가 보이는 위치(화면 좌표)."""
         local = QRectF(slide_rect.translated(-geometry.topLeft()))
+        scene_key = scene_key if scene_key is not None else tuple(sorted({_slide_of(m.key) for m in marks}))
         if (
             self.geometry() == geometry
             and local == self._slide_rect
             and slide_size_pt == self._slide_size
             and list(marks) == self._marks
+            and scene_key == self._scene_key
         ):
             return  # 바뀐 게 없으면 다시 그리지 않는다
         if self.geometry() != geometry:
@@ -653,7 +749,35 @@ class SlideLens(QWidget):
         self._slide_rect = local
         self._slide_size = slide_size_pt
         self._marks = list(marks)
+        if scene_key != self._scene_key:
+            self._set_focused(self._focused_key, False)
+        self._scene_key = scene_key
         self._place_handles(geometry)
+        self.update()
+
+    def _set_focused(self, key, focused):
+        if focused:
+            self._focused_key = key
+        elif key == self._focused_key:
+            self._focused_key = None
+        else:
+            return
+        for mark_key, handle in self._handles.items():
+            handle.set_dimmed(self._focused_key is not None and mark_key != self._focused_key)
+        self.update()
+
+    def _move_badge(self, key, point):
+        handle = self._handles.get(key)
+        if handle is None or not self._slide_rect.width() or not self._slide_rect.height():
+            return
+        bounds = QRectF(self.geometry())
+        rect = _clamp(QRectF(point, QSizeF(handle.anchor.size())), bounds)
+        local = rect.topLeft() - QPointF(self.geometry().topLeft()) - self._slide_rect.topLeft()
+        self._badge_positions[self._scene_key, key] = QPointF(
+            local.x() * self._slide_size[0] / self._slide_rect.width(),
+            local.y() * self._slide_size[1] / self._slide_rect.height(),
+        )
+        handle.set_mark(handle.mark, rect.toAlignedRect())
         self.update()
 
     def set_busy(self, busy: bool):
@@ -688,14 +812,29 @@ class SlideLens(QWidget):
             handle = self._handles.get(mark.key)
             if handle is None:
                 handle = BadgeHandle(self)
+                handle.set_excluded_rects(self._excluded_rects)
                 handle.toggled.connect(self.option_toggled)
+                handle.focused.connect(self._set_focused)
+                handle.dragged.connect(self._move_badge)
                 self._handles[mark.key] = handle
+            saved = self._badge_positions.get((self._scene_key, mark.key))
+            if saved is not None:
+                rect.moveTopLeft(
+                    self._slide_rect.topLeft()
+                    + QPointF(
+                        saved.x() * self._slide_rect.width() / self._slide_size[0],
+                        saved.y() * self._slide_rect.height() / self._slide_size[1],
+                    )
+                )
+                rect = _clamp(rect, QRectF(0, 0, geometry.width(), geometry.height()))
             handle.set_mark(mark, rect.toAlignedRect().translated(geometry.topLeft()))
+            handle.set_dimmed(self._focused_key is not None and mark.key != self._focused_key)
             handle.set_busy(self._busy)
             handle.set_note(self._notes.get(mark.key, ""))
-            if self.isVisible() and not handle.isVisible():
+            if self.isVisible() and not handle.isVisible() and not handle.occluded:
                 handle.show()
         for key in set(self._handles) - keep:
+            self._set_focused(key, False)
             handle = self._handles.pop(key)
             handle.hide()
             handle.deleteLater()
@@ -703,10 +842,12 @@ class SlideLens(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         for handle in self._handles.values():
-            handle.show()
+            if not handle.occluded:
+                handle.show()
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        self._set_focused(self._focused_key, False)
         for handle in self._handles.values():
             handle.hide()
 
@@ -717,9 +858,22 @@ class SlideLens(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
+        painter.setClipRegion(_uncovered_region(self.geometry(), self._excluded_rects))
         bounds = QRectF(self.rect()).intersected(self._slide_rect.adjusted(-4, -30, 4, 4))
+        handle = self._handles.get(self._focused_key)
+        focused_badge = None
+        if handle is not None:
+            focused_badge = QRectF(handle.anchor)
+            focused_badge.moveTopLeft(QPointF(handle.geometry().topLeft() - self.geometry().topLeft()))
         paint_lens(
-            painter, self._slide_rect, self._slide_size, self._marks, bounds, badges=not self.interactive
+            painter,
+            self._slide_rect,
+            self._slide_size,
+            self._marks,
+            bounds,
+            badges=not self.interactive,
+            focused_key=self._focused_key,
+            focused_badge=focused_badge,
         )
 
 
@@ -736,6 +890,8 @@ class BadgeHandle(QWidget):
     """
 
     toggled = Signal(object, bool)  # (제안 ID 묶음, 켜기 여부)
+    focused = Signal(str, bool)
+    dragged = Signal(str, object)
 
     def __init__(self, owner: QWidget | None = None):
         super().__init__(
@@ -751,6 +907,14 @@ class BadgeHandle(QWidget):
         self.busy = False
         self.note = ""
         self._hover_row = -1
+        self._excluded_rects: tuple[QRect, ...] = ()
+        self.occluded = False
+        self._dimmed = False
+        self._press_position: QPointF | None = None
+        self._press_offset = QPointF()
+        self._dragging = False
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setAccessibleName("문제 라벨 · 마우스를 올려 설명 확인 · 위쪽을 끌어서 이동")
         self._collapse_timer = QTimer(self)
         self._collapse_timer.setSingleShot(True)
         self._collapse_timer.setInterval(350)
@@ -764,10 +928,37 @@ class BadgeHandle(QWidget):
             self._apply_geometry()
             self.update()
 
+    def set_excluded_rects(self, rectangles):
+        self._excluded_rects = tuple(QRect(rect) for rect in rectangles)
+        self._apply_exclusions()
+
+    def _apply_exclusions(self):
+        # A native mask excludes mouse hit testing too. An empty Qt mask means
+        # "no mask", so fully covered badges must be hidden instead.
+        region = _uncovered_region(self.geometry(), self._excluded_rects)
+        self.occluded = region.isEmpty()
+        if self.occluded:
+            self.hide()
+            return
+        if region == QRegion(self.rect()):
+            if not self.mask().isEmpty():
+                self.clearMask()
+        elif self.mask() != region:
+            self.setMask(region)
+        owner = self.parentWidget()
+        if owner is not None and owner.isVisible() and not self.isVisible():
+            self.show()
+        self.update()
+
     def set_busy(self, busy: bool):
         if busy != self.busy:
             self.busy = busy
             self._apply_geometry()
+            self.update()
+
+    def set_dimmed(self, dimmed: bool):
+        if self._dimmed != dimmed:
+            self._dimmed = dimmed
             self.update()
 
     def set_note(self, text: str):
@@ -801,7 +992,7 @@ class BadgeHandle(QWidget):
         y = BADGE_HEIGHT + 8.0
         message = None
         if self.mark is not None and self.mark.message:
-            lines = min(3, max(1, _wrapped_lines(self.mark.message, font, inner)))
+            lines = max(1, _wrapped_lines(self.mark.message, font, inner))
             message = QRectF(12, y, inner, lines * QFontMetricsF(font).lineSpacing())
             y = message.bottom() + 8
         rows = []
@@ -810,21 +1001,36 @@ class BadgeHandle(QWidget):
             rows.append(QRectF(6, y, width - 12, ROW_HEIGHT))
             y += ROW_HEIGHT
         empty = None
+        empty_text = ""
         if not options:
-            empty = QRectF(12, y, inner, ROW_HEIGHT)
-            y += ROW_HEIGHT
+            empty_text = (
+                self.mark.unavailable_reason if self.mark is not None else ""
+            ) or "현재 설정에서 자동 수정 후보를 만들지 못했습니다."
+            lines = max(1, _wrapped_lines(empty_text, small, inner))
+            empty = QRectF(12, y, inner, lines * QFontMetricsF(small).lineSpacing())
+            y = empty.bottom() + 4
         note = None
         if self.busy or self.note:
             note = QRectF(12, y + 2, inner, QFontMetricsF(small).lineSpacing() * 2)
             y = note.bottom()
-        hint = QRectF(12, y + 6, inner, QFontMetricsF(small).lineSpacing())
+        hint = None
+        hint_text = "라벨 위쪽을 끌어서 이동할 수 있습니다."
+        if options:
+            hint_text += (
+                "\n체크하면 바로 적용 · 해제하면 원래대로\n변경을 유지하려면 PowerPoint에서 저장하세요."
+            )
+        lines = _wrapped_lines(hint_text, small, inner)
+        hint = QRectF(12, y + 6, inner, QFontMetricsF(small).lineSpacing() * lines)
+        y = hint.bottom()
         return {
-            "size": QSizeF(width, hint.bottom() + 10),
+            "size": QSizeF(width, y + 10),
             "message": message,
             "rows": rows,
             "empty": empty,
+            "empty_text": empty_text,
             "note": note,
             "hint": hint,
+            "hint_text": hint_text,
             "font": font,
             "small": small,
         }
@@ -834,6 +1040,7 @@ class BadgeHandle(QWidget):
             return
         if not self.expanded:
             self.setGeometry(self.anchor)
+            self._apply_exclusions()
             return
         size = self._layout()["size"].toSize()
         rect = QRect(self.anchor.topLeft(), size)
@@ -849,29 +1056,61 @@ class BadgeHandle(QWidget):
             if rect.left() < area.left():
                 rect.moveLeft(area.left())
         self.setGeometry(rect)
+        self._apply_exclusions()
         # 펼친 카드는 다른 배지 창보다 앞으로 (옆 배지가 체크 항목을 덮어 누를 수 없던 문제)
         self.raise_()
 
     # ------------------------------------------------------------ 마우스
     def enterEvent(self, event):
+        if self.mark is not None:
+            self.focused.emit(self.mark.key, True)
         self.expand()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
+        if self.mark is not None and not self._dragging:
+            self.focused.emit(self.mark.key, False)
         self._hover_row = -1
         self._collapse_timer.start()
         self.update()
         super().leaveEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._press_position is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            position = event.globalPosition()
+            if (
+                not self._dragging
+                and (position - self._press_position).manhattanLength() < QApplication.startDragDistance()
+            ):
+                return
+            self._dragging = True
+            self._collapse_timer.stop()
+            self.expanded = False
+            self._hover_row = -1
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            if self.mark is not None:
+                self.focused.emit(self.mark.key, True)
+                self.dragged.emit(self.mark.key, position - self._press_offset)
+            return
         row = self._row_at(event.position()) if self.expanded else -1
-        if row != self._hover_row:
-            self._hover_row = row
-            self.setCursor(Qt.CursorShape.PointingHandCursor if row >= 0 else Qt.CursorShape.ArrowCursor)
-            self.update()
+        self._hover_row = row
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor
+            if row >= 0
+            else Qt.CursorShape.OpenHandCursor
+            if event.position().y() < BADGE_HEIGHT
+            else Qt.CursorShape.ArrowCursor
+        )
+        self.update()
 
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if event.position().y() < BADGE_HEIGHT:
+            self._press_position = event.globalPosition()
+            self._press_offset = event.globalPosition() - QPointF(self.geometry().topLeft())
+            self._dragging = False
+            event.accept()
             return
         if not self.expanded:
             self.expand()
@@ -881,6 +1120,16 @@ class BadgeHandle(QWidget):
             return
         option = self.mark.options[row]
         self.toggled.emit(option.proposal_ids, not option.checked)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._press_position is not None:
+            self._press_position = None
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.expand()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def _row_at(self, point: QPointF) -> int:
         if not self.expanded:
@@ -895,6 +1144,8 @@ class BadgeHandle(QWidget):
         if self.mark is None:
             return
         painter = QPainter(self)
+        if self._dimmed:
+            painter.setOpacity(0.45)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         font = badge_font()
         badge = QRectF(0, 0, self.anchor.width(), self.anchor.height())
@@ -943,7 +1194,11 @@ class BadgeHandle(QWidget):
         painter.setFont(small)
         if layout["empty"] is not None:
             painter.setPen(TEXT_SUB)
-            painter.drawText(layout["empty"], Qt.AlignmentFlag.AlignVCenter, "자동 수정 후보가 없습니다.")
+            painter.drawText(
+                layout["empty"],
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
+                layout["empty_text"],
+            )
         if layout["note"] is not None:
             painter.setPen(TEXT_SUB if self.busy else DIFF_BEFORE)
             painter.drawText(
@@ -951,12 +1206,13 @@ class BadgeHandle(QWidget):
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
                 "PowerPoint에 적용하는 중…" if self.busy else self.note,
             )
-        painter.setPen(QColor("#8A90A0"))
-        painter.drawText(
-            layout["hint"],
-            Qt.AlignmentFlag.AlignVCenter,
-            "체크하면 바로 적용 · 해제하면 원래대로 · 유지하려면 저장",
-        )
+        if layout["hint"] is not None:
+            painter.setPen(QColor("#8A90A0"))
+            painter.drawText(
+                layout["hint"],
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
+                layout["hint_text"],
+            )
 
 
 def _paint_check(painter: QPainter, box: QRectF, checked: bool, *, dimmed: bool = False):
@@ -1224,7 +1480,10 @@ def _is_color(value: str) -> bool:
 
 
 def _label(mark: LensMark) -> str:
-    return f"{mark.title} · {mark.target}" if mark.target else mark.title
+    label = f"{mark.title} · {mark.target}" if mark.target else mark.title
+    if mark.options:
+        label += f" · 수정안 {len(mark.options)}개"
+    return label
 
 
 def _clamp(rect: QRectF, bounds: QRectF) -> QRectF:

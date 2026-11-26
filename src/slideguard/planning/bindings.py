@@ -687,6 +687,8 @@ class TeamBindings:
             before=proposal.before,
             after=proposal.after,
             cost=proposal.cost,
+            payload=proposal.payload,
+            explanation=proposal.note,
         )
 
     def from_team_proposal(self, proposal: object) -> ChangeProposal:
@@ -709,6 +711,8 @@ class TeamBindings:
             rule="",
             group=group,
             finding_id=str(proposal.finding_id),
+            payload=getattr(proposal, "payload", None),
+            note=getattr(proposal, "explanation", ""),
         )
 
 

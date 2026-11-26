@@ -90,13 +90,12 @@ class SqliteReportRepository:
             if report.policy_key is not None and report.status == "analyzed":
                 prior = self._latest(connection, Path(deck.source_path), report.policy_key)
                 if prior is not None and prior.report.deck.source_sha256 == deck.source_sha256:
-                    if report.comparison is not None and prior.report.comparison is None:
-                        connection.execute(
-                            "UPDATE analysis_reports SET report_json = ? WHERE id = ?",
-                            (json.dumps(asdict(report), ensure_ascii=False), prior.id),
-                        )
-                    elif report.comparison is None:
+                    if report.comparison is None:
                         report.comparison = prior.report.comparison
+                    connection.execute(
+                        "UPDATE analysis_reports SET report_json = ? WHERE id = ?",
+                        (json.dumps(asdict(report), ensure_ascii=False), prior.id),
+                    )
                     return
                 if prior is not None and report.comparison is None:
                     report.compare_with(prior.report)
@@ -149,6 +148,18 @@ class SqliteReportRepository:
                 (str(path), policy_key),
             ).fetchone()
         return row[0] if row else None
+
+    def latest_snapshot(self, path: Path) -> DeckSnapshot | None:
+        """Reuse measurements independently of policy; never create or migrate on this read."""
+        if not self.database_path.exists():
+            return None
+        with sqlite3.connect(self.database_path.as_uri() + "?mode=ro", uri=True) as connection:
+            row = connection.execute(
+                "SELECT report_json FROM analysis_reports WHERE source_path = ? AND status = 'analyzed' "
+                "ORDER BY id DESC LIMIT 1",
+                (str(path),),
+            ).fetchone()
+        return _report_from_json(row[0]).deck if row else None
 
     def list_recent(self, limit: int = 100) -> list[StoredReport]:
         if limit < 1:
@@ -355,6 +366,7 @@ def _text_span(data: dict) -> TextSpan:
         index=data["index"],
         text=data["text"],
         box=_box(data.get("box")),
+        properties=_properties(data.get("properties")),
     )
 
 
@@ -390,6 +402,9 @@ def _report_from_json(payload: str) -> AnalysisReport:
                         transparency=run.get("transparency"),
                         fill_kind=run.get("fill_kind"),
                         fill_visible=run.get("fill_visible"),
+                        font_family=run.get("font_family"),
+                        italic=run.get("italic"),
+                        underline=run.get("underline"),
                     )
                     for run in shape_data.get("runs", [])
                 ),
@@ -427,6 +442,8 @@ def _report_from_json(payload: str) -> AnalysisReport:
         shapes=tuple(shapes),
         limitations=tuple(deck_data.get("limitations", [])),
         slides=tuple(_slide_details(item) for item in deck_data.get("slides", [])),
+        slide_fingerprints=tuple(tuple(item) for item in deck_data.get("slide_fingerprints", [])),
+        measurement_key=deck_data.get("measurement_key", ""),
     )
     findings = [
         Finding(
@@ -451,6 +468,8 @@ def _report_from_json(payload: str) -> AnalysisReport:
             before=tuple(item["before"]) if isinstance(item["before"], list) else item["before"],
             after=tuple(item["after"]) if isinstance(item["after"], list) else item["after"],
             cost=item["cost"],
+            payload=item.get("payload"),
+            explanation=item.get("explanation", ""),
         )
         for item in data.get("proposals", [])
     ]
@@ -463,4 +482,5 @@ def _report_from_json(payload: str) -> AnalysisReport:
         schema_version=data.get("schema_version", "0.1"),
         policy_key=data.get("policy_key"),
         comparison=FindingComparison(**data["comparison"]) if data.get("comparison") else None,
+        proposal_notes=dict(data.get("proposal_notes", {})),
     )

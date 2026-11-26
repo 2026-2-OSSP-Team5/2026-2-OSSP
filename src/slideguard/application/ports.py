@@ -45,6 +45,19 @@ class CollectionFailure:
 type CollectionFailureCallback = Callable[[CollectionFailure], None]
 
 
+@dataclass(frozen=True)
+class AnalysisProgress:
+    source_path: Path
+    stage: str
+    completed: int = 0
+    total: int = 0
+    reused: int = 0
+
+
+class ReadInterrupted(BaseException):
+    """Cooperatively yield a private COM session, without reporting a failure."""
+
+
 class SavedFileSource(Protocol):
     def list_paths(self) -> tuple[Path, ...]: ...
 

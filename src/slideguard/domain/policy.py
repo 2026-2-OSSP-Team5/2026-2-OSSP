@@ -267,7 +267,7 @@ class AnalysisPolicy:
     def cache_key(self) -> str:
         return json.dumps(
             {
-                "revision": 3,
+                "revision": 4,
                 "purpose": self.purpose,
                 "strength": self.strength,
                 "slides": sorted(set(self.slides)),
