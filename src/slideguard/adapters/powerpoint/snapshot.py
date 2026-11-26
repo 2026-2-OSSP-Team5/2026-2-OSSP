@@ -206,7 +206,7 @@ def _walk(collection, number, slide, path=(), *, ancestor_verified=True, ancesto
             yield from smartart_nodes(item, parent, layout_verified=verified)
 
 
-def extract_snapshot(presentation: Any, saved: SavedPresentationCopy) -> DeckSnapshot:
+def extract_snapshot(presentation: Any, saved: SavedPresentationCopy, *, slide_numbers=None) -> DeckSnapshot:
     setup = presentation.PageSetup
     width = _point(setup.SlideWidth, "PageSetup.SlideWidth", minimum=0)
     height = _point(setup.SlideHeight, "PageSetup.SlideHeight", minimum=0)
@@ -216,7 +216,7 @@ def extract_snapshot(presentation: Any, saved: SavedPresentationCopy) -> DeckSna
     slide_count = _integer(slides.Count, "Slides.Count")
     shapes = []
     details = []
-    for number in range(1, slide_count + 1):
+    for number in range(1, slide_count + 1) if slide_numbers is None else slide_numbers:
         slide = slides.Item(number)
         hidden = tristate(
             optional(lambda slide=slide: slide.SlideShowTransition.Hidden, "Hidden slide", []), "Hidden", []

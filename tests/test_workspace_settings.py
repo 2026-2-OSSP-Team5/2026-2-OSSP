@@ -254,6 +254,7 @@ class ControlledWorker:
         self.succeeded = FakeSignal()
         self.failed = FakeSignal()
         self.storage_failed = FakeSignal()
+        self.progress = FakeSignal()
         self.finished = FakeSignal()
         self.started = False
 
@@ -352,9 +353,10 @@ def test_file_analysis_details_history_and_back_flow(tmp_path, monkeypatch, appl
         assert window.result_table.rowCount() == 1
         window.result_table.selectRow(0)
         application.processEvents()
-        assert "16.0" in window.detail_values.text()
-        assert "18.0" in window.detail_values.text()
-        assert "권장 크기" in window.detail_reason.text()
+        assert "16pt" in window.detail_values.text()
+        assert "18pt" in window.detail_values.text()
+        assert "권장 크기" in window.detail_values.text()
+        assert "글자를 키우고" in window.detail_reason.text()
         assert window.result_table.selectedRanges()[0].columnCount() == 4
         assert window.result_table.cellWidget(0, 2) is not None
 
@@ -418,7 +420,7 @@ def test_completed_file_restores_its_saved_proposals_after_returning_from_histor
         window.file_table.setCurrentCell(0, 0)
         assert window.inspection_stack.currentWidget() is window.results_page
         assert window.report_tabs.tabText(1) == "수정안 (1건)"
-        assert window.proposal_table.item(0, 2).text() == "글자 크기 · 10 → 14"
+        assert window.proposal_table.item(0, 2).text() == "글자 크기 · 10pt → 14pt"
 
         window.show_history_list()
         window.history_table.setCurrentCell(0, 0)
@@ -580,14 +582,19 @@ def test_unknown_empty_not_configured_and_failure_states_are_distinct(tmp_path, 
             )
         )
         assert window.result_table.item(0, 2).text() == "판정 불가"
-        assert "확인할 수 없음" in window.detail_values.text()
+        assert not window.detail_values.text()
+        assert "확인하지 못해" in window.detail_reason.text()
 
         window.show_report(AnalysisReport(deck=deck, status="not_configured"))
         assert "검사 규칙이 설정되지 않아" in window.result_label.text()
 
         window.show_analysis_error("reader failed")
         assert window.inspection_stack.currentWidget() is window.error_page
-        assert "reader failed" in window.error_page.description_label.text()
+        assert "다시 시도" in window.error_page.description_label.text()
+        assert "reader failed" not in window.error_page.description_label.text()
+        window.error_page.description_label.linkActivated.emit("error-details")
+        assert "reader failed" in window._measurement_dialog.evidence.toPlainText()
+        window._measurement_dialog.close()
         assert warnings
     finally:
         window.close()

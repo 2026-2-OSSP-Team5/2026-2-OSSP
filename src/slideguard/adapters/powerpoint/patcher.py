@@ -157,6 +157,12 @@ class PowerPointPatcher:
 
         하나도 적용하지 못하면 ApplyRejected. 거절 이유·경고는 self.last_result에 남습니다.
         """
+        proposal_ids = tuple(proposal_ids)
+        selected = [p for p in report.proposals if p.id in proposal_ids]
+        if any(p.property == Property.SLIDE_SPLIT for p in selected):
+            from .restructure import apply_structural_copy
+
+            return apply_structural_copy(self, report, proposal_ids, output, policy)
         proposals = self._selected_proposals(report, proposal_ids)
         deck = report.deck
         result = self.apply(deck.source_path, deck.source_sha256, proposals, policy, str(output))
@@ -176,6 +182,9 @@ class PowerPointPatcher:
         원본을 바꾸기 전에 backup_dir에 백업을 만듭니다. 하나도 적용하지 못하면
         원본은 그대로이고 백업도 지운 뒤 ApplyRejected. 상세 결과는 self.last_result.
         """
+        proposal_ids = tuple(proposal_ids)
+        if any(p.id in proposal_ids and p.property == Property.SLIDE_SPLIT for p in report.proposals):
+            raise ApplyRejected("본문 분할은 렌더링 검증을 거친 새 PPTX 사본에만 적용할 수 있습니다.")
         proposals = self._selected_proposals(report, proposal_ids)
         deck = report.deck
         result = self.apply_in_place(deck.source_path, deck.source_sha256, proposals, policy, str(backup_dir))

@@ -31,6 +31,7 @@ class Property:
     SHAPE_FILL = "shape.fill"  # 상자 배경 채우기 (사진 위 글씨용 배경판)
     AUTOFIT = "text.autofit"  # 자동 맞춤
     LINE_SPACING = "paragraph.line_spacing"  # 줄 간격
+    SLIDE_SPLIT = "slide.split"
 
 
 class Rule:
@@ -142,6 +143,7 @@ class ChangeProposal:
     group: str | None = None  # 함께 적용해야 하는 변경 묶음 이름 (예: 상자 키우기 + 아래 그림 내리기)
     finding_id: str = ""  # 이 후보를 만든 팀 Finding.id
     variant: str = "minimum"  # "minimum" 최소 수정 / "recommended" 권장 수정 (FixTargets 목표)
+    payload: dict | None = None
 
 
 @dataclass(frozen=True)

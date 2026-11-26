@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from html import escape
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from time import monotonic
@@ -45,6 +46,9 @@ from slideguard.bootstrap import (
     build_workspace_settings_repository,
     report_database_path,
 )
+from slideguard.ui.analysis_tasks import SplitProposalWorker, progress_text
+from slideguard.ui.finding_details import FindingDetailsDialog, TechnicalDetailsDialog, describe_finding
+from slideguard.ui.user_text import friendly_error, readability_label
 
 LOGGER = logging.getLogger("slideguard.desktop")
 
@@ -240,6 +244,7 @@ class AnalysisWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
     storage_failed = Signal(str)
+    progress = Signal(object)
 
     def __init__(self, path: Path, parent=None):
         super().__init__(parent)
@@ -249,7 +254,9 @@ class AnalysisWorker(QThread):
         started = monotonic()
         try:
             analyzer = build_analyzer(build_powerpoint_reader(render=True))
-            report = analyzer.execute(self.path, build_analysis_policy(self.path))
+            report = analyzer.execute(
+                self.path, build_analysis_policy(self.path), incremental=True, on_progress=self.progress.emit
+            )
         except Exception as error:
             LOGGER.exception("ANALYSIS_FAILED | file=%s", self.path.name)
             self.failed.emit(f"{type(error).__name__}: {error}")
@@ -278,6 +285,7 @@ class MainWindow(QMainWindow):
         self.workspace: Path | None = None
         self.selected_file: Path | None = None
         self.worker: AnalysisWorker | None = None
+        self._split_worker = None
         self.current_report = None
         self.viewing_history = False
         self.controller = None
@@ -479,6 +487,11 @@ class MainWindow(QMainWindow):
         self.error_page = self._build_state_page(
             "검사에 실패했습니다", "오류 내용을 확인한 뒤 다시 시도하세요."
         )
+        self.error_page.description_label.setTextFormat(Qt.TextFormat.RichText)
+        self.error_page.description_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.error_page.description_label.linkActivated.connect(self.show_error_details)
         self.history_empty_page = self._build_state_page(
             "검사 이력을 선택하세요",
             "왼쪽 이력 목록에서 항목을 선택하면 검사 당시 저장된 결과와 판정 근거를 표시합니다.",
@@ -526,7 +539,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setMaximumWidth(520)
         layout.addWidget(self.progress_bar, alignment=Qt.AlignmentFlag.AlignCenter)
-        note = QLabel("검사가 끝나면 결과가 자동으로 표시됩니다.", objectName="muted")
+        note = self.progress_stage_label = QLabel(
+            "검사가 끝나면 결과가 자동으로 표시됩니다.", objectName="muted"
+        )
         note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(note)
         layout.addStretch(3)
@@ -576,14 +591,20 @@ class MainWindow(QMainWindow):
         )
         self.detail_title.setWordWrap(True)
         detail_layout.addWidget(self.detail_title)
-        self.detail_values = QLabel(objectName="detailCaption")
+        self.detail_values = QLabel()
         self.detail_values.setWordWrap(True)
         self.detail_values.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         detail_layout.addWidget(self.detail_values)
         self.detail_reason = QLabel()
         self.detail_reason.setWordWrap(True)
-        self.detail_reason.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.detail_reason.setTextFormat(Qt.TextFormat.RichText)
+        self.detail_reason.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.detail_reason.linkActivated.connect(self.show_measurement_details)
         detail_layout.addWidget(self.detail_reason)
+        self.view_fixes_button = QPushButton("이 위치의 수정안 보기")
+        self.view_fixes_button.setEnabled(False)
+        self.view_fixes_button.clicked.connect(self.request_fixes)
+        detail_layout.addWidget(self.view_fixes_button)
         findings_layout.addWidget(detail, 2)
         self.report_tabs.addTab(self._build_proposals_page(), "수정안 (0)")
         return page
@@ -640,7 +661,7 @@ class MainWindow(QMainWindow):
             self.proposal_summary.setText("발견된 가독성 문제가 없습니다.")
 
         shape_names = {shape.key: shape.name for shape in report.deck.shapes}
-        evidence = {finding.id: finding.message for finding in report.findings}
+        evidence = {finding.id: describe_finding(finding).summary for finding in report.findings}
         for row, proposal in enumerate(proposals):
             values = (
                 _slide_number(proposal.shape_key),
@@ -864,6 +885,7 @@ class MainWindow(QMainWindow):
         self.settings_button.clicked.connect(lambda: controller.show_settings(parent=self))
         controller.settings_dialog.settings_saved.connect(self._reload_workspace)
         controller.file_activity.connect(self._on_file_activity)
+        controller.progress.connect(self.show_analysis_progress)
         controller.completed.connect(self._on_collection_report)
         controller.workspace_requested.connect(self._raise_window)
         self.closing.connect(controller.request_exit)
@@ -1041,6 +1063,8 @@ class MainWindow(QMainWindow):
         self.selected_file = path
         LOGGER.info("DESKTOP_ANALYSIS_REQUESTED | file=%s", path.name)
         self.progress_file_label.setText(f"검사 중 · {path.name}")
+        self.progress_bar.setRange(0, 0)
+        self.progress_stage_label.setText("우선 검사 대기 중")
         self.inspection_stack.setCurrentWidget(self.progress_page)
         self.statusBar().showMessage("검사 중")
         if self.controller is not None:
@@ -1057,6 +1081,7 @@ class MainWindow(QMainWindow):
         self.worker.succeeded.connect(self.show_report)
         self.worker.failed.connect(self.show_analysis_error)
         self.worker.storage_failed.connect(self.show_storage_error)
+        self.worker.progress.connect(self.show_analysis_progress)
         self.worker.finished.connect(self.finish_analysis)
         self.worker.start()
 
@@ -1128,11 +1153,11 @@ class MainWindow(QMainWindow):
                 _slide_number(finding.shape_key),
                 _rule_name(finding.rule_id),
                 _severity_name(finding.severity),
-                finding.message,
+                describe_finding(finding).title,
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                item.setToolTip(finding.evidence)
+                item.setToolTip(describe_finding(finding).summary)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, finding)
                 if column == 2:
@@ -1163,20 +1188,90 @@ class MainWindow(QMainWindow):
         finding = item.data(Qt.ItemDataRole.UserRole)
         if finding is None:
             return
-        self.detail_title.setText(
-            f"{_slide_number(finding.shape_key)} 슬라이드 · {_rule_name(finding.rule_id)} · "
-            f"{_severity_name(finding.severity)}"
+        explanation = describe_finding(finding)
+        self.detail_title.setText(f"{_slide_number(finding.shape_key)} 슬라이드 · {explanation.title}")
+        self.detail_values.setText(
+            "\n".join(f"{label}   {value}" for label, value in explanation.measurements)
         )
-        measured = _display_value(finding.measured)
-        expected = _display_value(finding.expected)
-        self.detail_values.setText(f"측정값   {measured}\n검사 기준   {expected}")
-        self.detail_reason.setText(f"판정 이유\n{finding.evidence}")
+        self.detail_reason.setText(explanation.html(measurements=False))
+        self.view_fixes_button.setEnabled(not self.viewing_history and self._split_worker is None)
+
+    def show_analysis_progress(self, progress):
+        if self.selected_file != progress.source_path:
+            return
+        self.progress_stage_label.setText(progress_text(progress))
+        self.progress_bar.setRange(0, progress.total if progress.total else 0)
+        if progress.total:
+            self.progress_bar.setValue(progress.completed)
+
+    def request_fixes(self):
+        report = self.current_report
+        item = self.result_table.item(self.result_table.currentRow(), 0)
+        if report is None or item is None or self._split_worker is not None or self.viewing_history:
+            return
+        finding = item.data(Qt.ItemDataRole.UserRole)
+        if finding.rule_id not in ("typography", "layout.density"):
+            self.report_tabs.setCurrentIndex(1)
+            return
+        policy = build_analysis_policy(Path(report.deck.source_path))
+        self.view_fixes_button.setEnabled(False)
+        self.view_fixes_button.setText("분할 수정안 검증 중…")
+        worker = SplitProposalWorker(report, policy, _slide_number(finding.shape_key), self)
+        self._split_worker = worker
+        worker.completed.connect(self._show_requested_fixes)
+        worker.failed.connect(lambda message: self.statusBar().showMessage(friendly_error(message)))
+        worker.finished.connect(self._requested_fixes_finished)
+        worker.start()
+
+    def _show_requested_fixes(self, report):
+        current = self.current_report
+        if (
+            current is None
+            or current.deck.source_path != report.deck.source_path
+            or current.deck.source_sha256 != report.deck.source_sha256
+            or current.policy_key != report.policy_key
+        ):
+            return
+        self.current_report = report
+        self._show_proposals(report)
+        self.report_tabs.setCurrentIndex(1)
+        notes = list(dict.fromkeys(report.proposal_notes.values()))
+        if notes:
+            self.proposal_summary.setText(self.proposal_summary.text() + "\n" + "\n".join(notes))
+
+    def _requested_fixes_finished(self):
+        worker = self._split_worker
+        self._split_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.view_fixes_button.setText("이 위치의 수정안 보기")
+        self.view_fixes_button.setEnabled(self.current_report is not None and not self.viewing_history)
+
+    def show_measurement_details(self, link):
+        item = self.result_table.item(self.result_table.currentRow(), 0)
+        if link != "measurement-details" or item is None:
+            return
+        finding = item.data(Qt.ItemDataRole.UserRole)
+        if finding is not None:
+            self._measurement_dialog = FindingDetailsDialog(finding, self)
+            self._measurement_dialog.show()
 
     def show_analysis_error(self, message):
-        self.error_page.description_label.setText(message)
+        self._last_analysis_error = message
+        self.error_page.description_label.setText(
+            escape(friendly_error(message))
+            + '<br><a href="error-details" style="color:#1756b2">오류 상세 보기</a>'
+        )
         self.inspection_stack.setCurrentWidget(self.error_page)
         self.statusBar().showMessage("검사 실패")
-        QMessageBox.warning(self, "검사 실패", message)
+        QMessageBox.warning(self, "검사 실패", friendly_error(message))
+
+    def show_error_details(self, link):
+        if link == "error-details" and getattr(self, "_last_analysis_error", None):
+            self._measurement_dialog = TechnicalDetailsDialog(
+                "검사를 완료하지 못한 이유", self._last_analysis_error, self
+            )
+            self._measurement_dialog.show()
 
     def show_storage_error(self, message):
         self.statusBar().showMessage("검사 결과 저장 실패")
@@ -1295,7 +1390,7 @@ class MainWindow(QMainWindow):
         self.refresh_history()
 
     def closeEvent(self, event):
-        if self.worker is not None:
+        if self.worker is not None or self._split_worker is not None:
             QMessageBox.information(self, "검사 진행 중", "검사가 끝난 뒤 창을 닫아주세요.")
             event.ignore()
             return
@@ -1347,6 +1442,15 @@ def _slide_number(shape_key: str) -> str:
 
 
 def _rule_name(rule_id: str) -> str:
+    if rule_id.startswith("readability."):
+        return readability_label(rule_id)
+    if rule_id.startswith("layout."):
+        return {
+            "layout.margin": "가장자리",
+            "layout.overflow": "글 넘침",
+            "layout.overlap": "겹침",
+            "layout.density": "정보량",
+        }.get(rule_id, "배치")
     root = rule_id.partition(".")[0]
     names = {
         "contrast": "명암비",
@@ -1355,6 +1459,7 @@ def _rule_name(rule_id: str) -> str:
         "color_vision": "색약",
         "consistency": "일관성",
         "image_text": "그림 속 글자",
+        "readability": "읽기 편의",
     }
     return names.get(root, rule_id)
 

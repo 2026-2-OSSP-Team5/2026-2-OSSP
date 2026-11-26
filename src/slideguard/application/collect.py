@@ -8,12 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from slideguard.application.ports import (
+    AnalysisProgress,
     CollectionFailure,
     CollectionFailureCallback,
     CollectionStage,
     DeckReader,
     FileRemoved,
     FileWatchEvent,
+    ReadInterrupted,
     SavedFileSource,
     SavedRevision,
     SnapshotCallback,
@@ -57,6 +59,7 @@ class SnapshotCollector:
         successful_hashes: SuccessfulAnalysisHashes | None = None,
         on_failure: CollectionFailureCallback | None = None,
         on_collecting: Callable[[Path], None] | None = None,
+        on_progress=None,
         max_attempts: int = 3,
         retry_delay_seconds: float = 0.2,
     ):
@@ -70,6 +73,8 @@ class SnapshotCollector:
         self._successful_hashes = successful_hashes
         self._on_failure = on_failure
         self._on_collecting = on_collecting
+        self._on_progress = on_progress
+        self._active_path: Path | None = None
         self._max_attempts = max_attempts
         self._retry_delay_seconds = retry_delay_seconds
         self._condition = threading.Condition()
@@ -115,6 +120,23 @@ class SnapshotCollector:
             if self._scan is not None:
                 self._touched.add(path)
             self._enqueue(_Job(path, manual=True))
+
+    def prioritize(self, path: Path | None) -> None:
+        """The open presentation follows explicit requests, ahead of background work."""
+        with self._condition:
+            self._active_path = path
+            self._condition.notify_all()
+
+    def _priority(self, job):
+        return 2 if job.manual else (1 if job.path == self._active_path else 0)
+
+    def _should_yield(self, job):
+        with self._condition:
+            return not self._current(job) or any(
+                self._priority(pending) > self._priority(job)
+                for pending in self._pending.values()
+                if pending.ready_at <= time.monotonic()
+            )
 
     def _enqueue(self, job: _Job) -> None:
         # Called with the condition held. Replacing the identity invalidates active work.
@@ -174,13 +196,12 @@ class SnapshotCollector:
         with self._condition:
             while not self._closed:
                 now = time.monotonic()
-                manual = next(
-                    (job for job in self._pending.values() if job.manual and job.ready_at <= now), None
-                )
-                if manual is not None:
-                    self._pending.pop(manual.path)
+                ready = [job for job in self._pending.values() if job.ready_at <= now]
+                priority = max(ready, key=self._priority, default=None)
+                if priority is not None and (self._priority(priority) > 0 or self._scan is None):
+                    self._pending.pop(priority.path)
                     self._processing = True
-                    return manual
+                    return priority
                 if self._scan is not None and self._scan.ready_at <= now:
                     self._processing = True
                     return self._scan
@@ -282,7 +303,13 @@ class SnapshotCollector:
                 job.attempt,
                 (started - job.queued_at) * 1000,
             )
-            deck = self._reader.read(job.path)
+            incremental = getattr(self._reader, "read_incremental", None)
+            if incremental is not None:
+                deck = incremental(
+                    job.path, should_yield=lambda: self._should_yield(job), on_progress=self._on_progress
+                )
+            else:
+                deck = self._reader.read(job.path)
             LOGGER.info(
                 "SNAPSHOT_READ | file=%s | read_ms=%.0f", job.path.name, (time.monotonic() - started) * 1000
             )
@@ -300,6 +327,16 @@ class SnapshotCollector:
             if not self._current(job):
                 return
             self._on_snapshot(deck)
+        except ReadInterrupted:
+            with self._condition:
+                if self._current(job):
+                    job.attempt -= 1
+                    self._pending[job.path] = job
+                    self._condition.notify_all()
+            if self._on_progress is not None:
+                self._on_progress(AnalysisProgress(job.path, "yielded"))
+            LOGGER.info("SNAPSHOT_YIELDED | file=%s", job.path.name)
+            return
         except Exception as error:
             failure = self._failure_data(job, stage, error, job.attempt)
         if failure is None:

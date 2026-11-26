@@ -22,6 +22,7 @@ from slideguard.checks.consistency import ConsistencyRule
 from slideguard.checks.contrast import ContrastRule
 from slideguard.checks.image_text import ImageTextRule
 from slideguard.checks.layout import LayoutRule
+from slideguard.checks.readability import ReadabilityRule
 from slideguard.checks.typography import TypographyRule
 from slideguard.domain.policy import AnalysisPolicy
 from slideguard.planning import MinimumChangePlanner
@@ -44,6 +45,7 @@ def build_analyzer(reader: DeckReader | None = None) -> AnalyzePresentation:
             ContrastRule(),
             TypographyRule(),
             LayoutRule(),
+            ReadabilityRule(),
             ColorVisionRule(),
             ConsistencyRule(),
             ImageTextRule(),
@@ -92,6 +94,7 @@ def build_powerpoint_reader(*, render: bool = False):
         PowerPointReadSession(),
         render=render,
         wants_image_text=lambda path: build_analysis_policy(path).image_text,
+        baseline_provider=lambda path: build_report_repository().latest_snapshot(path),
     )
 
 
@@ -140,6 +143,7 @@ def build_snapshot_collection(
     on_detected: Callable[[Path], None] | None = None,
     on_watch_event: FileWatchCallback | None = None,
     on_collecting: Callable[[Path], None] | None = None,
+    on_progress=None,
     settle_seconds: float = 0.8,
     max_attempts: int = 3,
     retry_delay_seconds: float = 0.2,
@@ -156,6 +160,7 @@ def build_snapshot_collection(
         successful_hashes=successful_hashes,
         on_failure=on_failure,
         on_collecting=on_collecting,
+        on_progress=on_progress,
         max_attempts=max_attempts,
         retry_delay_seconds=retry_delay_seconds,
     )

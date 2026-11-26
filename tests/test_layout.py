@@ -285,6 +285,19 @@ def test_density_sums_all_shapes_on_the_slide():
     assert findings[0].shape_key == "1:1"  # 가장 글자가 많은 도형
 
 
+def test_density_marks_all_counted_boxes_and_excludes_manual_page_number():
+    body = make_shape(x=100, y=100, w=200, h=100, text="\n".join(["항목"] * 6), shape_id=1)
+    page = make_shape(x=800, y=20, text="1 / 23", shape_id=2)
+    assert only(run_rule(body, page), "layout.density") == []
+    extra = make_shape(x=500, y=300, w=100, h=30, text="추가 항목", shape_id=3)
+    [finding] = only(run_rule(body, page, extra), "layout.density")
+    assert finding.measured == 7 and finding.box == Box(100, 100, 500, 230)
+    assert "6줄" in finding.evidence and "1줄" in finding.evidence
+    # A fraction in the body is content, even if its numerator matches the page.
+    fraction = replace(page, box=Box(800, 200, 100, 30))
+    assert only(run_rule(body, fraction), "layout.density")[0].measured == 7
+
+
 def test_density_is_counted_per_slide():
     a = make_shape(text="가" * 60, slide_number=1)
     b = make_shape(text="나" * 60, slide_number=2)

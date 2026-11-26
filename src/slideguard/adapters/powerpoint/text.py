@@ -23,6 +23,18 @@ def read_run(run, text: str, index: int, notes: list[str], *, modern: bool = Fal
         notes.append(f"{label} font size is mixed or nonpositive")
         size = None
     bold = tristate(read_optional(lambda: font.Bold, f"{label} bold", notes), f"{label} bold", notes)
+    family = read_optional(lambda: font.Name, f"{label} font name", [])
+    underline = read_optional(lambda: font.UnderlineStyle if modern else font.Underline, "Underline", [])
+    underline_state = (
+        (underline > 0 if type(underline) is int and underline >= 0 else None)
+        if modern
+        else tristate(underline, "Underline", [])
+    )
+    style = {
+        "font_family": family if isinstance(family, str) and family else None,
+        "italic": tristate(read_optional(lambda: font.Italic, "Italic", []), "Italic", []),
+        "underline": underline_state,
+    }
     if modern:
         fill = read_optional(lambda: font.Fill, f"{label} text fill", notes)
         fill_type = read_optional(lambda: fill.Type, f"{label} fill type", notes)
@@ -50,10 +62,10 @@ def read_run(run, text: str, index: int, notes: list[str], *, modern: bool = Fal
         color = source_color if visible is True and kind == "solid" and transparency == 0 else None
         if color is None:
             notes.append(f"{label} has transparent, non-solid or unverified text fill; opaque RGB is unknown")
-        return TextRun(text, size, color, bold, source_color, transparency, kind, visible)
+        return TextRun(text, size, color, bold, source_color, transparency, kind, visible, **style)
     notes.append(f"{label} text fill/transparency is unavailable; opaque RGB is unknown")
     color_format = read_optional(lambda: font.Color, f"{label} color", notes)
-    return TextRun(text, size, None, bold, read_color(color_format, label, notes))
+    return TextRun(text, size, None, bold, read_color(color_format, label, notes), **style)
 
 
 def _runs(text_range, text: str, notes: list[str], *, modern: bool = False) -> tuple[TextRun, ...]:
