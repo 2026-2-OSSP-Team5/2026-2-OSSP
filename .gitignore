@@ -8,6 +8,7 @@ __pycache__/
 .ruff_cache/
 build/
 dist/
+/releases/
 *.log
 *.bak
 .DS_Store
@@ -20,6 +21,7 @@ Desktop.ini
 # User documents, reports and local databases
 input/
 output/
+/releases/
 reports/
 data/
 *.ppt
