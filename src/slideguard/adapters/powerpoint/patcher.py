@@ -344,6 +344,7 @@ def apply_proposal(doc: Document, p: ChangeProposal, result: ApplyResult) -> Non
         Property.FONT_SIZE: _apply_font_size,
         Property.FONT_COLOR: _apply_font_color,
         Property.FONT_FAMILY: _apply_font_family,
+        Property.FONT_BOLD: _apply_font_bold,
         Property.SHAPE_HEIGHT: _apply_height,
         Property.SHAPE_WIDTH: _apply_width,
         Property.SHAPE_POSITION: _apply_position,
@@ -388,9 +389,17 @@ def _apply_font_size(shape: ShapeHandle, p: ChangeProposal):
     if get_autofit is not None and get_autofit() == "shrink":
         return _resize_shrunk_text(shape, target)
     changed = 0
+    shrinking = _is_number(p.before) and target < float(p.before) - TOLERANCE
     for run in shape.runs():
         size = run.get_size()
-        if size is not None and size < target:  # 크기를 모르는 런은 건드리지 않음
+        if size is None:
+            continue  # 크기를 모르는 런은 건드리지 않음
+        if shrinking:
+            # 줄이는 후보(슬라이드 간 일관성: 제목 크기 맞추기)는 '그 크기였던 글자'만 바꾼다
+            if abs(size - float(p.before)) <= TOLERANCE:
+                run.set_size(target)
+                changed += 1
+        elif size < target:
             run.set_size(target)
             changed += 1
     fit_rows = getattr(shape, "fit_table_rows", None)
@@ -434,6 +443,20 @@ def _apply_font_color(shape: ShapeHandle, p: ChangeProposal):
         color = run.get_color()
         if color is not None and color.upper() == before:
             run.set_color(after)
+            changed += 1
+    return changed
+
+
+def _apply_font_bold(shape: ShapeHandle, p: ChangeProposal):
+    """글자색이 p.before인 글자를 굵게 (색만으로 구분한 글자에 색 외의 표시를 더함: Okabe & Ito CUD 원칙 2)."""
+    target = str(p.before).upper().lstrip("#")
+    changed = 0
+    for run in shape.runs():
+        get_bold = getattr(run, "get_bold", None)
+        if get_bold is None or str(run.get_color() or "").upper() != target:
+            continue
+        if get_bold() is not True:
+            run.set_bold(bool(p.after))
             changed += 1
     return changed
 
@@ -662,6 +685,15 @@ class _ComRun:
     def set_font_name(self, name: str) -> None:
         self._tr.Font.Name = name
         self._tr.Font.NameFarEast = name
+
+    def get_bold(self) -> bool | None:
+        try:
+            return int(self._tr.Font.Bold) == MSO_TRUE
+        except _COM_ERRORS:
+            return None
+
+    def set_bold(self, bold: bool) -> None:
+        self._tr.Font.Bold = MSO_TRUE if bold else 0
 
 
 class _ComParagraph:
@@ -966,3 +998,7 @@ class OriginalDocumentSession(ComDocumentSession):
                 )
             return pres
         return super()._open(app)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)

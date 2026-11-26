@@ -65,7 +65,59 @@ def _with_lightness(hex_color: str, lightness: float) -> str:
     return rgb_to_hex(round(nr * 255), round(ng * 255), round(nb * 255))
 
 
-def nearest_passing_color(fg: str, bg: str, required: float) -> str | None:
+def worst_vision_contrast(fg: str, bg: str, kinds: tuple[str, ...] | None = None) -> float:
+    """보통 눈과 고른 색약 눈(kinds, 없으면 적색약·녹색약·청색약 모두) 가운데 가장 낮은 명암비."""
+    from slideguard.checks.color_vision import worst_cvd_contrast
+
+    return worst_cvd_contrast(hex_to_rgb(fg), hex_to_rgb(bg), kinds)[0]
+
+
+def vision_ratio(kinds: tuple[str, ...] | None):
+    """명암비 계산 함수 하나로 묶기: (글자색, 배경색) → 고른 눈 가운데 가장 낮은 명암비."""
+
+    def ratio(fg: str, bg: str) -> float:
+        return worst_vision_contrast(fg, bg, kinds)
+
+    return ratio
+
+
+# 색각 친화 팔레트 (Okabe & Ito, Color Universal Design 2008; Wong 2011 Nature Methods 8:441)
+# 검정을 뺀 유채색 7개: 주황, 하늘색, 청록, 노랑, 파랑, 버밀리언, 붉은 보라
+CUD_PALETTE = ("E69F00", "56B4E9", "009E73", "F0E442", "0072B2", "D55E00", "CC79A7")
+
+
+def _lab_hue(hex_color: str) -> float:
+    from slideguard.checks.color_vision import _lab
+
+    _l, a, b = _lab(hex_to_rgb(hex_color))
+    return math.degrees(math.atan2(b, a)) % 360
+
+
+def cud_color(fg: str, bg: str, required: float, kinds: tuple[str, ...] | None = None) -> str | None:
+    """원래 글자색과 색상(hue)이 가장 가까운 색각 친화 색.
+
+    팔레트 색이 그대로는 명암비가 모자라면(흰 배경 위 노랑 등) 같은 색상에서 밝기만 조정한다.
+    모든 눈(보통 + 적색약·녹색약·청색약)에서 required 이상이어야 후보가 된다.
+    """
+    ratio = vision_ratio(kinds)  # 설정에서 고른 색약 눈(없으면 세 가지 모두)
+    hue = _lab_hue(fg)
+    best, best_score = None, None
+    for base in CUD_PALETTE:
+        color = base if ratio(base, bg) >= required else None
+        adjusted = 0.0
+        if color is None:
+            color = nearest_passing_color(base, bg, required, ratio)
+            if color is None:
+                continue
+            adjusted = color_distance(base, color)  # 팔레트 색에서 멀어진 만큼 덜 선호
+        gap = abs(_lab_hue(color) - hue)
+        score = min(gap, 360 - gap) + 60 * adjusted
+        if best_score is None or score < best_score:
+            best, best_score = color, score
+    return best
+
+
+def nearest_passing_color(fg: str, bg: str, required: float, ratio_of=contrast_ratio) -> str | None:
     """글자색의 색상은 유지하고 밝기만 조절해 기준을 넘는 가장 가까운 색을 찾습니다.
 
     어둡게 하는 방향과 밝게 하는 방향을 모두 찾아 원래 색에 더 가까운 쪽을 고릅니다.
@@ -77,7 +129,7 @@ def nearest_passing_color(fg: str, bg: str, required: float) -> str | None:
     candidates = []
     for target_l in (0.0, 1.0):  # 0.0 = 어둡게, 1.0 = 밝게
         # 끝까지 가도 기준을 못 넘으면 이 방향은 불가능
-        if contrast_ratio(_with_lightness(fg, target_l), bg) < required:
+        if ratio_of(_with_lightness(fg, target_l), bg) < required:
             continue
 
         # 이분 탐색: 기준을 넘는 지점 중 원래 밝기에 가장 가까운 곳
@@ -85,7 +137,7 @@ def nearest_passing_color(fg: str, bg: str, required: float) -> str | None:
         high = target_l  # 기준 통과 쪽
         for _ in range(30):
             mid = (low + high) / 2
-            if contrast_ratio(_with_lightness(fg, mid), bg) >= required:
+            if ratio_of(_with_lightness(fg, mid), bg) >= required:
                 high = mid
             else:
                 low = mid
@@ -94,11 +146,11 @@ def nearest_passing_color(fg: str, bg: str, required: float) -> str | None:
         # 반올림 때문에 기준 바로 아래로 떨어지는 경우를 한 칸씩 보정
         step = 0.002 if target_l == 1.0 else -0.002
         lightness = high
-        while contrast_ratio(color, bg) < required and 0.0 <= lightness <= 1.0:
+        while ratio_of(color, bg) < required and 0.0 <= lightness <= 1.0:
             lightness += step
             color = _with_lightness(fg, min(1.0, max(0.0, lightness)))
 
-        if contrast_ratio(color, bg) >= required:
+        if ratio_of(color, bg) >= required:
             candidates.append(color)
 
     if not candidates:
@@ -200,3 +252,50 @@ def harmony_score(color1: str, color2: str) -> float:
     # 색상 자체의 영향
     hh = _hue_effect(l1, c1, h1) + _hue_effect(l2, c2, h2)
     return hc + hl_sum + hl_diff + hh
+
+
+def cud_distinct_colors(
+    originals: list[str], body: str, bg: str, required: float = 4.5, kinds: tuple[str, ...] | None = None
+) -> list[str] | None:
+    """색만으로 구분한 글자색들을 모든 눈(보통 + 세 가지 색약)에서 서로·본문과 구분되는 색각 친화 색으로.
+
+    Okabe & Ito(CUD)와 Wong(2011)은 빨강·초록 짝 대신 팔레트의 서로 다른 색을 쓰라고 권한다.
+    1) 팔레트 7색을 배경과 모든 눈에서 required 이상이 되도록 밝기만 조정 (안 되면 그 색은 뺌)
+    2) originals 개수만큼 고르는 모든 경우 가운데, 세 가지 색약 눈에서 '서로·본문과의 가장 작은 색차'가
+       가장 큰 조합 (같으면 원래 색과 색상이 가까운 조합)
+    """
+    from itertools import permutations
+
+    from slideguard.checks.color_vision import CVD_MATRICES, delta_e, simulate
+
+    ratio = vision_ratio(kinds)  # 설정에서 고른 색약 눈(없으면 세 가지 모두)
+    eyes = tuple(CVD_MATRICES) if kinds is None else kinds
+    usable = []
+    for base in CUD_PALETTE:
+        color = base if ratio(base, bg) >= required else nearest_passing_color(base, bg, required, ratio)
+        if color is not None and color not in usable:
+            usable.append(color)
+    if len(usable) < len(originals):
+        return None
+
+    def separation(colors) -> float:
+        everything = [hex_to_rgb(color) for color in (*colors, body)]
+        worst = math.inf
+        for kind in eyes:
+            seen = [simulate(color, kind) for color in everything]
+            for i in range(len(seen)):
+                for j in range(i + 1, len(seen)):
+                    worst = min(worst, delta_e(seen[i], seen[j]))
+        return worst
+
+    def hue_gap(colors) -> float:
+        total = 0.0
+        for old, new in zip(originals, colors, strict=True):
+            gap = abs(_lab_hue(old) - _lab_hue(new))
+            total += min(gap, 360 - gap)
+        return total
+
+    best = max(
+        permutations(usable, len(originals)), key=lambda colors: (round(separation(colors)), -hue_gap(colors))
+    )
+    return list(best)

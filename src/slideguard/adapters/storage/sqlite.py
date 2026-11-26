@@ -22,7 +22,16 @@ from slideguard.domain.models import (
     TextRun,
     TextSpan,
 )
-from slideguard.domain.policy import AnalysisPolicy, FixTargets, Purpose, Strength, ThresholdOverrides
+from slideguard.domain.policy import (
+    COLOR_VISION_KINDS,
+    AnalysisPolicy,
+    Audience,
+    FixTargets,
+    Purpose,
+    Strength,
+    ThresholdOverrides,
+    ViewingSetup,
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +58,12 @@ class WorkspaceSettings:
             locked_shapes=self._locked_shapes(document),
             thresholds=ThresholdOverrides(**options.get("thresholds", {})),
             fix=FixTargets(**options.get("fix", {})),
+            audience=Audience(options.get("audience", "general")),
+            viewing=ViewingSetup(**options.get("viewing", {})),
+            # 예전 버전은 켜기/끄기(True/False)로 저장했고 기본이 켜기였다 → 모두 '없음'으로 시작
+            color_vision=_color_vision_option(options.get("color_vision")),
+            consistency=bool(options.get("consistency", True)),
+            image_text=bool(options.get("image_text", True)),
         )
 
     def _locked_shapes(self, document: Path | None) -> frozenset[str]:
@@ -243,6 +258,11 @@ class SqliteWorkspaceSettingsRepository:
                             key: str(value) if hasattr(value, "value") else value
                             for key, value in asdict(policy.fix).items()
                         },
+                        "audience": policy.audience.value,
+                        "viewing": asdict(policy.viewing),
+                        "color_vision": policy.color_vision,
+                        "consistency": policy.consistency,
+                        "image_text": policy.image_text,
                     },
                 )
             elif purpose is not None:
@@ -484,3 +504,8 @@ def _report_from_json(payload: str) -> AnalysisReport:
         comparison=FindingComparison(**data["comparison"]) if data.get("comparison") else None,
         proposal_notes=dict(data.get("proposal_notes", {})),
     )
+
+
+def _color_vision_option(value) -> str:
+    """저장된 색약 설정 → 색각 유형 키. 예전 True/False나 모르는 값은 'none'(검사 안 함)."""
+    return value if isinstance(value, str) and value in COLOR_VISION_KINDS else "none"

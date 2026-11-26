@@ -9,12 +9,12 @@ from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
-CACHE_VERSION = "slide-measurements-3"
+CACHE_VERSION = "slide-measurements-4"
 
 
-def measurement_key(render):
+def measurement_key(render, *, image_text=False):
     # Font installation changes invalidate saved rendering measurements too.
-    digest = hashlib.sha256(f"{CACHE_VERSION}:{render}:{sys.platform}".encode())
+    digest = hashlib.sha256(f"{CACHE_VERSION}:{render}:{image_text}:{sys.platform}".encode())
     if sys.platform == "win32":
         import winreg
 

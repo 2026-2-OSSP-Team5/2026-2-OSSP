@@ -1,6 +1,6 @@
 import json
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from zipfile import ZipFile
@@ -168,6 +168,68 @@ def test_saved_measurements_survive_restart_and_slide_reordering(tmp_path):
     assert session.opens == 0
     assert [s.text for s in result.shapes] == ["Body 2", "Body 0", "Body 1"]
     assert [s.slide_number for s in result.shapes] == [1, 2, 3]
+
+
+def test_incremental_reader_runs_image_text_when_enabled_and_reuses_completed_measurements(
+    tmp_path, monkeypatch
+):
+    from slideguard.adapters.powerpoint import reader as reader_module
+
+    path = deck_file(tmp_path / "deck.pptx")
+    session = Session()
+    enabled = False
+    recognized = []
+    monkeypatch.setattr(reader_module, "refresh_shrunk_text", lambda _p, deck: deck)
+    monkeypatch.setattr(reader_module, "render_evidence", lambda _p, deck, _path: deck)
+
+    def recognize(_presentation, deck, _folder):
+        recognized.extend(s.number for s in deck.slides)
+        return replace(
+            deck,
+            shapes=tuple(replace(s, properties=((*s.properties, ("image_text", "[]")))) for s in deck.shapes),
+        )
+
+    monkeypatch.setattr(reader_module, "read_image_text", recognize)
+    reader = PowerPointDeckReader(session, render=True, wants_image_text=lambda _p: enabled)
+    without_ocr = reader.read_incremental(path)
+    assert recognized == [] and session.opens == 1
+    assert reader.read_incremental(path) == without_ocr and session.opens == 1
+
+    enabled = True
+    with_ocr = reader.read_incremental(path)
+    assert recognized == [1, 2, 3] and session.opens == 2
+    assert all("image_text" in dict(s.properties) for s in with_ocr.shapes)
+    assert reader.read_incremental(path) == with_ocr and session.opens == 2
+
+
+@pytest.mark.parametrize("baseline_image_text", [False, True])
+def test_incremental_reader_only_reuses_saved_image_text_measurements_when_available(
+    tmp_path, monkeypatch, baseline_image_text
+):
+    from slideguard.adapters.powerpoint import reader as reader_module
+
+    path = deck_file(tmp_path / "deck.pptx")
+    monkeypatch.setattr(reader_module, "refresh_shrunk_text", lambda _p, deck: deck)
+    monkeypatch.setattr(reader_module, "render_evidence", lambda _p, deck, _path: deck)
+    recognized = []
+
+    def recognize(_presentation, deck, _folder):
+        recognized.extend(s.number for s in deck.slides)
+        return deck
+
+    monkeypatch.setattr(reader_module, "read_image_text", recognize)
+    baseline = PowerPointDeckReader(
+        Session(), render=True, wants_image_text=lambda _p: baseline_image_text
+    ).read_incremental(path)
+    restored = _report_from_json(json.dumps(asdict(AnalysisReport(baseline)))).deck
+    recognized.clear()
+    session = Session()
+    reader = PowerPointDeckReader(
+        session, render=True, wants_image_text=lambda _p: True, baseline_provider=lambda _p: restored
+    )
+    reader.read_incremental(path)
+    assert recognized == ([] if baseline_image_text else [1, 2, 3])
+    assert session.opens == (0 if baseline_image_text else 1)
 
 
 def test_theme_change_invalidates_dependent_slides(tmp_path):

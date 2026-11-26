@@ -201,6 +201,13 @@ class _RecordingRun:
     def get_font_names(self):
         return self._run.get_font_names()
 
+    def get_bold(self):
+        return self._run.get_bold()
+
+    def set_bold(self, bold: bool) -> None:
+        self._owner._record("run.bold", self._index, self._run.get_bold(), bool(bold))
+        self._run.set_bold(bold)
+
     def set_font_name(self, name: str) -> None:
         names = self._run.get_font_names()
         self._owner._record("run.font", self._index, names[0] if names else None, name)
@@ -259,6 +266,9 @@ def _restore(shape, step: UndoStep) -> bool:
             and str(run.get_color() or "").upper() == step.after
         ):
             run.set_color(str(step.before))
+            return True
+        if kind == "run.bold" and step.before is not None and run.get_bold() == step.after:
+            run.set_bold(bool(step.before))
             return True
         if kind == "run.font" and step.before is not None and step.after in run.get_font_names():
             run.set_font_name(str(step.before))

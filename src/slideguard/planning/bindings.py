@@ -53,6 +53,22 @@ def _enum_text(value: object) -> str:
     return str(getattr(value, "value", value)).strip().lower()
 
 
+def _consistency_values(rule_id: str, measured: object, expected: object) -> dict:
+    """일관성 판정의 목표값 (다른 슬라이드의 중앙값). 제목 위치는 "x,y" 글로 온다."""
+    if rule_id == "consistency.title_position":
+        try:
+            left, top = (float(part) for part in str(expected).split(","))
+        except ValueError:
+            return {}
+        return {"consistency": True, "target_left": left, "target_top": top}
+    if rule_id in ("consistency.title_size", "consistency.body_size"):
+        size, target = _number(measured), _number(expected)
+        if size is None or target is None:
+            return {}
+        return {"consistency": True, "size_pt": size, "target_pt": target}
+    return {}
+
+
 def _normalize_color(value: object) -> str | None:
     """(255, 136, 0), '#ff8800', 'FF8800' → 'FF8800'. 모르면 None."""
     if value is None:
@@ -248,6 +264,7 @@ class TeamBindings:
         Property.FONT_COLOR: ("font_color",),
         Property.SHAPE_FILL: ("font_color",),  # 배경판도 글자와 배경의 색 관계를 바꿈
         Property.FONT_FAMILY: ("font_family",),
+        Property.FONT_BOLD: ("font_family",),
         Property.SHAPE_POSITION: ("position",),
         Property.Z_ORDER: ("position",),
         Property.SHAPE_HEIGHT: ("size",),
@@ -309,6 +326,9 @@ class TeamBindings:
         status = self.STATUS_NAMES.get(_enum_text(finding.severity), Status.UNKNOWN)
         finding_id = str(getattr(finding, "id", ""))
         rule = Rule.HIERARCHY if finding_id.endswith(":hierarchy") else self._team_rule(rule_id, status)
+        if rule_id == "color_vision.contrast":
+            rule = Rule.CONTRAST  # 색약 눈 기준 명암비: 글자색 후보를 '모든 눈에서 통과'로 찾음
+        consistency = _consistency_values(rule_id, finding.measured, finding.expected)
 
         address = parse_shape_key(key)
         if address is None:
@@ -331,7 +351,18 @@ class TeamBindings:
                 values["ratio"] = measured
             if expected is not None:
                 values["required_ratio"] = expected
-            if shape is not None:
+            if rule_id == "color_vision.contrast":
+                # id 끝에 글자색이 붙어 있음 (color_vision.contrast:<슬라이드>:<도형>:<RRGGBB>)
+                values["color_vision"] = True
+                foreground = _normalize_color(finding_id.rsplit(":", 1)[-1])
+                background = (
+                    _normalize_color(getattr(shape, "background", None)) if shape is not None else None
+                )
+                if foreground is not None and background is not None:
+                    values.update(
+                        {"foreground": foreground, "background": background, "background_kind": "solid"}
+                    )
+            elif shape is not None:
                 values.update(self._contrast_colors(shape, measured))
         elif rule == Rule.HIERARCHY:
             values["confirmed_hierarchy"] = rule_id == "typography"
@@ -365,6 +396,21 @@ class TeamBindings:
             if expected is not None:
                 values["required_count"] = expected
 
+        values.update(consistency)
+        if rule_id == "layout.margin":
+            # 여백 검사는 글자가 실제로 그려진 영역(글자 상자)으로 판정한다 → 옮길 거리도 그 영역으로 계산
+            text_box = getattr(finding, "box", None)
+            if text_box is not None:
+                values["text_box"] = (
+                    float(text_box.x),
+                    float(text_box.y),
+                    float(text_box.width),
+                    float(text_box.height),
+                )
+        if rule_id == "color_vision.color_only":
+            # 색만으로 구분한 글자: 글자 뒤 배경색 (모르면 흰색으로 봄 — 대부분의 본문 슬라이드)
+            background = _normalize_color(getattr(shape, "background", None)) if shape is not None else None
+            values["background"] = background or "FFFFFF"
         return FindingInfo(
             rule=rule,
             slide_index=slide_index,
@@ -430,6 +476,11 @@ class TeamBindings:
                 if min(abs(worst - ratio), abs(best - ratio)) <= _RATIO_TOLERANCE:
                     foreground = color
                     break
+        # 글자 획 위에 떨어진 픽셀은 배경이 아니므로 빼고 본다 (B의 판정과 같은 방법)
+        from slideguard.checks.contrast import without_text_ink
+
+        background_only = without_text_ink(_rgb(foreground), [_rgb(color) for color in samples])
+        samples = ["{:02X}{:02X}{:02X}".format(*pixel) for pixel in background_only]
         plain = _plain_background(samples)
         if plain is not None:
             # 렌더링해 보니 글자 뒤가 사실상 한 가지 색 (흰 슬라이드 위 연회색 출처 글씨 등)

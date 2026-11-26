@@ -10,6 +10,19 @@ class Purpose(StrEnum):
     REPORT = "report"
 
 
+class Audience(StrEnum):
+    """청중 (계획서 서브 기능 '청중 맞춤').
+
+    GENERAL   일반 성인 (대학생·직장인): 용도별 기준 그대로
+    CHILDREN  초등학생: 글자를 더 크게, 한 장의 정보량을 더 적게
+    OLDER     고령 청중: 글자를 더 크게
+    """
+
+    GENERAL = "general"
+    CHILDREN = "children"
+    OLDER = "older"
+
+
 class Strength(StrEnum):
     LIGHT = "light"
     STANDARD = "standard"
@@ -98,6 +111,69 @@ FONT_SIZE_THRESHOLDS: dict[Purpose, FontSizeThreshold] = {
 
 def font_size_threshold(purpose: Purpose) -> FontSizeThreshold:
     return FONT_SIZE_THRESHOLDS[purpose]
+
+
+# --- 청중 맞춤 ---------------------------------------------------------------
+# 글자 크기 기준에 곱하는 배수와 정보 밀도 기준에 곱하는 배수.
+#   어린이: Hughes & Wilkins (2000, J. Research in Reading) — 5~7세는 성인용보다 큰 글자에서 더 빨리 읽음.
+#           한 장의 정보량은 줄 수·글자 수를 0.7배로 (팀 제안값)
+#   고령:   Legge & Bigelow (2011, J. Vision) — 나이가 들면 '빨리 읽기 시작하는 최소 크기(임계 글자 크기)'가 커짐
+# 배수 자체는 연구가 제시한 값이 아니라 팀 제안값이다 (방향만 근거 있음). 설정에서 직접 기준을 바꾸면 그 값이 우선.
+AUDIENCE_FONT_FACTOR = {Audience.GENERAL: 1.0, Audience.CHILDREN: 1.25, Audience.OLDER: 1.25}
+AUDIENCE_DENSITY_FACTOR = {Audience.GENERAL: 1.0, Audience.CHILDREN: 0.7, Audience.OLDER: 1.0}
+AUDIENCE_LABELS = {Audience.GENERAL: "일반", Audience.CHILDREN: "어린이", Audience.OLDER: "고령"}
+
+
+# --- 환경 맞춤: 화면 크기와 맨 뒷줄 거리로 최소 글자 크기 계산 ---------------------
+# 글자가 눈에 보이는 크기는 pt가 아니라 '보이는 각도(시각도)'로 정해진다.
+#   Legge & Bigelow (2011, "Does print size matter for reading?", J. Vision 11(5):8):
+#     정상 시력의 '임계 글자 크기'(이보다 작으면 읽는 속도가 떨어지는 크기)는 소문자 높이(x-height) 약 0.2°.
+# 그래서 맨 뒷줄에서 x-height가 0.2° 미만이면 최소 기준(경고) 미달로 본다.
+# 권장 기준(검토)은 용도별 기준의 '권장 ÷ 최소' 비율을 그대로 곱한다 (발표용 18/14 ≈ 1.29배).
+# x-height는 글자 크기(em)의 약 0.5배로 본다 (라틴 글꼴 기준. 한글은 글자 높이가 더 커서 이 계산이 보수적).
+CRITICAL_X_HEIGHT_DEG = 0.2
+X_HEIGHT_PER_EM = 0.5
+SCREEN_ASPECT = 16 / 9  # 화면 비율 (대부분의 프로젝터·TV)
+
+
+@dataclass(frozen=True)
+class ViewingSetup:
+    """발표 환경. 둘 다 정해야 계산한다 (하나라도 None이면 쓰지 않음)."""
+
+    screen_inches: float | None = None  # 화면 대각선 (인치)
+    distance_m: float | None = None  # 화면에서 맨 뒷줄까지 거리 (m)
+
+    def __post_init__(self):
+        if self.screen_inches is not None and (
+            not math.isfinite(self.screen_inches) or not 10 <= self.screen_inches <= 600
+        ):
+            raise ValueError("화면 크기는 10~600인치 사이여야 합니다.")
+        if self.distance_m is not None and (
+            not math.isfinite(self.distance_m) or not 0.3 <= self.distance_m <= 100
+        ):
+            raise ValueError("거리는 0.3~100m 사이여야 합니다.")
+
+    @property
+    def active(self) -> bool:
+        return self.screen_inches is not None and self.distance_m is not None
+
+    def minimum_pt(self, slide_width_pt: float, slide_height_pt: float, degrees: float) -> float | None:
+        """맨 뒷줄에서 x-height가 degrees도로 보이려면 필요한 글자 크기 (슬라이드 pt 단위)."""
+        if not self.active or slide_width_pt <= 0 or slide_height_pt <= 0:
+            return None
+        # 1) 화면의 실제 높이·너비 (m)
+        diagonal_m = self.screen_inches * 0.0254
+        screen_h = diagonal_m / math.sqrt(1 + SCREEN_ASPECT**2)
+        screen_w = screen_h * SCREEN_ASPECT
+        # 2) 슬라이드를 화면에 맞췄을 때 슬라이드 높이가 차지하는 실제 길이 (m)
+        shown_h = min(screen_h, screen_w * slide_height_pt / slide_width_pt)
+        # 3) 맨 뒷줄에서 그 각도로 보이는 x-height (m) → 글자 크기(em, m) → 슬라이드 pt
+        x_height = 2 * self.distance_m * math.tan(math.radians(degrees) / 2)
+        em = x_height / X_HEIGHT_PER_EM
+        return round(em / shown_h * slide_height_pt, 1)
+
+    def label(self) -> str:
+        return f"{self.screen_inches:g}인치 화면, 맨 뒷줄 {self.distance_m:g}m"
 
 
 # 도형 좌표를 비교할 때 허용하는 오차(pt). 반올림·렌더링 오차로 인한 오탐을 줄인다.
@@ -211,6 +287,19 @@ class FixTargets:
         return max(required, goal)  # 어떤 목표도 검사 기준보다 낮아지지 않음
 
 
+# 색약 맞춤 검사에서 고를 수 있는 색각 유형 → 실제로 시뮬레이션할 눈
+#   적록색약은 적색약(1형, protan)과 녹색약(2형, deutan)을 함께 부르는 말이라 둘 다 본다.
+#   청색약(3형, tritan)은 드물지만 파랑·노랑 구분이 어렵다.
+COLOR_VISION_KINDS: dict[str, tuple[str, ...]] = {
+    "none": (),
+    "red_green": ("protan", "deutan"),
+    "protan": ("protan",),
+    "deutan": ("deutan",),
+    "tritan": ("tritan",),
+    "all": ("protan", "deutan", "tritan"),
+}
+
+
 @dataclass(frozen=True)
 class AnalysisPolicy:
     purpose: Purpose = Purpose.PRESENTATION
@@ -220,10 +309,24 @@ class AnalysisPolicy:
     locked_shapes: frozenset[str] = frozenset()
     thresholds: ThresholdOverrides = field(default_factory=ThresholdOverrides)
     fix: FixTargets = field(default_factory=FixTargets)  # 수정 후보의 목표 (검사에는 영향 없음)
+    audience: Audience = Audience.GENERAL  # 청중 맞춤
+    viewing: ViewingSetup = field(default_factory=ViewingSetup)  # 환경 맞춤 (화면 크기·거리)
+    # 색약 맞춤 검사: 어떤 색각 이상을 고려할지 (COLOR_VISION_KINDS의 키). 기본은 "none" = 검사 안 함
+    color_vision: str = "none"
+    consistency: bool = True  # 슬라이드 간 디자인 일관성 검사
+    image_text: bool = True  # 그림 속 글자 검사 (Windows 문자 인식)
 
     def __post_init__(self):
         if not isinstance(self.purpose, Purpose) or not isinstance(self.strength, Strength):
             raise ValueError("Use Purpose and Strength enum values")
+        object.__setattr__(self, "audience", Audience(self.audience))  # 설정 파일의 문자열도 허용
+        # 예전 설정은 켜기/끄기(True/False)였다: True는 세 가지 모두, False는 없음으로 바꿔 받는다
+        if self.color_vision is True:
+            object.__setattr__(self, "color_vision", "all")
+        elif self.color_vision is False or self.color_vision is None:
+            object.__setattr__(self, "color_vision", "none")
+        if self.color_vision not in COLOR_VISION_KINDS:
+            raise ValueError("알 수 없는 색각 유형입니다.")
         if self.locked_properties - PROPERTIES:
             raise ValueError("Unknown locked property")
         if any(type(n) is not int or n < 1 for n in self.slides):
@@ -235,19 +338,53 @@ class AnalysisPolicy:
             raise ValueError("대형 글자 명암비는 일반 글자 명암비 이하여야 합니다.")
 
     @property
+    def vision_kinds(self) -> tuple[str, ...]:
+        """검사할 색각 이상 종류 (protan=적색약, deutan=녹색약, tritan=청색약). 비어 있으면 색약 검사 안 함."""
+        return COLOR_VISION_KINDS[self.color_vision]
+
+    @property
     def font_limits(self) -> FontSizeThreshold:
+        """용도별 기준 × 청중 배수 (직접 지정한 값이 있으면 그 값)."""
         defaults = font_size_threshold(self.purpose)
+        factor = AUDIENCE_FONT_FACTOR[self.audience]
         return FontSizeThreshold(
-            self.thresholds.recommended_font or defaults.recommended_pt,
-            self.thresholds.minimum_font or defaults.minimum_pt,
+            self.thresholds.recommended_font or round(defaults.recommended_pt * factor, 1),
+            self.thresholds.minimum_font or round(defaults.minimum_pt * factor, 1),
         )
+
+    def slide_font_limits(
+        self, slide_width_pt: float | None, slide_height_pt: float | None
+    ) -> tuple[FontSizeThreshold, str]:
+        """이 덱에 실제로 쓰는 글자 크기 기준과 그 근거 설명.
+
+        1) 용도·청중 기준 × 슬라이드 크기 배수 (큰 슬라이드는 같은 비율로 키움)
+        2) 발표 환경(화면 크기·거리)을 정했으면 시각도로 계산한 값
+        둘 중 큰 값을 쓴다 (환경 계산이 더 너그러워도 기본 기준 아래로는 내리지 않음).
+        """
+        base = self.font_limits
+        scale = slide_scale(slide_height_pt)
+        minimum = round(base.minimum_pt * scale, 1)
+        recommended = round(base.recommended_pt * scale, 1)
+        notes = []
+        if scale > 1.0:
+            notes.append(f"슬라이드가 기본보다 {scale:g}배 커서 기준도 ×{scale:g}")
+        if self.audience != Audience.GENERAL and not self.thresholds.minimum_font:
+            notes.append(f"청중 {AUDIENCE_LABELS[self.audience]} ×{AUDIENCE_FONT_FACTOR[self.audience]:g}")
+        if self.viewing.active and slide_width_pt and slide_height_pt:
+            env_min = self.viewing.minimum_pt(slide_width_pt, slide_height_pt, CRITICAL_X_HEIGHT_DEG)
+            env_rec = None if env_min is None else round(env_min * base.recommended_pt / base.minimum_pt, 1)
+            if env_min is not None and env_rec is not None and (env_min > minimum or env_rec > recommended):
+                minimum, recommended = max(minimum, env_min), max(recommended, env_rec)
+                notes.append(f"{self.viewing.label()}에서 보이는 크기 기준 (Legge & Bigelow 2011)")
+        return FontSizeThreshold(recommended, minimum), ", ".join(notes)
 
     @property
     def density_limits(self) -> DensityThreshold:
         defaults = density_threshold(self.purpose)
+        factor = AUDIENCE_DENSITY_FACTOR[self.audience]
         return DensityThreshold(
-            self.thresholds.max_chars or defaults.max_chars,
-            self.thresholds.max_lines or defaults.max_lines,
+            self.thresholds.max_chars or max(1, round(defaults.max_chars * factor)),
+            self.thresholds.max_lines or max(1, round(defaults.max_lines * factor)),
         )
 
     @property
@@ -267,7 +404,7 @@ class AnalysisPolicy:
     def cache_key(self) -> str:
         return json.dumps(
             {
-                "revision": 4,
+                "revision": 6,
                 "purpose": self.purpose,
                 "strength": self.strength,
                 "slides": sorted(set(self.slides)),
@@ -275,6 +412,11 @@ class AnalysisPolicy:
                 "locked_shapes": sorted(self.locked_shapes),
                 "thresholds": asdict(self.thresholds),
                 "fix": asdict(self.fix),
+                "audience": self.audience,
+                "viewing": asdict(self.viewing),
+                "color_vision": self.color_vision,
+                "consistency": self.consistency,
+                "image_text": self.image_text,
             },
             sort_keys=True,
             separators=(",", ":"),

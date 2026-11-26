@@ -178,3 +178,16 @@ def test_unknown_text_kind_below_three_is_warning_citing_both_targets():
     assert "대형 텍스트" not in finding.evidence
     assert "유형 미확정" in finding.evidence
     assert "4.5:1" in finding.evidence and "3.0:1" in finding.evidence
+
+
+def test_glyph_pixels_around_overflowing_text_are_not_background():
+    """쪽 번호 글자가 상자 위로 삐져나와 둘레 픽셀 일부가 검은 획 위에 떨어져도 배경은 회녹색 (5.5:1 통과)."""
+    from slideguard.checks.contrast import best_sample_contrast, sample_contrast, without_text_ink
+
+    green, black = (119, 134, 118), (0, 0, 0)
+    samples = [green] * 30 + [black] * 9 + [(60, 67, 59)] * 4  # 회녹색 + 글자 획 + 번진 가장자리
+    assert without_text_ink(black, samples) == [green] * 30
+    assert sample_contrast(black, samples)[0] > 5 and best_sample_contrast(black, samples) > 5
+    # 배경 절반 이상이 정말 어두우면(사진의 어두운 부분 등) 빼지 않는다
+    half = [green] * 10 + [black] * 12
+    assert len(without_text_ink(black, half)) == len(half)

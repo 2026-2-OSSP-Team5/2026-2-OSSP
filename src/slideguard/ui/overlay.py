@@ -72,15 +72,19 @@ from slideguard.bootstrap import (
 )
 from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Finding
 from slideguard.domain.policy import (
+    CRITICAL_X_HEIGHT_DEG,
     AnalysisPolicy,
+    Audience,
     ContrastGoal,
     FixTargets,
     FontGoal,
     Purpose,
     Strength,
     ThresholdOverrides,
+    ViewingSetup,
 )
 from slideguard.planning.bindings import TeamBindings, is_recommended
+from slideguard.planning.same_place import same_place_sets
 from slideguard.ui.analysis_tasks import SplitProposalWorker, progress_text
 from slideguard.ui.finding_details import FindingDetailsDialog, TechnicalDetailsDialog, describe_finding
 from slideguard.ui.object_locks import ObjectLocksEditor
@@ -88,6 +92,15 @@ from slideguard.ui.preview import render_slide_previews
 from slideguard.ui.slide_lens import InputActivity, SlideLens, SlideView, SlideViewProbe, build_marks
 from slideguard.ui.user_text import change_text, friendly_error, friendly_reason, readability_label
 
+# 설정 창 '색약 맞춤' 목록: (저장 값, 보이는 이름). 저장 값은 domain/policy.py COLOR_VISION_KINDS의 키
+COLOR_VISION_CHOICES = (
+    ("none", "고려 안 함"),
+    ("red_green", "적록색약 (적색약 + 녹색약)"),
+    ("protan", "적색약 (1형, 빨강이 어둡게 보임)"),
+    ("deutan", "녹색약 (2형, 빨강·초록 구분 어려움)"),
+    ("tritan", "청색약 (3형, 파랑·노랑 구분 어려움)"),
+    ("all", "세 가지 모두"),
+)
 LOGGER = logging.getLogger("slideguard.overlay")
 
 OVERLAY_STYLE = """
@@ -898,6 +911,8 @@ class OverlayWidget(QWidget):
         self._report: AnalysisReport | None = None
         self._skip_reasons: dict[str, str] = {}
         self.proposal_items: dict[str, QListWidgetItem] = {}
+        # '같은 자리 일괄 적용' 체크 항목 → 그 항목이 함께 켜고 끄는 후보 id들 (planning/same_place.py)
+        self.batch_items: list[tuple[QListWidgetItem, tuple[str, ...]]] = []
         self._proposal_ids_by_severity: dict[str, set[str]] = {}
         self._syncing_proposals = False
         self._selection_snapshot: set[str] = set()
@@ -1109,6 +1124,7 @@ class OverlayWidget(QWidget):
         self.proposals_list.setUniformItemSizes(True)
         self.proposals_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.proposals_list.itemSelectionChanged.connect(self._proposal_selection_changed)
+        self.proposals_list.itemChanged.connect(self._proposal_item_changed)
         self.proposals_list.currentItemChanged.connect(self._show_proposal_explanation)
         proposal_body = QHBoxLayout()
         proposal_body.setSpacing(5)
@@ -1574,6 +1590,7 @@ class OverlayWidget(QWidget):
         self.proposals_list.blockSignals(True)
         self.proposals_list.clear()
         self.proposal_items.clear()
+        self.batch_items = []
         self._proposal_ids_by_severity.clear()
         findings = {item.id: item for item in report.findings}
         has_recommended = {_variant_target(item) for item in report.proposals if is_recommended(item.id)}
@@ -1599,9 +1616,73 @@ class OverlayWidget(QWidget):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
                 self.proposals_list.addItem(item)
                 self.proposal_items[proposal.id] = item
+            self._add_batch_items(report)
         finally:
             self.proposals_list.blockSignals(False)
         self._update_apply_button()
+
+    def _add_batch_items(self, report: AnalysisReport):
+        """같은 자리(쪽 번호·머리글 등) 같은 수정 후보마다 '일괄 적용' 체크 항목을 첫 후보 바로 위에 넣는다."""
+        by_id = {proposal.id: proposal for proposal in report.proposals}
+        for members in same_place_sets(report.deck, list(report.proposals)):
+            first = by_id[members[0]]
+            slides = sorted({_slide_number(by_id[member].shape_key) for member in members})
+            shown = ", ".join(str(number) for number in slides[:6]) + (" …" if len(slides) > 6 else "")
+            label = (
+                f"같은 자리 일괄 적용 · {len(members)}개 슬라이드 ({shown})\n{proposal_change_text(first)}"
+            )
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole + 1, members)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setToolTip(
+                "같은 자리에 있는 같은 개체(쪽 번호·머리글 등)에 같은 수정을 한 번에 적용합니다. 하나씩 적용할 수도 있습니다."
+            )
+            row = self.proposals_list.row(self.proposal_items[members[0]])
+            self.proposals_list.insertItem(row, item)
+            self.batch_items.append((item, members))
+
+    def _refresh_batch_items(self):
+        """개별 후보를 체크·해제하면 '일괄 적용' 항목도 맞춘다 (모두 체크됐을 때만 체크)."""
+        self.proposals_list.blockSignals(True)
+        try:
+            for item, members in self.batch_items:
+                every = all(self.proposal_items[member].isSelected() for member in members)
+                item.setCheckState(Qt.CheckState.Checked if every else Qt.CheckState.Unchecked)
+        finally:
+            self.proposals_list.blockSignals(False)
+
+    def _batch_toggled(self, item: QListWidgetItem, members: tuple[str, ...]):
+        """'일괄 적용' 체크: 같은 자리의 후보를 모두 체크·해제하고 열린 문서에도 바로 적용·해제."""
+        if self._syncing_proposals or self._report is None:
+            return
+        checked = item.checkState() == Qt.CheckState.Checked
+        by_id = {proposal.id: proposal for proposal in self._report.proposals}
+        released = []
+        self._syncing_proposals = True
+        try:
+            for member in members:
+                self.proposal_items[member].setSelected(checked)
+                if checked:
+                    for other in _counterparts(self._report, by_id[member]):
+                        if self.proposal_items[other.id].isSelected():
+                            released.append(other.id)
+                        self.proposal_items[other.id].setSelected(False)
+        finally:
+            self._syncing_proposals = False
+        self._refresh_batch_items()
+        self._update_apply_button()
+        self.proposals_list.viewport().update()
+        self.preview_state_changed.emit()
+        if released:
+            self.proposal_user_toggled.emit(tuple(released), False)
+        self.proposal_user_toggled.emit(tuple(members), checked)
+
+    def _proposal_item_changed(self, item: QListWidgetItem):
+        members = item.data(Qt.ItemDataRole.UserRole + 1)
+        if members:
+            self._batch_toggled(item, tuple(members))
 
     def _proposal_selection_changed(self):
         if self._syncing_proposals or self._report is None:
@@ -1648,6 +1729,7 @@ class OverlayWidget(QWidget):
                     self.proposal_items[other.id].setSelected(False)
         finally:
             self._syncing_proposals = False
+        self._refresh_batch_items()
         self._update_apply_button()
         self.proposals_list.viewport().update()
         self.preview_state_changed.emit()
@@ -1673,6 +1755,7 @@ class OverlayWidget(QWidget):
                     item.setSelected(checked)
         finally:
             self._syncing_proposals = False
+        self._refresh_batch_items()
         self._update_apply_button()
         self.proposals_list.viewport().update()
 
@@ -1710,6 +1793,7 @@ class OverlayWidget(QWidget):
                             self.proposal_items[other.id].setSelected(False)
         finally:
             self._syncing_proposals = False
+        self._refresh_batch_items()
         self._update_apply_button()
         self.preview_state_changed.emit()
 
@@ -1722,6 +1806,7 @@ class OverlayWidget(QWidget):
                 item.setSelected(proposal_id in chosen)
         finally:
             self.proposals_list.blockSignals(False)
+        self._refresh_batch_items()
         self._update_apply_button()
         self.preview_state_changed.emit()
         self.apply_requested.emit()
@@ -1733,6 +1818,7 @@ class OverlayWidget(QWidget):
                 item.setSelected(False)
         finally:
             self._syncing_proposals = False
+        self._refresh_batch_items()
         self._update_apply_button()
         self.preview_state_changed.emit()
 
@@ -1810,7 +1896,7 @@ class SettingsDialog(QDialog):
         self.path_provider = path_provider
         self.document: Path | None = None
         self.setWindowTitle("SlideGuard 설정")
-        self.resize(590, 490)
+        self.resize(620, 600)
         self.setStyleSheet(OVERLAY_STYLE)
         outer = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -1866,6 +1952,37 @@ class SettingsDialog(QDialog):
         self.purpose.addItem("강의용", Purpose.LECTURE.value)
         self.purpose.addItem("보고서용", Purpose.REPORT.value)
         policy_form.addRow("검사 목적", self.purpose)
+        # 청중 맞춤: 글자 크기·정보량 기준을 청중에 맞춰 조정
+        self.audience = QComboBox()
+        self.audience.addItem("일반 (대학생·직장인)", Audience.GENERAL.value)
+        self.audience.addItem("어린이 (초등학생)", Audience.CHILDREN.value)
+        self.audience.addItem("고령 청중", Audience.OLDER.value)
+        policy_form.addRow("청중", self.audience)
+        # 환경 맞춤: 화면 크기와 맨 뒷줄 거리를 넣으면 그 자리에서 보이는 크기로 최소 글자 크기를 계산
+        viewing_row = QHBoxLayout()
+        self.screen_inches_edit = QLineEdit(placeholderText="화면 대각선 인치 (예 100)")
+        self.distance_edit = QLineEdit(placeholderText="맨 뒷줄 거리 m (예 10)")
+        viewing_row.addWidget(self.screen_inches_edit)
+        viewing_row.addWidget(QLabel("인치"))
+        viewing_row.addWidget(self.distance_edit)
+        viewing_row.addWidget(QLabel("m"))
+        policy_form.addRow("발표 환경", viewing_row)
+        self.viewing_hint = QLabel(objectName="muted")
+        self.viewing_hint.setWordWrap(True)
+        policy_form.addRow("", self.viewing_hint)
+        self.screen_inches_edit.textChanged.connect(self._update_viewing_hint)
+        self.distance_edit.textChanged.connect(self._update_viewing_hint)
+        # 색약 맞춤: 색각 이상은 종류마다 헷갈리는 색이 달라서 종류를 고르게 한다 (기본은 '고려 안 함')
+        self.color_vision = QComboBox()
+        for key, label in COLOR_VISION_CHOICES:
+            self.color_vision.addItem(label, key)
+        policy_form.addRow("색약 맞춤", self.color_vision)
+        extra_checks = QHBoxLayout()
+        self.consistency_check = QCheckBox("슬라이드 간 일관성 검사")
+        self.image_text_check = QCheckBox("그림 속 글자 검사")
+        extra_checks.addWidget(self.consistency_check)
+        extra_checks.addWidget(self.image_text_check)
+        policy_form.addRow("추가 검사", extra_checks)
         self.strength = QComboBox()
         self.strength.addItem("약하게", Strength.LIGHT.value)
         self.strength.addItem("표준", Strength.STANDARD.value)
@@ -1931,6 +2048,7 @@ class SettingsDialog(QDialog):
             self.threshold_fields[key] = field
             threshold_form.addRow(label, field)
         self.purpose.currentIndexChanged.connect(self._update_threshold_placeholders)
+        self.audience.currentIndexChanged.connect(self._update_threshold_placeholders)
         self.recursive.toggled.connect(self.refresh_files)
 
         actions = QHBoxLayout()
@@ -1972,6 +2090,14 @@ class SettingsDialog(QDialog):
             "" if policy.fix.line_spacing is None else f"{policy.fix.line_spacing:g}"
         )
         self._update_contrast_goal()
+        self.audience.setCurrentIndex(self.audience.findData(policy.audience.value))
+        screen, distance = policy.viewing.screen_inches, policy.viewing.distance_m
+        self.screen_inches_edit.setText("" if screen is None else f"{screen:g}")
+        self.distance_edit.setText("" if distance is None else f"{distance:g}")
+        self.color_vision.setCurrentIndex(max(0, self.color_vision.findData(policy.color_vision)))
+        self.consistency_check.setChecked(policy.consistency)
+        self.image_text_check.setChecked(policy.image_text)
+        self._update_viewing_hint()
         self.slides_edit.setText(", ".join(map(str, policy.slides)))
         for key, checkbox in self.property_locks.items():
             checkbox.setChecked(key in policy.locked_properties)
@@ -1994,7 +2120,9 @@ class SettingsDialog(QDialog):
         self.refresh_files()
 
     def _update_threshold_placeholders(self):
-        policy = AnalysisPolicy(purpose=Purpose(self.purpose.currentData()))
+        policy = AnalysisPolicy(
+            purpose=Purpose(self.purpose.currentData()), audience=Audience(self.audience.currentData())
+        )
         defaults = (
             policy.font_limits.minimum_pt,
             policy.font_limits.recommended_pt,
@@ -2006,6 +2134,38 @@ class SettingsDialog(QDialog):
         )
         for editor, value in zip(self.threshold_fields.values(), defaults, strict=True):
             editor.setPlaceholderText(f"기본 {value:g}")
+
+    def _viewing(self) -> ViewingSetup:
+        """발표 환경 입력칸 → ViewingSetup. 둘 다 비우면 쓰지 않음."""
+        values = []
+        for editor, name in ((self.screen_inches_edit, "화면 크기"), (self.distance_edit, "거리")):
+            raw = editor.text().strip()
+            if not raw:
+                values.append(None)
+                continue
+            try:
+                values.append(float(raw))
+            except ValueError:
+                raise ValueError(f"발표 환경의 {name}를 숫자로 입력하세요.") from None
+        if (values[0] is None) != (values[1] is None):
+            raise ValueError("발표 환경은 화면 크기와 거리를 둘 다 입력하거나 둘 다 비워 두세요.")
+        return ViewingSetup(*values)
+
+    def _update_viewing_hint(self, *_args):
+        """입력한 환경에서 16:9 슬라이드의 최소 글자 크기를 바로 보여 준다."""
+        try:
+            viewing = self._viewing()
+        except ValueError as error:
+            self.viewing_hint.setText(str(error))
+            return
+        if not viewing.active:
+            self.viewing_hint.setText("비워 두면 화면 크기·거리를 따지지 않습니다.")
+            return
+        size = viewing.minimum_pt(960, 540, CRITICAL_X_HEIGHT_DEG)
+        self.viewing_hint.setText(
+            f"맨 뒷줄에서 읽히려면 16:9 슬라이드 기준 최소 약 {size:g}pt "
+            "(글자 높이가 0.2° 이상으로 보이는 크기, Legge & Bigelow 2011)"
+        )
 
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(self, "작업 폴더 선택", self.folder_edit.text())
@@ -2070,6 +2230,11 @@ class SettingsDialog(QDialog):
                 locked_shapes=shapes,
                 thresholds=ThresholdOverrides(**overrides),
                 fix=self._fix_targets(),
+                audience=Audience(self.audience.currentData()),
+                viewing=self._viewing(),
+                color_vision=self.color_vision.currentData() or "none",
+                consistency=self.consistency_check.isChecked(),
+                image_text=self.image_text_check.isChecked(),
             )
             build_workspace_settings_repository().save(
                 folder.resolve(), self.recursive.isChecked(), policy=policy, document=self.document
@@ -2215,7 +2380,7 @@ class OverlayController(QObject):
         self.overlay.geometry_changed.connect(self._sync_lens_exclusions)
         self.overlay.lens_toggled.connect(self.set_lens_enabled)
         self.overlay.proposal_user_toggled.connect(self._panel_proposal_toggled)
-        self.settings_dialog.settings_saved.connect(self.restart_collection)
+        self.settings_dialog.settings_saved.connect(self._settings_saved)
         self.detected.connect(self._on_detected)
         self.completed.connect(self._on_completed)
         self.collection_failed.connect(self._on_collection_failure)
@@ -2232,6 +2397,15 @@ class OverlayController(QObject):
         self.preview_timer.setInterval(300)
         self.preview_timer.timeout.connect(self._start_preview)
         self.restart_collection()
+
+    def _settings_saved(self):
+        """설정 저장 → 폴더 감시를 다시 시작하고, 지금 보고 있는 문서를 맨 먼저 다시 검사."""
+        self.restart_collection()
+        path = self.active_path
+        if self.collection is not None and path is not None and self._in_workspace(path):
+            # 수동 요청은 대기열 맨 앞으로 간다 (폴더의 다른 파일을 다 검사할 때까지 기다리지 않게).
+            # 같은 내용은 이미 읽어 둔 스냅샷을 다시 쓰므로 PowerPoint로 다시 열지 않고 판정만 새로 한다
+            self.request_path(path)
 
     def restart_collection(self):
         if self.collection is not None:
@@ -3494,12 +3668,16 @@ def _rule_name(rule_id: str) -> str:
             "layout.density": "정보량",
         }.get(rule_id, "배치")
     root = rule_id.partition(".")[0]
-    return {
+    names = {
         "contrast": "명암비",
         "typography": "글자 크기",
         "layout": "배치",
+        "color_vision": "색약",
+        "consistency": "일관성",
+        "image_text": "그림 속 글자",
         "readability": "읽기 편의",
-    }.get(root, rule_id)
+    }
+    return names.get(root, rule_id)
 
 
 def _severity(value: str) -> str:
@@ -3574,7 +3752,9 @@ def _variant_target(proposal: ChangeProposal) -> tuple:
     (한 상자에 회색이 두 가지면 두 후보를 함께 고를 수 있어야 함).
     """
     before = (
-        _normalized_value(proposal.before) if proposal.property in ("font.color", "font.family") else None
+        _normalized_value(proposal.before)
+        if proposal.property in ("font.color", "font.family", "font.bold")
+        else None
     )
     return (proposal.shape_key, proposal.property, before)
 
@@ -3637,6 +3817,8 @@ def _replaced_bundle(report: AnalysisReport, item: ChangeProposal, rec_targets: 
 
 
 def proposal_change_text(proposal: ChangeProposal) -> str:
+    if proposal.property == "font.bold":
+        return f"굵게 · {_value(proposal.before)} 글자"
     return change_text(proposal)
 
 
@@ -3645,6 +3827,7 @@ def _property_name(value: str) -> str:
         "font.size": "글자 크기",
         "font.color": "글자색",
         "font.family": "글꼴",
+        "font.bold": "굵게",
         "shape.height": "개체 높이",
         "shape.width": "개체 너비",
         "shape.position": "개체 위치",

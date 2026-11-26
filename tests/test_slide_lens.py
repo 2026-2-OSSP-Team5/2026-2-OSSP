@@ -85,6 +85,7 @@ def test_marks_offer_proposals_as_options_and_show_applied_ones(tmp_path):
     assert option.proposal_ids == ("font.size@1:2",) and option.checked
     assert option.label == "글자 크기 11pt → 14pt"
     assert marks["1:2"].kind == "change" and marks["1:2"].applied
+    assert "왜 바꾸나요? 글자 크기 11pt → 14pt" in marks["1:2"].message
     assert "크기 기준" in marks["1:2"].message
     assert "글자를 키우고" in marks["1:2"].message
     assert not marks["1:3"].options[0].checked and marks["1:3"].kind == "warning"
@@ -841,3 +842,89 @@ def test_unknown_cell_findings_join_the_table_badge():
     )
     report = AnalysisReport(DeckSnapshot("t.pptx", "0" * 64, 7, 960, 540), cells, ())
     assert sorted(mark.key for mark in build_marks(report, 7)) == ["7:5", "7:5:table_cell:1,2"]
+
+
+def test_new_rules_have_short_badge_text():
+    from slideguard.ui.slide_lens import metric_text, rule_title
+
+    cases = [
+        ("color_vision.contrast", 2.35, 3.0, ("2.4:1", "최소 3:1"), "색약 명암비"),
+        ("color_vision.color_only", 7.3, 15.0, ("구분 어려움", ""), "색만으로 강조"),
+        ("consistency.title_position", "100,72", "43,29", ("위치 다름", ""), "제목 위치"),
+        ("consistency.title_size", 24.0, 32.0, ("24pt", "다른 쪽 32pt"), "제목 크기"),
+        ("image_text.size", 11.2, 14.0, ("약 11.2pt", "최소 14pt"), "그림 속 글자"),
+    ]
+    for rule, measured, expected, text, title in cases:
+        finding = Finding(f"{rule}:1:2", rule, "1:2", "review", "", measured, expected, "")
+        assert metric_text(finding) == text and rule_title(finding) == title
+
+
+def test_panel_batch_checkbox_checks_every_same_place_fix(controller, application):
+    """상단 패널: '같은 자리 일괄 적용' 체크 하나로 여러 슬라이드 후보를 함께 체크하고, 개별 체크도 그대로."""
+    from slideguard.domain.models import Shape, TextRun
+
+    page = [
+        Shape(
+            n,
+            9,
+            "쪽 번호",
+            Box(880, 500, 60, 24),
+            text=str(n),
+            runs=(TextRun(str(n), 10.0),),
+            supported=True,
+            placeholder_type=13,
+        )
+        for n in (1, 2)
+    ]
+    findings = tuple(
+        _finding(f"typography:{n}:9:1", "typography", f"{n}:9", "warning", 10.0, 14.0) for n in (1, 2)
+    )
+    proposals = tuple(
+        ChangeProposal(f"font.size@{n}:9", f"typography:{n}:9:1", f"{n}:9", "font.size", 10.0, 14.0, 0.1)
+        for n in (1, 2)
+    )
+    path = controller.overlay._report.deck.source_path
+    report = AnalysisReport(DeckSnapshot(path, "abc", 2, 960, 540, shapes=tuple(page)), findings, proposals)
+    calls = []
+    controller.toggle_live_edit = lambda ids, checked: calls.append((tuple(ids), checked))
+    controller.overlay.show_report(report)
+    panel = controller.overlay
+    [(batch, members)] = panel.batch_items
+    assert members == ("font.size@1:9", "font.size@2:9") and "같은 자리 일괄 적용" in batch.text()
+    batch.setCheckState(Qt.CheckState.Checked)
+    assert set(panel.selected_proposal_ids()) == {"font.size@1:9", "font.size@2:9"}
+    assert calls[-1] == (members, True)
+    panel.proposal_items["font.size@2:9"].setSelected(False)  # 하나만 해제
+    assert batch.checkState() == Qt.CheckState.Unchecked
+    assert panel.selected_proposal_ids() == ("font.size@1:9",)
+    assert calls[-1] == (("font.size@2:9",), False)
+    batch.setCheckState(Qt.CheckState.Checked)
+    batch.setCheckState(Qt.CheckState.Unchecked)
+    assert panel.selected_proposal_ids() == ()
+    assert calls[-1] == (members, False)
+
+
+def test_change_badge_explains_why_the_colour_changes():
+    """글자색 수정을 고르면 배지 설명에 '명암비 전 → 후 (기준)'이 붙는다."""
+    from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, DeckSnapshot, Finding, Shape
+    from slideguard.ui.slide_lens import build_marks, change_reason
+
+    shape = Shape(1, 5, "쪽 번호", Box(800, 480, 100, 40), text="12/23", background=(0x80, 0x90, 0x80))
+    deck = DeckSnapshot("d.pptx", "0" * 64, 1, 960, 540, shapes=(shape,))
+    finding = Finding(
+        id="contrast:1:5",
+        rule_id="contrast",
+        shape_key="1:5",
+        severity="warning",
+        message="글자와 배경의 명암비가 낮습니다",
+        measured=1.4,
+        expected=4.5,
+        evidence="글자 #A0A8B0 / 배경 #809080",
+        box=shape.box,
+    )
+    proposal = ChangeProposal("prop@1:5", "contrast:1:5", "1:5", "font.color", "A0A8B0", "000000", 0.5)
+    report = AnalysisReport(deck, [finding], [proposal])
+    reason = change_reason(report, proposal)
+    assert "명암비" in reason and "→" in reason and "기준 4.5:1" in reason
+    [mark] = build_marks(report, 1, selected_ids={"prop@1:5"})
+    assert "왜 바꾸나요?" in mark.message

@@ -487,3 +487,53 @@ def test_density_ignores_blank_lines_chart_labels_and_footers():
     number = make_shape(text="02", shape_id=4)  # 쪽 왼쪽 위 번호 표시
     lines = make_shape(text="\n".join(["항목"] * 3), shape_id=5)
     assert only(run_rule(body, axis, page, number, lines), "layout.density") == []  # 2 + 3 = 5줄
+
+
+def test_header_and_page_number_repeated_on_every_slide_do_not_count_as_content():
+    """여러 쪽 같은 자리의 머리글·쪽 번호는 읽을 내용이 아니므로 정보 밀도에서 뺀다 (함정 PPT 2)."""
+    shapes = []
+    for slide in (1, 2):
+        shapes.append(
+            replace(
+                make_shape(x=60, y=120, w=800, h=300, text="\n".join(["항목"] * 6), shape_id=2),
+                slide_number=slide,
+            )
+        )
+        shapes.append(
+            replace(
+                make_shape(x=640, y=8, w=300, h=24, text="셔틀 2차 개편안", shape_id=4), slide_number=slide
+            )
+        )
+        shapes.append(
+            replace(make_shape(x=880, y=500, w=60, h=24, text=f"{slide} / 2", shape_id=5), slide_number=slide)
+        )
+    deck = DeckSnapshot("d.pptx", "0" * 64, 2, 960, 540, shapes=tuple(shapes))
+    assert [f for f in LayoutRule().evaluate(deck, AnalysisPolicy()) if f.rule_id == "layout.density"] == []
+
+
+def test_outline_only_card_in_front_of_text_does_not_hide_it():
+    """채우기 없는 둥근 테두리 카드가 글상자 앞에 있어도, 글자가 테두리 안쪽이면 가림이 아님 (자바게티 20쪽)."""
+    from slideguard.checks.layout import LayoutRule
+    from slideguard.domain.models import Box, DeckSnapshot, Shape, TextRun
+    from slideguard.domain.policy import AnalysisPolicy
+
+    text = Shape(
+        1,
+        3,
+        "TextBox 3",
+        Box(96, 211, 322, 123),
+        text="아파요(훼손)\\n등록 활성화",
+        runs=(TextRun("아파요(훼손) 등록 활성화", 32.0),),
+        supported=True,
+        z_order=3,
+        rendered_box=Box(103, 215, 195, 77),
+    )
+    card = Shape(
+        1, 5, "모서리가 둥근 직사각형 4", Box(82, 177, 348, 438), z_order=4, properties=(("no_fill", True),)
+    )
+    deck = DeckSnapshot("d.pptx", "0" * 64, 1, 1440, 810, shapes=(text, card))
+    overlaps = [f for f in LayoutRule().evaluate(deck, AnalysisPolicy()) if f.rule_id == "layout.overlap"]
+    assert overlaps == []
+    filled = Shape(1, 5, "가리는 도형", Box(82, 177, 348, 438), z_order=4)  # 채우기 모름 → 그대로 검토
+    deck = DeckSnapshot("d.pptx", "0" * 64, 1, 1440, 810, shapes=(text, filled))
+    assert [f for f in LayoutRule().evaluate(deck, AnalysisPolicy()) if f.rule_id == "layout.overlap"]

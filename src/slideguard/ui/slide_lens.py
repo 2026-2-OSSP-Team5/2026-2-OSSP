@@ -28,6 +28,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetricsF, QGuiApplication, QPainte
 from PySide6.QtWidgets import QApplication, QWidget
 
 from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Finding
+from slideguard.planning.same_place import same_place_sets
 from slideguard.ui.finding_details import describe_finding
 from slideguard.ui.user_text import friendly_reason, readability_label
 
@@ -38,6 +39,8 @@ SEVERITY_ORDER = {"warning": 0, "review": 1, "unknown": 2}
 RULE_ORDER = (
     "layout.overflow",
     "contrast",
+    "color_vision",
+    "image_text",
     "typography",
     "layout.density",
     "layout.overlap",
@@ -58,7 +61,7 @@ def finding_rank(finding: Finding) -> tuple[int, int, int]:
 
 
 # 상자의 글 자체를 읽기 어렵게 하는 판정
-READING_RULES = ("layout.overflow", "contrast", "typography", "layout.overlap")
+READING_RULES = ("layout.overflow", "contrast", "color_vision", "image_text", "typography", "layout.overlap")
 
 
 def _rule_group(finding: Finding) -> str:
@@ -97,11 +100,18 @@ RULE_TITLES = {
     "layout.overlap": "겹침",
     "layout.margin": "여백",
     "layout.density": "정보 밀도",
+    "color_vision.contrast": "색약 명암비",
+    "color_vision.color_only": "색만으로 강조",
+    "consistency.title_position": "제목 위치",
+    "consistency.title_size": "제목 크기",
+    "consistency.body_size": "본문 크기",
+    "image_text": "그림 속 글자",
 }
 PROPERTY_TITLES = {
     "font.size": "글자 크기",
     "font.color": "글자색",
     "font.family": "글꼴",
+    "font.bold": "굵게",
     "shape.height": "개체 높이",
     "shape.width": "개체 너비",
     "shape.position": "개체 위치",
@@ -188,6 +198,8 @@ def build_marks(
     selected = {str(item) for item in selected_ids}
     applied = {str(item) for item in applied_ids}
 
+    # 같은 자리 일괄 묶음은 슬라이드마다 한 번만 계산 (배지마다 다시 계산하면 큰 문서에서 화면이 멈춤)
+    batch_sets = same_place_sets(report.deck, list(report.proposals)) if proposals else []
     marks = []
     for key in sorted(set(findings) | set(proposals), key=_key_order):
         items = sorted(findings.get(key, []), key=finding_rank)
@@ -200,7 +212,7 @@ def build_marks(
             box = next((located for item in items if (located := locate(report, item)) is not None), None)
         if box is None:
             box = _shape_box(report, key)
-        options = _options(report, proposals.get(key, []), applied)
+        options = _options(report, proposals.get(key, []), applied, batch_sets)
         reasons = dict.fromkeys(skip_reasons[item.id] for item in items if item.id in skip_reasons)
         unavailable_reason = (
             "\n".join(dict.fromkeys(friendly_reason(reason) for reason in reasons)) if not options else ""
@@ -215,12 +227,29 @@ def build_marks(
                 else "슬라이드 분할은 상단 패널에서 정보 밀도 항목을 선택한 뒤 ‘수정안 만들기’를 눌러 확인하세요."
             )
         active = [item for item in proposals.get(key, []) if item.id in applied or item.id in selected]
-        explanation = describe_finding(items[0]) if items else None
-        message = f"{explanation.summary}\n{explanation.guidance}" if explanation else ""
-        if explanation and items[0].rule_id == "layout.density":
+        texts = []
+        for item in items:
+            explanation = describe_finding(item)
+            summary = (
+                item.message
+                if item.rule_id.startswith(("color_vision", "consistency", "image_text"))
+                else explanation.summary
+            )
+            texts.append(f"{summary}\n{explanation.guidance}")
+        texts = list(dict.fromkeys(texts))
+        message = "\n".join(texts[:4])
+        if len(texts) > 4:
+            message += f"\n• 그 밖에 {len(texts) - 4}개"
+        if items and items[0].rule_id == "layout.density":
             value, target = metric_text(items[0])
             message = f"{value} · {target}\n{message}"
         if active:
+            # 바꾸는 이유: '명암비 2.1:1 → 4.6:1 (기준 4.5:1)'처럼 수정 전후 수치를 판정 설명 뒤에 붙임
+            reason = change_reason(
+                report, sorted(active, key=lambda item: item.property == "shape.position")[0]
+            )
+            if reason:
+                message = f"{message}\n왜 바꾸나요? {reason}" if message else f"왜 바꾸나요? {reason}"
             # 위치 이동은 뒤로 (배지에는 글자 크기·상자 높이처럼 주된 변경을 보여 줌)
             active.sort(key=lambda item: item.property == "shape.position")
             first = active[0]
@@ -268,7 +297,10 @@ def build_marks(
 
 
 def _options(
-    report: AnalysisReport, proposals: list[ChangeProposal], applied: set[str]
+    report: AnalysisReport,
+    proposals: list[ChangeProposal],
+    applied: set[str],
+    batch_sets: list[tuple[str, ...]] | None = None,
 ) -> tuple[LensOption, ...]:
     """한 개체의 수정 후보를 체크 항목으로. 같은 묶음(id의 #뒤)은 함께 켜고 끈다."""
     groups: dict[str, list[ChangeProposal]] = {}
@@ -285,6 +317,20 @@ def _options(
         label = _option_label(members, own)
         ids = tuple(item.id for item in members)
         options.append(LensOption(group, ids, label, checked=all(item in applied for item in ids)))
+    # 같은 자리(쪽 번호·머리글 등) 같은 수정: 다른 슬라이드까지 한 번에 켜고 끄는 '일괄 적용' 항목
+    own_ids = {item.id for item in proposals}
+    by_id = {item.id: item for item in report.proposals}
+    if batch_sets is None:
+        batch_sets = same_place_sets(report.deck, list(report.proposals))
+    for members in batch_sets:
+        mine = [member for member in members if member in own_ids]
+        if not mine:
+            continue
+        label = f"[같은 자리 {len(members)}쪽 일괄] {_change_text(by_id[mine[0]])}"
+        if "~rec" in str(mine[0]).split("#", 1)[0]:
+            label = f"[권장] {label}"
+        checked = all(member in applied for member in members)
+        options.append(LensOption(f"same:{members[0]}", tuple(members), label, checked=checked))
     return tuple(options)
 
 
@@ -304,8 +350,61 @@ def _option_label(members: list[ChangeProposal], own_keys: set[str]) -> str:
     return label
 
 
+def change_reason(report: AnalysisReport, proposal: ChangeProposal) -> str:
+    """수정 후보를 왜 고르는지 한 줄 설명 (수정 전 → 후 수치와 기준).
+
+    글자색: 배경과의 명암비가 기준(WCAG 1.4.3: 보통 글자 4.5:1, 큰 글자 3:1)보다 낮아서 바꾼다.
+            색약 판정이면 그 색약 눈으로 본 명암비로 보여 준다 (Machado 2009 시뮬레이션).
+    글자 크기: 최소 크기보다 작아서 키운다.
+    그 밖에는 판정 근거(evidence)를 그대로 보여 준다.
+    """
+    from slideguard.checks.color_vision import CVD_LABELS, worst_cvd_contrast
+    from slideguard.checks.contrast import contrast_ratio
+
+    finding = next((item for item in report.findings if item.id == proposal.finding_id), None)
+    if finding is None:
+        return ""
+    expected = finding.expected
+    if proposal.property == "font.color" and _is_hex(proposal.before) and _is_hex(proposal.after):
+        shape = next((item for item in report.deck.shapes if item.key == proposal.shape_key), None)
+        background = getattr(shape, "background", None)
+        if background is not None and _is_number(expected):
+            before, after = _rgb(proposal.before), _rgb(proposal.after)
+            # 판정 설명에 색약 종류가 적혀 있으면 그 눈으로 본 명암비
+            kinds = tuple(kind for kind, label in CVD_LABELS.items() if label in finding.message)
+            if finding.rule_id.startswith("color_vision") and kinds:
+                old = worst_cvd_contrast(before, background, kinds)[0]
+                new = worst_cvd_contrast(after, background, kinds)[0]
+                eye = f"{CVD_LABELS[kinds[0]]} 눈으로 본 "
+                # 색약 수정은 기준선만 겨우 넘기지 않고 보통 글자 기준 4.5:1까지 올림 (Okabe & Ito CUD)
+                goal = f"기준 {float(expected):g}:1, 색약은 여유 있게 4.5:1 목표"
+            else:
+                old, new, eye = contrast_ratio(before, background), contrast_ratio(after, background), ""
+                goal = f"기준 {float(expected):g}:1 이상이어야 읽기 쉬움"
+            return f"글자와 배경(#{_hex6(background)})의 {eye}명암비가 {old:.1f}:1 → {new:.1f}:1 ({goal}, WCAG 1.4.3)"
+        return finding.evidence or ""
+    if proposal.property == "font.size" and _is_number(proposal.after) and _is_number(expected):
+        return f"글자 크기 {_short(proposal.before, 'font.size')} → {_short(proposal.after, 'font.size')} (최소 {float(expected):g}pt)"
+    return finding.evidence or ""
+
+
+def _is_hex(value) -> bool:
+    return isinstance(value, str) and len(value.lstrip("#")) == 6
+
+
+def _rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def _hex6(color) -> str:
+    return "{:02X}{:02X}{:02X}".format(*color)
+
+
 def _change_text(item: ChangeProposal) -> str:
     title = PROPERTY_TITLES.get(item.property, item.property)
+    if item.property == "font.bold":
+        return f"{_short(item.before, 'font.color')} 글자 굵게"  # before = 그 글자의 색
     if item.property == "shape.position" and _is_point(item.before) and _is_point(item.after):
         return f"{title} {_move_text(item.before, item.after)}"
     return f"{title} {_short(item.before, item.property)} → {_short(item.after, item.property)}"
@@ -365,9 +464,23 @@ def metric_text(finding: Finding) -> tuple[str, str]:
     if rule == "layout.margin":
         if number and measured < 0:
             return "슬라이드 밖", ""
-        return (f"{measured:g}pt" if number else "가장자리"), (f"여백 {expected:g}pt 이상" if limit else "")
+        # 메시지 끝의 '(왼쪽)' 같은 방향을 붙여 어느 가장자리인지 보이게 (예: "왼쪽 55.2pt · 72pt 이상")
+        side = finding.message.rsplit("(", 1)[-1].rstrip(")") if finding.message.endswith(")") else ""
+        side = side if side in ("왼쪽", "오른쪽", "위", "아래") else ""
+        value = f"{side} {measured:g}pt".strip() if number else "가장자리"
+        return value, (f"여백 {expected:g}pt 이상" if limit else "")
     if rule == "layout.overlap":
         return "겹침", ""
+    if rule.startswith("color_vision.contrast") and number:
+        return f"{measured:.1f}:1", f"최소 {expected:g}:1" if limit else ""
+    if rule == "color_vision.color_only":
+        return "구분 어려움", ""
+    if rule == "consistency.title_position":
+        return "위치 다름", ""
+    if rule.startswith("consistency.") and number:
+        return f"{measured:g}pt", f"다른 쪽 {expected:g}pt" if limit else ""
+    if rule.startswith("image_text") and number:
+        return f"약 {measured:g}pt", f"최소 {expected:g}pt" if limit else ""
     if rule == "layout.density" and number:
         unit = "자" if finding.id.endswith(":chars") else "줄"
         # 슬라이드 전체 값임을 밝힌다 (이 상자 하나가 14줄인 것으로 오해하지 않게)

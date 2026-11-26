@@ -5,7 +5,13 @@ from collections import defaultdict
 from itertools import combinations
 
 from slideguard.domain.models import Box, DeckSnapshot, Finding, Severity, Shape
-from slideguard.domain.policy import GEOMETRY_TOLERANCE_PT, AnalysisPolicy, DensityThreshold
+from slideguard.domain.policy import (
+    BODY_PLACEHOLDERS,
+    GEOMETRY_TOLERANCE_PT,
+    TITLE_PLACEHOLDERS,
+    AnalysisPolicy,
+    DensityThreshold,
+)
 
 from .scope import target_shapes
 
@@ -33,11 +39,13 @@ class LayoutRule:
         by_slide: dict[int, list[Shape]] = defaultdict(list)
         for shape in shapes:
             by_slide[shape.slide_number].append(shape)
+        repeated = _repeated_on_slides(deck)
         for slide_number in sorted(by_slide):
             slide_shapes = sorted(by_slide[slide_number], key=lambda s: s.shape_id)
             findings.extend(_check_overlap(slide_shapes))
             findings.extend(_check_card_off_slide(deck, slide_shapes))
-            findings.extend(_check_density(slide_number, slide_shapes, policy.density_limits, deck.height_pt))
+            content = [shape for shape in slide_shapes if shape.key not in repeated]
+            findings.extend(_check_density(slide_number, content, policy.density_limits, deck.height_pt))
         return findings
 
 
@@ -300,6 +308,26 @@ def _owns_content(container: Shape, content: Shape) -> bool:
     )
 
 
+# 테두리 선이 그려지는 띠의 두께로 보는 값 (pt). 글자 줄이 테두리에서 이만큼 안쪽이면 선과 안 닿음
+OUTLINE_BAND_PT = 3.0
+
+
+def _outline_only(shape: Shape) -> bool:
+    """채우기가 없는 도형(테두리만 그려짐)인지 (reader가 확인한 경우만)."""
+    return ("no_fill", True) in shape.properties
+
+
+def _inside_outline(ink: list[Box], outline: Box) -> bool:
+    """글자 줄이 모두 테두리 선 안쪽(선 두께만큼 띄운 영역)에 있는지."""
+    inner = Box(
+        outline.x + OUTLINE_BAND_PT,
+        outline.y + OUTLINE_BAND_PT,
+        outline.width - 2 * OUTLINE_BAND_PT,
+        outline.height - 2 * OUTLINE_BAND_PT,
+    )
+    return inner.width > 0 and inner.height > 0 and all(_contains(inner, box) for box in ink)
+
+
 def _check_overlap(shapes: list[Shape]) -> list[Finding]:
     findings: list[Finding] = []
     for shape in shapes:
@@ -326,6 +354,14 @@ def _check_overlap(shapes: list[Shape]) -> list[Finding]:
             continue
         if not _has_text(other) and _behind(other, anchor) is True:
             # 글자 뒤에 깔린 도형(말풍선·카드·사진 등)은 배경이다. 글씨가 잘 보이는지는 명암비 검사가 본다.
+            continue
+        if (
+            not _has_text(other)
+            and _outline_only(other)
+            and _inside_outline(_ink_boxes(anchor, anchor_box), other_box)
+        ):
+            # 채우기 없는 테두리 카드가 글자 '앞'에 있어도 글자는 테두리 안쪽에 있으면 가려지지 않는다
+            # (자바게티 20쪽: 모서리가 둥근 카드 테두리 안의 '아파요(훼손) 등록 활성화')
             continue
 
         severity: Severity = "review"
@@ -417,6 +453,35 @@ def _density_severity(count: int, limit: int) -> Severity:
     return "warning" if count >= limit * DENSITY_WARNING_FACTOR else "review"
 
 
+def _repeated_on_slides(deck: DeckSnapshot, tolerance: float = 1.0) -> set[str]:
+    """여러 슬라이드의 같은 자리에 반복되는 작은 글상자(머리글·쪽 번호 등) — 정보 밀도에서 뺀다.
+
+    같은 자리 = 다른 슬라이드에 좌표(왼쪽·위·너비·높이)가 1pt 이내로 같은 글상자가 있고, 두 줄 이하.
+    본문 자리 표시자는 쪽마다 같은 자리라도 내용이므로 빼지 않는다.
+    """
+    candidates = [
+        shape
+        for shape in deck.shapes
+        if shape.box is not None
+        and _has_text(shape)
+        and shape.placeholder_type not in BODY_PLACEHOLDERS
+        and shape.placeholder_type not in TITLE_PLACEHOLDERS
+        and len([line for line in _text_of(shape).splitlines() if _visible(line)]) <= 2
+    ]
+    repeated = set()
+    for index, first in enumerate(candidates):
+        for second in candidates[index + 1 :]:
+            if first.slide_number == second.slide_number:
+                continue
+            a, b = first.box, second.box
+            if all(
+                abs(x - y) <= tolerance
+                for x, y in ((a.x, b.x), (a.y, b.y), (a.width, b.width), (a.height, b.height))
+            ):
+                repeated.update((first.key, second.key))
+    return repeated
+
+
 def _check_density(
     slide_number: int, shapes: list[Shape], limits: DensityThreshold, slide_height: float | None = None
 ) -> list[Finding]:
@@ -449,7 +514,7 @@ def _check_density(
                 f"{slide_number}:chars",
                 heaviest,
                 _density_severity(total_chars, limits.max_chars),
-                f"슬라이드의 글자 수가 많습니다 ({total_chars}자)",
+                f"슬라이드 전체 글자 수가 많습니다 ({total_chars}자, 글상자 {len(text_shapes)}개 합계)",
                 total_chars,
                 limits.max_chars,
                 f"슬라이드 {slide_number}: 공백 제외 {total_chars}자 > 기준 {limits.max_chars}자 "
@@ -464,7 +529,7 @@ def _check_density(
                 f"{slide_number}:lines",
                 heaviest,
                 _density_severity(total_lines, limits.max_lines),
-                f"슬라이드의 줄(항목) 수가 많습니다 ({total_lines}줄)",
+                f"슬라이드 전체 줄(항목) 수가 많습니다 ({total_lines}줄, 글상자 {len(text_shapes)}개 합계)",
                 total_lines,
                 limits.max_lines,
                 f"슬라이드 {slide_number}: {total_lines}줄 > 기준 {limits.max_lines}줄 "
