@@ -183,6 +183,17 @@ class FindingComparison:
     indeterminate: int = 0
 
 
+@dataclass(frozen=True)
+class ElementGroup:
+    """User-reviewable instances of one element across saved slides."""
+
+    id: str
+    title: str
+    members: tuple[str, ...]
+    excluded: tuple[str, ...] = ()
+    manual: bool = False
+
+
 @dataclass
 class AnalysisReport:
     deck: DeckSnapshot
@@ -194,6 +205,7 @@ class AnalysisReport:
     policy_key: str | None = None
     comparison: FindingComparison | None = None
     proposal_notes: dict[str, str] = field(default_factory=dict)
+    element_groups: list[ElementGroup] = field(default_factory=list)
 
     def compare_with(self, before: "AnalysisReport") -> None:
         rank = {"review": 1, "warning": 2, "unknown": None}

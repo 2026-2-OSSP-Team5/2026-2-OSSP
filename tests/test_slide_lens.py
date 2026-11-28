@@ -502,7 +502,7 @@ def test_badges_identify_candidates_before_hovering(application, tmp_path):
     from slideguard.ui.slide_lens import _label
 
     marks = {m.key: m for m in build_marks(_report(tmp_path / "d.pptx"), 1)}
-    assert "수정안 1개" in _label(marks["1:2"])
+    assert "최소 1 / 권장 0" in _label(marks["1:2"])
     assert "수정안" not in _label(marks["1:4"])
 
 
@@ -890,7 +890,8 @@ def test_panel_batch_checkbox_checks_every_same_place_fix(controller, applicatio
     controller.overlay.show_report(report)
     panel = controller.overlay
     [(batch, members)] = panel.batch_items
-    assert members == ("font.size@1:9", "font.size@2:9") and "같은 자리 일괄 적용" in batch.text()
+    assert members == ("font.size@1:9", "font.size@2:9") and "쪽 번호 · 그룹 2쪽" in batch.text()
+    assert all(item.isHidden() for item in panel.proposal_items.values())
     batch.setCheckState(Qt.CheckState.Checked)
     assert set(panel.selected_proposal_ids()) == {"font.size@1:9", "font.size@2:9"}
     assert calls[-1] == (members, True)

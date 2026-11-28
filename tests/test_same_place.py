@@ -65,7 +65,8 @@ def test_lens_card_offers_individual_and_batch_options():
     report = AnalysisReport(deck, findings, tuple(proposals))
     [mark] = build_marks(report, 2)
     labels = [option.label for option in mark.options]
-    assert labels[0].startswith("글자 크기") and labels[1].startswith("[같은 자리 3쪽 일괄]")
+    assert labels[0].startswith("글자 크기") and "3쪽" in labels[1]
+    assert [option.scope for option in mark.options] == ["local", "group"]
     assert mark.options[1].proposal_ids == ("font.size@1:9", "font.size@2:9", "font.size@3:9")
 
 

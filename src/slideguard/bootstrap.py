@@ -72,6 +72,12 @@ def build_report_repository() -> SqliteReportRepository:
     return SqliteReportRepository(report_database_path())
 
 
+def build_element_group_repository():
+    from slideguard.adapters.storage.element_groups import SqliteElementGroupRepository
+
+    return SqliteElementGroupRepository(report_database_path())
+
+
 def build_workspace_settings_repository() -> SqliteWorkspaceSettingsRepository:
     return SqliteWorkspaceSettingsRepository(report_database_path())
 

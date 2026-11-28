@@ -28,7 +28,39 @@ try {
     if (-not (Test-Path -LiteralPath $executable)) { throw 'The build did not produce SlideGuard.exe.' }
 
     $zipPath = "$releasePath/$releaseName.zip"
-    Compress-Archive -Path "$releasePath/SlideGuard" -DestinationPath $zipPath
+    $sourcePath = (Resolve-Path -LiteralPath "$releasePath/SlideGuard").Path
+    $archivePath = [System.IO.Path]::GetFullPath($zipPath)
+    $temporaryArchive = "$archivePath.partial"
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    try {
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            try {
+                # ZipFile allows concurrent readers, including running applications.
+                [System.IO.Compression.ZipFile]::CreateFromDirectory(
+                    $sourcePath,
+                    $temporaryArchive,
+                    [System.IO.Compression.CompressionLevel]::Optimal,
+                    $true
+                )
+                Move-Item -LiteralPath $temporaryArchive -Destination $archivePath
+                break
+            } catch {
+                if (Test-Path -LiteralPath $temporaryArchive) {
+                    Remove-Item -LiteralPath $temporaryArchive -Force
+                }
+                $cause = $_.Exception.GetBaseException()
+                $canRetry = $cause -is [System.IO.IOException] -or
+                    $cause -is [System.UnauthorizedAccessException]
+                if (-not $canRetry -or $attempt -eq 6) { throw }
+                Write-Warning "ZIP creation encountered a file access error. Retrying ($attempt/6)..."
+                Start-Sleep -Seconds 2
+            }
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporaryArchive) {
+            Remove-Item -LiteralPath $temporaryArchive -Force
+        }
+    }
     Write-Output "EXE: $((Resolve-Path -LiteralPath $executable).Path)"
     Write-Output "ZIP: $((Resolve-Path -LiteralPath $zipPath).Path)"
 } finally {

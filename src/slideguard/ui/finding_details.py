@@ -54,6 +54,13 @@ def describe_finding(finding):
     rule, message = finding.rule_id, finding.message
     current, target = finding.measured, finding.expected
     unknown = finding.severity == "unknown"
+    if rule == "group.alignment":
+        return FindingExplanation(
+            "그룹 요소의 위치를 맞출 수 있습니다",
+            message,
+            (),
+            "최소 수정의 그룹 전체 탭에서 확인한 뒤 적용하세요.",
+        )
     hierarchy = rule.startswith("typography.hierarchy") or finding.id.endswith(":hierarchy")
     if unknown:
         if rule == "contrast":
