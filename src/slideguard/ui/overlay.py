@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import re
+import sqlite3
 import sys
 from dataclasses import dataclass, field
 from html import escape
@@ -64,6 +65,7 @@ from slideguard.bootstrap import (
     PolicyAnalysisHashes,
     build_analysis_policy,
     build_analyzer,
+    build_element_group_repository,
     build_powerpoint_reader,
     build_presentation_patcher,
     build_report_repository,
@@ -84,8 +86,17 @@ from slideguard.domain.policy import (
     ViewingSetup,
 )
 from slideguard.planning.bindings import TeamBindings, is_recommended
-from slideguard.planning.same_place import same_place_sets
+from slideguard.planning.element_groups import (
+    align_group,
+    detect_groups,
+    edit_group,
+    ensure_groups,
+    group_problem_text,
+    grouped_findings,
+    proposal_options,
+)
 from slideguard.ui.analysis_tasks import SplitProposalWorker, progress_text
+from slideguard.ui.element_groups import ElementGroupsDialog
 from slideguard.ui.finding_details import FindingDetailsDialog, TechnicalDetailsDialog, describe_finding
 from slideguard.ui.object_locks import ObjectLocksEditor
 from slideguard.ui.preview import render_slide_previews
@@ -896,6 +907,8 @@ class OverlayWidget(QWidget):
     lens_toggled = Signal(bool)
     # 수정 후보 목록에서 사용자가 직접 체크/해제함: (같은 묶음 후보 ID들, 체크 여부)
     proposal_user_toggled = Signal(object, bool)
+    groups_requested = Signal()
+    group_selected_requested = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -1093,14 +1106,21 @@ class OverlayWidget(QWidget):
         self.proposal_details_link = QLabel('<a href="details" style="color:#1756b2">제안 설명</a>')
         self.proposal_details_link.linkActivated.connect(self._show_proposal_details)
         proposal_header.addWidget(self.proposal_details_link)
-        self.select_warning_button = QPushButton("문제 발견 선택", objectName="proposalSelection")
+        self.proposal_variant = QComboBox()
+        self.proposal_variant.addItem("최소 수정", "minimum")
+        self.proposal_variant.addItem("권장 수정", "recommended")
+        self.proposal_variant.currentIndexChanged.connect(self._filter_proposals)
+        proposal_header.addWidget(self.proposal_variant)
+        self.groups_button = QPushButton("같은 요소 관리")
+        self.groups_button.clicked.connect(self.groups_requested)
+        self.select_warning_button = QPushButton("문제 선택", objectName="proposalSelection")
         self.select_warning_button.setCheckable(True)
         self.select_warning_button.setToolTip(
             "문제 발견 항목의 최소 수정안을 선택합니다. 다시 누르면 해제합니다."
         )
         self.select_warning_button.clicked.connect(lambda: self.select_severity("warning"))
         proposal_header.addWidget(self.select_warning_button)
-        self.select_review_button = QPushButton("검토 필요 선택", objectName="proposalSelection")
+        self.select_review_button = QPushButton("검토 선택", objectName="proposalSelection")
         self.select_review_button.setCheckable(True)
         self.select_review_button.setToolTip(
             "검토 필요 항목의 최소 수정안을 선택합니다. 다시 누르면 해제합니다."
@@ -1137,6 +1157,7 @@ class OverlayWidget(QWidget):
         self.proposal_text.hide()
         direct_actions = QVBoxLayout()
         direct_actions.setSpacing(3)
+        direct_actions.addWidget(self.groups_button)
         self.apply_button = QPushButton("선택 적용", objectName="primary")
         self.apply_button.setToolTip("선택한 수정 제안을 새 PPTX 사본에 저장합니다.")
         self.apply_button.setEnabled(False)
@@ -1457,6 +1478,8 @@ class OverlayWidget(QWidget):
         self.findings_table.setRowCount(0)
         self.proposals_list.clear()
         self.proposal_items.clear()
+        self.batch_items = []
+        self._grouped_proposal_ids = set()
         self._proposal_ids_by_severity.clear()
         self.status_label.setText("대기 중")
         self.detail_title.setText("검사 결과를 선택하세요")
@@ -1468,6 +1491,7 @@ class OverlayWidget(QWidget):
         self.preview_state_changed.emit()
 
     def show_report(self, report: AnalysisReport, skip_reasons: dict[str, str] | None = None):
+        ensure_groups(report)
         self._report = report
         self._finding = None
         self.preview_tabs.setCurrentIndex(1)
@@ -1475,26 +1499,32 @@ class OverlayWidget(QWidget):
         self._report_stale = False
         self.set_analysis_busy(False)
         count = len(report.findings)
-        self.status_label.setText(f"검사 완료 · {count}건")
+        rows = grouped_findings(report)
+        self.status_label.setText(f"검사 완료 · {count}건 · {len(rows)}개 항목")
         self.manual_button.setEnabled(True)
         proposal_count = len(report.proposals)
         self.count_badge.setText(str(proposal_count) if proposal_count else "")
         self.count_badge.setVisible(self.collapsed and proposal_count > 0)
         self._apply_geometry()
         with QSignalBlocker(self.findings_table):
-            self.findings_table.setRowCount(count)
-            for row, finding in enumerate(report.findings):
+            self.findings_table.setRowCount(len(rows))
+            for row, (finding, group, issues) in enumerate(rows):
                 values = [
-                    finding.shape_key.partition(":")[0],
-                    _rule_name(finding.rule_id),
+                    f"그룹 {len(group.members)}쪽" if group else finding.shape_key.partition(":")[0],
+                    group.title if group else _rule_name(finding.rule_id),
                     _severity(finding.severity),
                 ]
                 for column, value in enumerate(values):
                     item = QTableWidgetItem(value)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    item.setToolTip(value)
+                    item.setToolTip(
+                        "\n".join(f"{f.shape_key.split(':')[0]}쪽 · {f.message}" for f in issues)
+                        if group
+                        else value
+                    )
                     if column == 0:
                         item.setData(Qt.ItemDataRole.UserRole, finding)
+                        item.setData(Qt.ItemDataRole.UserRole + 1, group.id if group else "")
                     self.findings_table.setItem(row, column, item)
             if count:
                 self.findings_table.selectRow(0)
@@ -1526,6 +1556,17 @@ class OverlayWidget(QWidget):
         self.detail_title.setText(f"{slide} 슬라이드 · {explanation.title}")
         self.detail_title.setToolTip(self.detail_title.text())
         self.detail_evidence.setText(explanation.html(compact=True))
+        group_id = item.data(Qt.ItemDataRole.UserRole + 1)
+        group = next((g for g in self._report.element_groups if g.id == group_id), None)
+        if group:
+            self.detail_title.setText(f"{group.title} · {len(group.members)}쪽 그룹")
+            counts = " · ".join(
+                f"{_rule_name(rule)} {count}건"
+                for rule, count in group_problem_text(self._report, group).items()
+            )
+            self.detail_evidence.setText(
+                escape(counts) + '<br><a href="element-group">그룹 전체·슬라이드별 문제와 구성원 보기</a>'
+            )
         self.detail_scroll.verticalScrollBar().setValue(0)
         matching = [
             item
@@ -1567,6 +1608,9 @@ class OverlayWidget(QWidget):
         self.preview_state_changed.emit()
 
     def _show_measurement_details(self, link):
+        if link == "element-group" and self._finding is not None:
+            self.group_selected_requested.emit(self._finding.shape_key)
+            return
         if link == "error-details" and getattr(self, "_last_failure", None):
             self._measurement_dialog = TechnicalDetailsDialog(
                 "작업을 완료하지 못한 이유", self._last_failure, self
@@ -1620,28 +1664,51 @@ class OverlayWidget(QWidget):
         finally:
             self.proposals_list.blockSignals(False)
         self._update_apply_button()
+        self._filter_proposals()
 
     def _add_batch_items(self, report: AnalysisReport):
-        """같은 자리(쪽 번호·머리글 등) 같은 수정 후보마다 '일괄 적용' 체크 항목을 첫 후보 바로 위에 넣는다."""
-        by_id = {proposal.id: proposal for proposal in report.proposals}
-        for members in same_place_sets(report.deck, list(report.proposals)):
-            first = by_id[members[0]]
-            slides = sorted({_slide_number(by_id[member].shape_key) for member in members})
-            shown = ", ".join(str(number) for number in slides[:6]) + (" …" if len(slides) > 6 else "")
-            label = (
-                f"같은 자리 일괄 적용 · {len(members)}개 슬라이드 ({shown})\n{proposal_change_text(first)}"
-            )
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole + 1, members)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-            item.setCheckState(Qt.CheckState.Unchecked)
-            item.setToolTip(
-                "같은 자리에 있는 같은 개체(쪽 번호·머리글 등)에 같은 수정을 한 번에 적용합니다. 하나씩 적용할 수도 있습니다."
-            )
-            row = self.proposals_list.row(self.proposal_items[members[0]])
-            self.proposals_list.insertItem(row, item)
-            self.batch_items.append((item, members))
+        """One document-wide element, one action per variant; individual rows stay hidden."""
+        self._grouped_proposal_ids = set()
+        by_id = {p.id: p for p in report.proposals}
+        for group in report.element_groups:
+            for members, first, count, varying in proposal_options(report, group.members):
+                self._grouped_proposal_ids.update(members)
+                change = (
+                    _property_name(first.property) + " 조정 (쪽별 제안값)"
+                    if varying
+                    else proposal_change_text(first)
+                )
+                properties = tuple(dict.fromkeys(by_id[pid].property for pid in members))
+                if len(properties) > 1:
+                    change = " + ".join(_property_name(prop) for prop in properties) + " 함께 조정"
+                item = QListWidgetItem(f"{group.title} · 그룹 {len(group.members)}쪽 중 {count}쪽 · {change}")
+                item.setSizeHint(QSize(1, 28))
+                item.setData(Qt.ItemDataRole.UserRole + 1, members)
+                item.setData(Qt.ItemDataRole.UserRole + 2, is_recommended(first.id))
+                item.setFlags(
+                    (item.flags() | Qt.ItemFlag.ItemIsUserCheckable) & ~Qt.ItemFlag.ItemIsSelectable
+                )
+                item.setCheckState(Qt.CheckState.Unchecked)
+                item.setToolTip(
+                    "그룹 전체 수정입니다. 구성원과 각 슬라이드 문제는 ‘같은 요소 관리’에서 확인하세요."
+                    + "\n"
+                    + "\n".join(
+                        f"{by_id[pid].shape_key.split(':')[0]}쪽 · {proposal_change_text(by_id[pid])}"
+                        for pid in members
+                    )
+                )
+                self.proposals_list.insertItem(self.proposals_list.row(self.proposal_items[members[0]]), item)
+                self.batch_items.append((item, members))
+
+    def _filter_proposals(self):
+        if not hasattr(self, "proposals_list"):
+            return
+        recommended = self.proposal_variant.currentData() == "recommended"
+        grouped = getattr(self, "_grouped_proposal_ids", set())
+        for pid, item in self.proposal_items.items():
+            item.setHidden(pid in grouped or is_recommended(pid) != recommended)
+        for item, _members in self.batch_items:
+            item.setHidden(bool(item.data(Qt.ItemDataRole.UserRole + 2)) != recommended)
 
     def _refresh_batch_items(self):
         """개별 후보를 체크·해제하면 '일괄 적용' 항목도 맞춘다 (모두 체크됐을 때만 체크)."""
@@ -1848,6 +1915,7 @@ class OverlayWidget(QWidget):
             self._analysis_busy or self._apply_busy or self._report_stale or self._split_busy
         )
         self.view_fixes_button.setEnabled(ready and self._finding is not None)
+        self.groups_button.setEnabled(ready)
         for severity, button in (
             ("warning", self.select_warning_button),
             ("review", self.select_review_button),
@@ -2337,6 +2405,8 @@ class OverlayController(QObject):
         self._live_task: LiveEditTask | None = None
         self._live_hash: str | None = None  # 적용할 때의 검사 결과 (저장 후 재검사되면 기억을 지움)
         self.lens.option_toggled.connect(self.toggle_live_edit)
+        self.lens.group_requested.connect(self.show_element_groups)
+        self._groups_dialog = None
         self._live_queue: list[tuple[tuple[str, ...], bool]] = []  # 적용 중에 들어온 체크 (차례로 처리)
         # PowerPoint에 COM으로 묻는 일은 사용자 입력 뒤에만 (가만히 있을 때 바쁜 커서가 계속 돌지 않게)
         self.activity = input_activity or InputActivity()
@@ -2375,6 +2445,8 @@ class OverlayController(QObject):
         self.overlay.slide_requested.connect(self.navigate_to_finding_slide)
         self.overlay.lock_requested.connect(self.show_settings)
         self.overlay.fixes_requested.connect(self.request_fixes)
+        self.overlay.groups_requested.connect(self.show_element_groups)
+        self.overlay.group_selected_requested.connect(self.show_element_groups)
         self.overlay.preview_state_changed.connect(self.schedule_preview)
         self.overlay.preview_state_changed.connect(self._redraw_lens)
         self.overlay.geometry_changed.connect(self._sync_lens_exclusions)
@@ -2521,6 +2593,7 @@ class OverlayController(QObject):
             policy_key = build_analysis_policy(path).cache_key
             stored = build_report_repository().find_successful(path, policy_key)
             if stored is not None and _sha256(path) == stored.report.deck.source_sha256:
+                self._hydrate_element_groups(stored.report)
                 self.overlay.show_report(stored.report)
         except (OSError, ValueError):
             pass
@@ -2751,7 +2824,89 @@ class OverlayController(QObject):
         self.file_activity.emit(path, "검사 완료")
         if current is not None and _same_path(path, current):
             if report.policy_key is None or report.policy_key == build_analysis_policy(path).cache_key:
+                self._hydrate_element_groups(report)
                 self.overlay.show_report(report, skip_reasons)
+
+    def _hydrate_element_groups(self, report):
+        try:
+            saved = build_element_group_repository().load(report.deck)
+        except (OSError, ValueError, sqlite3.Error):
+            saved = []
+        report.element_groups = detect_groups(
+            report.deck, saved or [g for g in report.element_groups if g.manual]
+        )
+
+    def _check_group_context(self, report):
+        if report is not self.overlay._report or self.overlay._report_stale:
+            raise ValueError("검사 결과가 변경되었습니다. 그룹 관리 창을 다시 열어 주세요.")
+        if (
+            self._live_task is not None
+            or self.live_editor.applied_ids
+            or self._apply_thread is not None
+            or self._split_worker is not None
+        ):
+            raise ValueError("적용 중인 수정을 해제하거나 저장·재검사한 뒤 그룹을 편집하세요.")
+        if _sha256(Path(report.deck.source_path)) != report.deck.source_sha256:
+            raise ValueError("검사 이후 파일이 변경되었습니다. 다시 검사한 뒤 그룹을 편집하세요.")
+
+    def show_element_groups(self, shape_key=""):
+        report = self.overlay._report
+        if report is None or self.overlay._report_stale:
+            return
+        if self._groups_dialog is not None:
+            self._groups_dialog.close()
+        dialog = ElementGroupsDialog(
+            report,
+            self.overlay,
+            shape_key=shape_key,
+            on_save=lambda group: self._save_element_group(report, group),
+            on_align=lambda group, reference: self._align_element_group(report, group, reference),
+        )
+        self._groups_dialog = dialog
+        dialog.finished.connect(lambda: setattr(self, "_groups_dialog", None))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _save_element_group(self, report, group):
+        self._check_group_context(report)
+        groups = edit_group(report.element_groups, group)
+        build_element_group_repository().save(report.deck, groups)
+        report.element_groups = groups
+        token = f"#align:{group.id}"
+        report.proposals = [p for p in report.proposals if not p.id.endswith(token)]
+        report.findings = [f for f in report.findings if not f.id.startswith(f"group.alignment:{group.id}:")]
+        build_report_repository().save(report)
+        self.overlay.show_report(report, self.overlay._skip_reasons)
+        self._redraw_lens()
+
+    def _align_element_group(self, report, group, reference):
+        self._check_group_context(report)
+        candidates, rejected = align_group(
+            report.deck, group, reference, build_analysis_policy(Path(report.deck.source_path))
+        )
+        if not candidates:
+            return 0, rejected or ["그룹 요소가 이미 같은 위치입니다."]
+        report.proposals = [*report.proposals, *candidates]
+        shapes = {s.key: s for s in report.deck.shapes}
+        for p in candidates:
+            report.findings.append(
+                Finding(
+                    p.finding_id,
+                    "group.alignment",
+                    p.shape_key,
+                    "review",
+                    p.explanation,
+                    str(p.before),
+                    str(p.after),
+                    "사용자가 선택한 그룹과 기준 요소의 위치",
+                    shapes[p.shape_key].box,
+                )
+            )
+        build_report_repository().save(report)
+        self.overlay.show_report(report, self.overlay._skip_reasons)
+        self._redraw_lens()
+        return len(candidates), rejected
 
     def schedule_preview(self):
         self._preview_token += 1
@@ -3380,6 +3535,8 @@ class OverlayController(QObject):
 
     def stop(self):
         self._stopping = True
+        if self._groups_dialog is not None:
+            self._groups_dialog.close()
         if self._split_worker is not None:
             self._split_worker.requestInterruption()
             self._split_worker.wait()
@@ -3658,6 +3815,8 @@ def _presentation_name(title: str) -> str:
 
 
 def _rule_name(rule_id: str) -> str:
+    if rule_id == "group.alignment":
+        return "위치 맞춤"
     if rule_id.startswith("readability."):
         return readability_label(rule_id)
     if rule_id.startswith("layout."):

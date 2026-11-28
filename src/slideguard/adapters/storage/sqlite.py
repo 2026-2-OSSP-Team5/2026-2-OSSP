@@ -12,6 +12,7 @@ from slideguard.domain.models import (
     Box,
     ChangeProposal,
     DeckSnapshot,
+    ElementGroup,
     Finding,
     FindingComparison,
     Measurement,
@@ -503,6 +504,16 @@ def _report_from_json(payload: str) -> AnalysisReport:
         policy_key=data.get("policy_key"),
         comparison=FindingComparison(**data["comparison"]) if data.get("comparison") else None,
         proposal_notes=dict(data.get("proposal_notes", {})),
+        element_groups=[
+            ElementGroup(
+                item["id"],
+                item["title"],
+                tuple(item["members"]),
+                tuple(item.get("excluded", ())),
+                item.get("manual", False),
+            )
+            for item in data.get("element_groups", ())
+        ],
     )
 
 

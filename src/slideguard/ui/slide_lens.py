@@ -28,7 +28,8 @@ from PySide6.QtGui import QColor, QFont, QFontMetricsF, QGuiApplication, QPainte
 from PySide6.QtWidgets import QApplication, QWidget
 
 from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, Finding
-from slideguard.planning.same_place import same_place_sets
+from slideguard.planning.bindings import is_recommended
+from slideguard.planning.element_groups import ensure_groups, group_problem_text, proposal_options
 from slideguard.ui.finding_details import describe_finding
 from slideguard.ui.user_text import friendly_reason, readability_label
 
@@ -80,6 +81,7 @@ def _rule_position(finding: Finding) -> int:
 
 # 종류별 (칩 글자, 강조색). 칩은 게임 오버레이의 등급 칩(S/A/B)처럼 한눈에 구분되게 한다.
 STYLE = {
+    "group": ("≡", "#6EA8FE"),
     "warning": ("!", "#F04438"),  # 문제 발견
     "review": ("?", "#F79009"),  # 검토 필요
     "unknown": ("–", "#98A2B3"),  # 판정 불가
@@ -94,6 +96,7 @@ DIFF_BEFORE = QColor("#FDA29B")
 DIFF_AFTER = QColor("#75E0A7")
 
 RULE_TITLES = {
+    "group.alignment": "위치 맞춤",
     "typography": "글자 크기",
     "contrast": "명암비",
     "layout.overflow": "글 넘침",
@@ -131,6 +134,8 @@ class LensOption:
     proposal_ids: tuple[str, ...]
     label: str  # 예: "글자 크기 12pt → 14pt"
     checked: bool = False  # 지금 문서에 적용되어 있는지
+    variant: str = "minimum"
+    scope: str = "local"
 
 
 @dataclass(frozen=True)
@@ -151,6 +156,10 @@ class LensMark:
     applied: bool = False  # 수정 후보가 문서에 실제로 적용되어 있음 (아니면 선택만 한 상태)
     quiet: bool = False  # 묶음 때문에 따라 움직이기만 하는 객체: 테두리만 그리고 배지는 띄우지 않음
     unavailable_reason: str = ""  # 자동 수정 후보를 만들지 못한 이유
+    group_id: str = ""
+    group_title: str = ""
+    group_count: int = 0
+    group_message: str = ""
 
 
 @dataclass(frozen=True)
@@ -199,10 +208,11 @@ def build_marks(
     selected = {str(item) for item in selected_ids}
     applied = {str(item) for item in applied_ids}
 
-    # 같은 자리 일괄 묶음은 슬라이드마다 한 번만 계산 (배지마다 다시 계산하면 큰 문서에서 화면이 멈춤)
-    batch_sets = same_place_sets(report.deck, list(report.proposals)) if proposals else []
+    ensure_groups(report)
+    by_member = {key: group for group in report.element_groups for key in group.members}
+    group_keys = {key for key in by_member if _slide_of(key) == slide}
     marks = []
-    for key in sorted(set(findings) | set(proposals), key=_key_order):
+    for key in sorted(set(findings) | set(proposals) | group_keys, key=_key_order):
         items = sorted(findings.get(key, []), key=finding_rank)
         if key in tables:
             # 표 칸 글자 크기 판정을 표 하나로 묶은 표시: 표 전체 테두리에 배지 하나
@@ -213,7 +223,19 @@ def build_marks(
             box = next((located for item in items if (located := locate(report, item)) is not None), None)
         if box is None:
             box = _shape_box(report, key)
-        options = _options(report, proposals.get(key, []), applied, batch_sets)
+        group = by_member.get(key)
+        options = _options(report, proposals.get(key, []), applied, element_group=group)
+        group_info = {}
+        if group:
+            counts = group_problem_text(report, group)
+            labels = {f.rule_id: rule_title(f) for f in report.findings}
+            group_info = dict(
+                group_id=group.id,
+                group_title=group.title,
+                group_count=len(group.members),
+                group_message="\n".join(f"{labels[rule]} · {count}건" for rule, count in counts.items())
+                or "이 그룹에서 검사로 발견한 문제는 없습니다. 그룹 관리에서 위치를 맞출 수 있습니다.",
+            )
         reasons = dict.fromkeys(skip_reasons[item.id] for item in items if item.id in skip_reasons)
         unavailable_reason = (
             "\n".join(dict.fromkeys(friendly_reason(reason) for reason in reasons)) if not options else ""
@@ -273,10 +295,24 @@ def build_marks(
                     options=options,
                     applied=any(item.id in applied for item in active),
                     quiet=follower,
+                    **group_info,
                 )
             )
             continue
         if not items:
+            if group:
+                marks.append(
+                    LensMark(
+                        key,
+                        box,
+                        "group",
+                        group.title,
+                        f"{len(group.members)}쪽 그룹",
+                        message="이 슬라이드 요소에서 발견한 문제는 없습니다.",
+                        options=options,
+                        **group_info,
+                    )
+                )
             continue  # 판정 없이 후보만 남은 개체는 표시하지 않음
         worst = items[0]
         value, target = metric_text(worst)
@@ -292,6 +328,7 @@ def build_marks(
                 message=message,
                 options=options,
                 unavailable_reason=unavailable_reason,
+                **group_info,
             )
         )
     return marks
@@ -302,37 +339,60 @@ def _options(
     proposals: list[ChangeProposal],
     applied: set[str],
     batch_sets: list[tuple[str, ...]] | None = None,
+    *,
+    element_group=None,
 ) -> tuple[LensOption, ...]:
     """한 개체의 수정 후보를 체크 항목으로. 같은 묶음(id의 #뒤)은 함께 켜고 끈다."""
     groups: dict[str, list[ChangeProposal]] = {}
     for proposal in proposals:
+        if "#align:" in proposal.id:
+            continue  # Explicit position matching is a group action.
         group = str(proposal.id).split("#", 1)[1] if "#" in str(proposal.id) else str(proposal.id)
         groups.setdefault(group, [])
     for proposal in report.proposals:  # 묶음은 다른 개체의 후보까지 함께 (모두 선택하거나 모두 해제)
         group = str(proposal.id).split("#", 1)[1] if "#" in str(proposal.id) else str(proposal.id)
-        if group in groups:
+        if group in groups and proposal.id not in {item.id for item in groups[group]}:
             groups[group].append(proposal)
     options = []
     own = {item.shape_key for item in proposals}
     for group, members in groups.items():
         label = _option_label(members, own)
         ids = tuple(item.id for item in members)
-        options.append(LensOption(group, ids, label, checked=all(item in applied for item in ids)))
+        options.append(
+            LensOption(
+                group,
+                ids,
+                label,
+                checked=all(item in applied for item in ids),
+                variant="recommended" if is_recommended(members[0].id) else "minimum",
+            )
+        )
     # 같은 자리(쪽 번호·머리글 등) 같은 수정: 다른 슬라이드까지 한 번에 켜고 끄는 '일괄 적용' 항목
-    own_ids = {item.id for item in proposals}
-    by_id = {item.id: item for item in report.proposals}
-    if batch_sets is None:
-        batch_sets = same_place_sets(report.deck, list(report.proposals))
-    for members in batch_sets:
-        mine = [member for member in members if member in own_ids]
-        if not mine:
-            continue
-        label = f"[같은 자리 {len(members)}쪽 일괄] {_change_text(by_id[mine[0]])}"
-        if "~rec" in str(mine[0]).split("#", 1)[0]:
-            label = f"[권장] {label}"
-        checked = all(member in applied for member in members)
-        options.append(LensOption(f"same:{members[0]}", tuple(members), label, checked=checked))
-    return tuple(options)
+    if element_group is not None:
+        by_id = {p.id: p for p in report.proposals}
+        for ids, first, count, varying in proposal_options(report, element_group.members):
+            label = f"{_change_text(first)} · {count}쪽"
+            properties = tuple(dict.fromkeys(by_id[pid].property for pid in ids))
+            if len(properties) > 1:
+                label = (
+                    " + ".join(PROPERTY_TITLES.get(prop, prop) for prop in properties)
+                    + f" 함께 조정 · {count}쪽"
+                )
+            elif varying:
+                label = (
+                    f"{PROPERTY_TITLES.get(first.property, first.property)} 조정 · {count}쪽 (쪽별 제안값)"
+                )
+            options.append(
+                LensOption(
+                    f"element:{ids[0]}",
+                    ids,
+                    label,
+                    checked=all(member in applied for member in ids),
+                    variant="recommended" if is_recommended(first.id) else "minimum",
+                    scope="group",
+                )
+            )
+    return tuple(sorted(options, key=lambda o: (o.variant == "recommended", o.scope == "group")))
 
 
 def _option_label(members: list[ChangeProposal], own_keys: set[str]) -> str:
@@ -472,6 +532,8 @@ def metric_text(finding: Finding) -> tuple[str, str]:
         return value, (f"여백 {expected:g}pt 이상" if limit else "")
     if rule == "layout.overlap":
         return "겹침", ""
+    if rule == "group.alignment":
+        return "위치 다름", "선택한 기준 위치"
     if rule == "layout.line_length" and number:
         return f"전각 {measured:g}자 분량", f"참고 {expected:g}자 이하" if limit else ""
     if rule.startswith("color_vision.contrast") and number:
@@ -744,8 +806,9 @@ def _paint_summary(painter: QPainter, slide_rect: QRectF, marks: list[LensMark],
             ("review", "검토"),
             ("change", "변경"),
             ("unknown", "판정 불가"),
+            ("group", "요소 그룹"),
         )
-        if counts[kind]
+        if counts.get(kind, 0)
     ]
     if not parts:
         parts = [(None, "이 슬라이드 문제 없음")]
@@ -799,6 +862,7 @@ class SlideLens(QWidget):
     """
 
     option_toggled = Signal(object, bool)
+    group_requested = Signal(str)
 
     def __init__(self, *, interactive: bool = True):
         super().__init__(
@@ -930,6 +994,7 @@ class SlideLens(QWidget):
                 handle = BadgeHandle(self)
                 handle.set_excluded_rects(self._excluded_rects)
                 handle.toggled.connect(self.option_toggled)
+                handle.group_requested.connect(self.group_requested)
                 handle.focused.connect(self._set_focused)
                 handle.dragged.connect(self._move_badge)
                 self._handles[mark.key] = handle
@@ -1008,6 +1073,7 @@ class BadgeHandle(QWidget):
     toggled = Signal(object, bool)  # (제안 ID 묶음, 켜기 여부)
     focused = Signal(str, bool)
     dragged = Signal(str, object)
+    group_requested = Signal(str)
 
     def __init__(self, owner: QWidget | None = None):
         super().__init__(
@@ -1029,6 +1095,9 @@ class BadgeHandle(QWidget):
         self._press_position: QPointF | None = None
         self._press_offset = QPointF()
         self._dragging = False
+        self.variant = "minimum"
+        self.scope = "local"
+        self._scroll = 0.0
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.setAccessibleName("문제 라벨 · 마우스를 올려 설명 확인 · 위쪽을 끌어서 이동")
         self._collapse_timer = QTimer(self)
@@ -1039,6 +1108,10 @@ class BadgeHandle(QWidget):
     # ------------------------------------------------------------ 상태
     def set_mark(self, mark: LensMark, anchor: QRect):
         changed = mark != self.mark or anchor != self.anchor
+        if self.mark is None or self.mark.key != mark.key:
+            self.variant = "minimum"
+            self.scope = "local"
+            self._scroll = 0.0
         self.mark, self.anchor = mark, QRect(anchor)
         if changed:
             self._apply_geometry()
@@ -1098,6 +1171,13 @@ class BadgeHandle(QWidget):
             self.update()
 
     # ------------------------------------------------------------ 배치
+    def visible_options(self):
+        return tuple(
+            option
+            for option in (self.mark.options if self.mark else ())
+            if option.variant == self.variant and option.scope == self.scope
+        )
+
     def _layout(self) -> dict:
         """펼친 카드 안의 자리들 (그리기와 클릭 판정이 같은 값을 쓴다)."""
         font = badge_font()
@@ -1106,13 +1186,30 @@ class BadgeHandle(QWidget):
         width = max(float(self.anchor.width()), CARD_WIDTH)
         inner = width - 24
         y = BADGE_HEIGHT + 8.0
+        variant_tabs = []
+        for index, (value, label) in enumerate((("minimum", "최소 수정"), ("recommended", "권장 수정"))):
+            variant_tabs.append((value, label, QRectF(8 + index * (width - 16) / 2, y, (width - 16) / 2, 26)))
+        y += 32
+        scope_tabs = []
+        if self.mark is not None and self.mark.group_id:
+            for index, (value, label) in enumerate(
+                (("local", "이 슬라이드"), ("group", f"그룹 전체 · {self.mark.group_count}쪽"))
+            ):
+                scope_tabs.append(
+                    (value, label, QRectF(8 + index * (width - 16) / 2, y, (width - 16) / 2, 24))
+                )
+            y += 30
+        body_top = y
+        message_text = (
+            (self.mark.group_message if self.scope == "group" else self.mark.message) if self.mark else ""
+        )
         message = None
-        if self.mark is not None and self.mark.message:
-            lines = max(1, _wrapped_lines(self.mark.message, font, inner))
+        if message_text:
+            lines = min(4, max(1, _wrapped_lines(message_text, font, inner)))
             message = QRectF(12, y, inner, lines * QFontMetricsF(font).lineSpacing())
             y = message.bottom() + 8
         rows = []
-        options = self.mark.options if self.mark is not None else ()
+        options = self.visible_options()
         for _option in options:
             rows.append(QRectF(6, y, width - 12, ROW_HEIGHT))
             y += ROW_HEIGHT
@@ -1120,11 +1217,16 @@ class BadgeHandle(QWidget):
         empty_text = ""
         if not options:
             empty_text = (
-                self.mark.unavailable_reason if self.mark is not None else ""
-            ) or "현재 설정에서 자동 수정 후보를 만들지 못했습니다."
+                "추가 권장 수정이 없습니다. 최소 수정 탭을 확인하세요."
+                if self.variant == "recommended"
+                else (self.mark.unavailable_reason if self.mark is not None else "")
+                or "이 범위에 자동 수정 후보가 없습니다."
+            )
             lines = max(1, _wrapped_lines(empty_text, small, inner))
             empty = QRectF(12, y, inner, lines * QFontMetricsF(small).lineSpacing())
             y = empty.bottom() + 4
+        group_action = QRectF(8, y + 6, width - 16, 28)
+        y = group_action.bottom() + 4
         note = None
         if self.busy or self.note:
             note = QRectF(12, y + 2, inner, QFontMetricsF(small).lineSpacing() * 2)
@@ -1138,9 +1240,26 @@ class BadgeHandle(QWidget):
         lines = _wrapped_lines(hint_text, small, inner)
         hint = QRectF(12, y + 6, inner, QFontMetricsF(small).lineSpacing() * lines)
         y = hint.bottom()
+        full_height = y + 10
+        screen = QGuiApplication.screenAt(self.anchor.center()) or QGuiApplication.primaryScreen()
+        height = (
+            min(full_height, max(180, screen.availableGeometry().height() - 40)) if screen else full_height
+        )
+        max_scroll = max(0.0, full_height - height)
+        self._scroll = min(max_scroll, max(0.0, self._scroll))
+        for rect in [message, *rows, empty, group_action, note, hint]:
+            if rect is not None:
+                rect.translate(0, -self._scroll)
         return {
-            "size": QSizeF(width, y + 10),
+            "size": QSizeF(width, height),
+            "max_scroll": max_scroll,
+            "body_clip": QRectF(0, body_top, width, height - body_top - 4),
             "message": message,
+            "message_text": message_text,
+            "options": options,
+            "variant_tabs": variant_tabs,
+            "scope_tabs": scope_tabs,
+            "group_action": group_action,
             "rows": rows,
             "empty": empty,
             "empty_text": empty_text,
@@ -1231,10 +1350,26 @@ class BadgeHandle(QWidget):
         if not self.expanded:
             self.expand()
             return
+        if self.mark is not None and not self.busy:
+            layout = self._layout()
+            for field, tabs in (("variant", layout["variant_tabs"]), ("scope", layout["scope_tabs"])):
+                for value, _label, rect in tabs:
+                    if rect.contains(event.position()):
+                        setattr(self, field, value)
+                        self._scroll = 0.0
+                        self._hover_row = -1
+                        self._apply_geometry()
+                        self.update()
+                        return
+            if layout["body_clip"].contains(event.position()) and layout["group_action"].contains(
+                event.position()
+            ):
+                self.group_requested.emit(self.mark.key)
+                return
         row = self._row_at(event.position())
         if row < 0 or self.busy or self.mark is None:
             return
-        option = self.mark.options[row]
+        option = self.visible_options()[row]
         self.toggled.emit(option.proposal_ids, not option.checked)
 
     def mouseReleaseEvent(self, event):
@@ -1250,10 +1385,24 @@ class BadgeHandle(QWidget):
     def _row_at(self, point: QPointF) -> int:
         if not self.expanded:
             return -1
-        for index, rect in enumerate(self._layout()["rows"]):
+        layout = self._layout()
+        if not layout["body_clip"].contains(point):
+            return -1
+        for index, rect in enumerate(layout["rows"]):
             if rect.contains(point):
                 return index
         return -1
+
+    def wheelEvent(self, event):
+        if self.expanded:
+            layout = self._layout()
+            self._scroll = min(
+                layout["max_scroll"], max(0.0, self._scroll - event.angleDelta().y() / 120 * ROW_HEIGHT * 2)
+            )
+            self.update()
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     # ------------------------------------------------------------ 그리기
     def paintEvent(self, _event):
@@ -1282,16 +1431,30 @@ class BadgeHandle(QWidget):
         painter.setPen(QPen(divider, 1))
         painter.drawLine(QPointF(8, BADGE_HEIGHT + 2), QPointF(card.right() - 8, BADGE_HEIGHT + 2))
 
+        painter.setFont(layout["small"])
+        for selected, tabs in ((self.variant, layout["variant_tabs"]), (self.scope, layout["scope_tabs"])):
+            for value, label, rect in tabs:
+                if value == selected:
+                    painter.fillRect(rect, QColor("#23466E"))
+                painter.setPen(TEXT_MAIN if value == selected else TEXT_SUB)
+                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+
+        painter.save()
+        painter.setClipRect(layout["body_clip"])
+
         if layout["message"] is not None:
+            painter.save()
+            painter.setClipRect(layout["message"], Qt.ClipOperation.IntersectClip)
             painter.setFont(font)
             painter.setPen(TEXT_SUB)
             painter.drawText(
                 layout["message"],
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
-                self.mark.message,
+                layout["message_text"],
             )
+            painter.restore()
         metrics = QFontMetricsF(font)
-        for index, (option, rect) in enumerate(zip(self.mark.options, layout["rows"], strict=True)):
+        for index, (option, rect) in enumerate(zip(layout["options"], layout["rows"], strict=True)):
             if index == self._hover_row and not self.busy:
                 hover = QPainterPath()
                 hover.addRoundedRect(rect, 5, 5)
@@ -1308,6 +1471,12 @@ class BadgeHandle(QWidget):
             )
         small = layout["small"]
         painter.setFont(small)
+        painter.setPen(QColor("#83B7FF"))
+        painter.drawText(
+            layout["group_action"],
+            Qt.AlignmentFlag.AlignCenter,
+            "그룹 구성·위치 맞춤·문제 자세히" if self.mark.group_id else "같은 요소 묶기·문제 자세히",
+        )
         if layout["empty"] is not None:
             painter.setPen(TEXT_SUB)
             painter.drawText(
@@ -1329,6 +1498,7 @@ class BadgeHandle(QWidget):
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
                 layout["hint_text"],
             )
+        painter.restore()
 
 
 def _paint_check(painter: QPainter, box: QRectF, checked: bool, *, dimmed: bool = False):
@@ -1598,7 +1768,10 @@ def _is_color(value: str) -> bool:
 def _label(mark: LensMark) -> str:
     label = f"{mark.title} · {mark.target}" if mark.target else mark.title
     if mark.options:
-        label += f" · 수정안 {len(mark.options)}개"
+        scope = "local" if any(o.scope == "local" for o in mark.options) else "group"
+        minimum = sum(o.scope == scope and o.variant == "minimum" for o in mark.options)
+        recommended = sum(o.scope == scope and o.variant == "recommended" for o in mark.options)
+        label += f" · 최소 {minimum} / 권장 {recommended}"
     return label
 
 
