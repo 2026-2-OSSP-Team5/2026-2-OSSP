@@ -8,6 +8,7 @@ __pycache__/
 .ruff_cache/
 build/
 dist/
+/releases/
 *.log
 *.bak
 .DS_Store
@@ -15,10 +16,12 @@ Thumbs.db
 Desktop.ini
 ~$*
 *.spec
+!SlideGuard.spec
 
 # User documents, reports and local databases
 input/
 output/
+/releases/
 reports/
 data/
 *.ppt

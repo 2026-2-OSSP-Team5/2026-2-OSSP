@@ -1,0 +1,931 @@
+"""슬라이드 렌즈(검사 결과를 슬라이드 위에 겹쳐 그리는 오버레이) 테스트. PowerPoint 없이 확인한다."""
+
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSizeF, Qt
+from PySide6.QtGui import QColor, QEnterEvent, QImage, QMouseEvent, QPainter
+from PySide6.QtWidgets import QApplication
+
+from slideguard.adapters.powerpoint.live_edit import LiveResult
+from slideguard.adapters.storage.sqlite import WorkspaceSettings
+from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, DeckSnapshot, Finding
+from slideguard.ui import overlay
+from slideguard.ui.slide_lens import (
+    BadgeHandle,
+    InputActivity,
+    SlideLens,
+    SlideView,
+    build_marks,
+    map_box,
+    metric_text,
+    paint_lens,
+    place_badges,
+    summary_counts,
+)
+
+
+@pytest.fixture(scope="module")
+def application():
+    return QApplication.instance() or QApplication([])
+
+
+DEFAULT_BOX = Box(100, 100, 200, 50)
+
+
+def _finding(fid, rule, key, severity, measured, expected, box=DEFAULT_BOX):
+    return Finding(fid, rule, key, severity, "메시지", measured, expected, "근거", box)
+
+
+def _report(path: Path) -> AnalysisReport:
+    findings = [
+        _finding("typography:1:2:1", "typography", "1:2", "warning", 11.0, 14.0),
+        _finding("layout.overlap:1:2:1:3", "layout.overlap", "1:2", "review", 30.0, 0.0),
+        _finding("contrast:1:3", "contrast", "1:3", "warning", 1.8, 4.5, Box(100, 300, 300, 40)),
+        _finding("layout.margin:1:4", "layout.margin", "1:4", "warning", -4.0, 36.0, Box(900, 20, 100, 40)),
+        _finding("contrast:1:5", "contrast", "1:5", "unknown", None, None, None),
+        _finding("typography:2:2:1", "typography", "2:2", "warning", 10.0, 14.0),
+    ]
+    proposals = [
+        ChangeProposal("font.size@1:2", findings[0].id, "1:2", "font.size", 11.0, 14.0, 0.1),
+        ChangeProposal("font.color@1:3", findings[2].id, "1:3", "font.color", "C8C8C8", "767676", 0.1),
+    ]
+    deck = DeckSnapshot(str(path), "abc", 2, 960, 540)
+    return AnalysisReport(deck=deck, findings=findings, proposals=proposals, status="analyzed")
+
+
+def test_marks_group_findings_per_object_and_keep_the_worst(tmp_path):
+    marks = {mark.key: mark for mark in build_marks(_report(tmp_path / "d.pptx"), 1)}
+    assert set(marks) == {"1:2", "1:3", "1:4", "1:5"}  # 2번 슬라이드 것은 빠짐
+    assert marks["1:2"].kind == "warning" and marks["1:2"].value == "11pt" and marks["1:2"].more == 1
+    assert marks["1:2"].target == "최소 14pt"
+    assert marks["1:3"].value == "1.8:1"
+    assert marks["1:4"].value == "슬라이드 밖"
+    assert marks["1:5"].kind == "unknown" and marks["1:5"].box is None  # 위치를 모르면 요약에만 셈
+    assert summary_counts(list(marks.values())) == {"warning": 3, "review": 0, "unknown": 1, "change": 0}
+
+
+def test_selected_proposals_turn_into_diff_marks(tmp_path):
+    marks = {
+        mark.key: mark
+        for mark in build_marks(_report(tmp_path / "d.pptx"), 1, {"font.size@1:2", "font.color@1:3"})
+    }
+    assert marks["1:2"].kind == "change" and (marks["1:2"].before, marks["1:2"].after) == ("11pt", "14pt")
+    assert (marks["1:3"].before, marks["1:3"].after) == ("#C8C8C8", "#767676")
+    assert marks["1:4"].kind == "warning"  # 선택하지 않은 개체는 그대로 문제 표시
+    assert not marks["1:2"].applied  # 패널에서 선택만 함 → 점선
+
+
+def test_marks_offer_proposals_as_options_and_show_applied_ones(tmp_path):
+    report = _report(tmp_path / "d.pptx")
+    marks = {mark.key: mark for mark in build_marks(report, 1, applied_ids={"font.size@1:2"})}
+    option = marks["1:2"].options[0]
+    assert option.proposal_ids == ("font.size@1:2",) and option.checked
+    assert option.label == "글자 크기 11pt → 14pt"
+    assert marks["1:2"].kind == "change" and marks["1:2"].applied
+    assert "왜 바꾸나요? 글자 크기 11pt → 14pt" in marks["1:2"].message
+    assert "크기 기준" in marks["1:2"].message
+    assert "글자를 키우고" in marks["1:2"].message
+    assert not marks["1:3"].options[0].checked and marks["1:3"].kind == "warning"
+    assert marks["1:4"].options == ()
+
+
+def test_objects_that_only_follow_a_bundle_get_no_badge(application, tmp_path):
+    report = _report(tmp_path / "d.pptx")
+    report.proposals += [
+        ChangeProposal("shape.height@1:4#reflow:1", "x", "1:4", "shape.height", 104.208, 131.0, 0.1),
+        ChangeProposal(
+            "shape.position@1:6#reflow:1",
+            "x",
+            "1:6",
+            "shape.position",
+            (545.1063, 252.78),
+            (545.1063, 279.6),
+            0.1,
+        ),
+        ChangeProposal(
+            "shape.position@1:7#reflow:1", "x", "1:7", "shape.position", (792.0, 266.46), (792.0, 293.3), 0.1
+        ),
+    ]
+    ids = {p.id for p in report.proposals if "reflow" in p.id}
+    marks = {mark.key: mark for mark in build_marks(report, 1, applied_ids=ids)}
+    assert marks["1:4"].kind == "change" and not marks["1:4"].quiet  # 주된 변경: 배지
+    assert (marks["1:4"].before, marks["1:4"].after) == ("104.2pt", "131pt")
+    assert marks["1:6"].quiet and marks["1:7"].quiet  # 따라 내려가기만: 테두리만
+    assert marks["1:4"].options[0].label == "개체 높이 104.2pt → 131pt + 아래 객체 2개 함께 내림"
+    image = QImage(1000, 600, QImage.Format.Format_ARGB32)
+    painter = QPainter(image)
+    paint_lens(painter, QRectF(0, 0, 960, 540), (960, 540), list(marks.values()), QRectF(image.rect()))
+    painter.end()
+
+
+def test_bundled_proposals_toggle_together(tmp_path):
+    report = _report(tmp_path / "d.pptx")
+    report.proposals += [
+        ChangeProposal("shape.height@1:4#overflow:1:4", "x", "1:4", "shape.height", 60, 90, 0.1),
+        ChangeProposal(
+            "shape.position@1:6#overflow:1:4", "x", "1:6", "shape.position", (50, 170), (50, 190), 0.1
+        ),
+    ]
+    marks = {mark.key: mark for mark in build_marks(report, 1)}
+    (option,) = marks["1:4"].options
+    assert option.proposal_ids == ("shape.height@1:4#overflow:1:4", "shape.position@1:6#overflow:1:4")
+
+
+@pytest.mark.parametrize(
+    ("rule", "fid", "measured", "expected", "text"),
+    [
+        ("typography.hierarchy.inferred", "typography:8:hierarchy", 20.0, 30.0, ("20pt", "필요 30pt")),
+        ("layout.overflow", "layout.overflow:7:3", 13.2, 0.0, ("13.2pt", "")),
+        ("layout.density", "layout.density:2:lines", 19, 6, ("슬라이드 전체 19줄", "권장 6줄 이하")),
+        ("layout.density", "layout.density:2:chars", 358, 300, ("슬라이드 전체 358자", "권장 300자 이하")),
+        ("layout.margin", "layout.margin:1:4", 10.0, 36.0, ("10pt", "여백 36pt 이상")),
+    ],
+)
+def test_metric_text_is_short_and_readable(rule, fid, measured, expected, text):
+    assert metric_text(_finding(fid, rule, "1:2", "review", measured, expected)) == text
+
+
+def test_slide_points_map_onto_the_visible_slide():
+    rect = map_box(Box(480, 270, 96, 54), QRectF(100, 50, 960, 540), (960, 540))
+    assert rect == QRectF(580, 320, 96, 54)
+    half = map_box(Box(480, 270, 96, 54), QRectF(0, 0, 480, 270), (960, 540))
+    assert half == QRectF(240, 135, 48, 27)
+
+
+def test_badges_never_overlap_and_stay_inside():
+    bounds = QRectF(0, 0, 800, 450)
+    frames = [QRectF(50, 100 + index * 30, 300, 25) for index in range(6)] + [QRectF(760, 5, 60, 30)]
+    sizes = [QSizeF(180, 26)] * len(frames)
+    badges = place_badges(frames, sizes, bounds)
+    for index, badge in enumerate(badges):
+        assert bounds.contains(badge)
+        for other in badges[index + 1 :]:
+            assert not badge.intersects(other)
+
+
+def test_painting_draws_frames_badges_and_summary(application, tmp_path):
+    image = QImage(1000, 600, QImage.Format.Format_ARGB32)
+    image.fill(QColor("white"))
+    painter = QPainter(image)
+    marks = build_marks(_report(tmp_path / "d.pptx"), 1, {"font.color@1:3"})
+    paint_lens(painter, QRectF(20, 30, 960, 540), (960, 540), marks, QRectF(image.rect()))
+    painter.end()
+    colors = {image.pixelColor(x, y).name() for x in range(0, 1000, 4) for y in range(0, 600, 4)}
+    assert len(colors) > 10  # 배지·테두리·색 견본이 그려짐
+
+
+# ---------------------------------------------------------------- 컨트롤러 연결
+
+
+class _Collection:
+    def start(self):
+        pass
+
+    def stop(self, *, wait=True):
+        pass
+
+
+class _Tracker:
+    def __init__(self, target):
+        self.target = target
+
+    def poll(self, _owned):
+        return self.target
+
+
+def _wait_for(condition, application, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        application.processEvents()
+        if condition():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+@pytest.fixture
+def controller(application, tmp_path, monkeypatch):
+    path = tmp_path / "deck.pptx"
+    path.write_bytes(b"pptx")
+    settings = SimpleNamespace(
+        load=lambda: WorkspaceSettings(tmp_path, False, "presentation"), save=lambda *a, **k: None
+    )
+    monkeypatch.setattr(overlay, "build_workspace_settings_repository", lambda: settings)
+    monkeypatch.setattr(
+        overlay, "build_report_repository", lambda: SimpleNamespace(find_successful=lambda *_: None)
+    )
+    screen = QRect(0, 0, 1600, 900)
+    target = overlay.PowerPointWindow(
+        7, QRect(0, 0, 1600, 900), "deck.pptx - PowerPoint", (0, 0, 1600, 900), screen
+    )
+    views = {"slide": 1, "saved": True}
+
+    def reader(view_path, hwnd):
+        assert hwnd == 7
+        return SlideView(
+            view_path, views["slide"], (300, 150, 1260, 690), (0, 0, 1600, 900), (960, 540), views["saved"]
+        )
+
+    built = overlay.OverlayController(
+        tracker=_Tracker(target),
+        path_provider=lambda: path,
+        collection_builder=lambda *_a, **_k: _Collection(),
+        slide_view_reader=reader,
+    )
+    built.LENS_INTERVAL = 0.0
+    built.poll_powerpoint()  # 열린 문서를 먼저 알아본 뒤 검사 결과를 띄운다
+    built.overlay.show_report(_report(path))
+    built.views = views
+    yield built
+    built.stop()
+    built.settings_dialog.close()
+    built.overlay.close()
+    built.lens.close()
+
+
+def _poll_until_lens(controller, application, expected_slide):
+    def ready():
+        controller.poll_powerpoint()
+        view = controller._lens_view
+        return controller.lens.isVisible() and view is not None and view.slide == expected_slide
+
+    return _wait_for(ready, application)
+
+
+def test_lens_follows_the_slide_shown_in_powerpoint(controller, application):
+    assert _poll_until_lens(controller, application, 1)
+    assert {mark.key for mark in controller.lens.marks} == {"1:2", "1:3", "1:4", "1:5"}
+    assert controller.lens.geometry() == QRect(0, 0, 1600, 900)
+    controller.views["slide"] = 2  # 사용자가 PowerPoint에서 다음 슬라이드로 넘김
+    assert _poll_until_lens(controller, application, 2)
+    assert {mark.key for mark in controller.lens.marks} == {"2:2"}
+
+
+def _lens_image(lens):
+    image = QImage(lens.size(), QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    lens.render(image)
+    return image
+
+
+def test_toolbar_area_stays_clear_when_lens_is_redrawn(controller, application):
+    assert _poll_until_lens(controller, application, 1)
+    controller.timer.stop()
+    toolbar = controller.overlay
+    toolbar.set_collapsed(False)
+    controller.preview_timer.stop()
+    application.processEvents()
+    protected = toolbar.geometry().intersected(controller.lens.geometry())
+    assert not protected.isEmpty()
+
+    # Reproduce a late slide probe / badge redraw after the toolbar has opened.
+    controller._redraw_lens()
+    image = _lens_image(controller.lens)
+    assert all(
+        image.pixelColor(x, y).alpha() == 0
+        for x in range(protected.left(), protected.right() + 1, 3)
+        for y in range(protected.top(), protected.bottom() + 1, 3)
+    )
+    assert any(
+        image.pixelColor(x, y).alpha() > 0
+        for x in range(0, image.width(), 4)
+        for y in range(protected.bottom() + 1, image.height(), 4)
+    )
+
+
+def test_moving_and_collapsing_toolbar_updates_badge_hit_areas(controller, application):
+    from PySide6.QtCore import QPoint
+
+    assert _poll_until_lens(controller, application, 1)
+    controller.timer.stop()
+    handle = controller.lens.handles["1:2"]
+    anchor = QRect(handle.anchor)
+    toolbar = controller.overlay
+    toolbar.set_collapsed(False)
+    controller.preview_timer.stop()
+    toolbar._move_panel(QPoint(16, anchor.top() - 10))
+    application.processEvents()
+    assert toolbar.geometry().contains(handle.geometry())
+    assert handle.occluded and not handle.isVisible()
+    assert controller.lens.isVisible()
+
+    toolbar._move_panel(QPoint(16, anchor.bottom() + 30))
+    application.processEvents()
+    assert not handle.occluded and handle.isVisible()
+    toolbar._move_panel(QPoint(16, anchor.top() - 10))
+    application.processEvents()
+    assert handle.occluded
+    toolbar.set_collapsed(True)
+    controller.preview_timer.stop()
+    application.processEvents()
+    assert not handle.occluded and handle.isVisible() and handle.mask().isEmpty()
+
+
+def test_expanded_badge_cannot_paint_or_intercept_toolbar_area(application, tmp_path):
+    from PySide6.QtCore import QPoint
+
+    handle = BadgeHandle()
+    mark = next(m for m in build_marks(_report(tmp_path / "d.pptx"), 1) if m.key == "1:2")
+    try:
+        handle.set_mark(mark, QRect(100, 100, 180, 26))
+        handle.set_excluded_rects((QRect(100, 100, 800, 13),))
+        handle.expand()  # Popup raises itself again after the toolbar exclusion.
+        assert not handle.mask().contains(QPoint(5, 5))
+        assert handle.mask().contains(QPoint(5, handle.height() - 5))
+        handle.set_excluded_rects(())
+        assert handle.mask().isEmpty()
+    finally:
+        handle.close()
+
+
+def test_native_badge_hit_testing_leaves_toolbar_clickable(application, tmp_path):
+    import sys
+
+    if sys.platform != "win32" or application.platformName() != "windows":
+        pytest.skip("Native window hit testing requires Windows")
+    import win32con
+    import win32gui
+    from PySide6.QtWidgets import QWidget
+
+    toolbar = QWidget(
+        None,
+        Qt.WindowType.Tool
+        | Qt.WindowType.FramelessWindowHint
+        | Qt.WindowType.WindowStaysOnTopHint
+        | Qt.WindowType.WindowDoesNotAcceptFocus,
+    )
+    toolbar.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+    toolbar.setStyleSheet("background:white")
+    handle = BadgeHandle()
+    handle.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    mark = next(m for m in build_marks(_report(tmp_path / "d.pptx"), 1) if m.key == "1:2")
+
+    def root_at(x, y):
+        ratio = toolbar.devicePixelRatioF()
+        hwnd = win32gui.WindowFromPoint((round(x * ratio), round(y * ratio)))
+        return win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
+
+    try:
+        toolbar.setGeometry(200, 150, 600, 200)
+        toolbar.show()
+        handle.set_mark(mark, QRect(300, 200, 240, 26))
+        handle.show()
+        handle.raise_()
+        application.processEvents()
+        assert root_at(350, 212) == int(handle.winId())
+        handle.set_excluded_rects((toolbar.geometry(),))
+        application.processEvents()
+        assert root_at(350, 212) == int(toolbar.winId())
+
+        # A hovered card may raise itself again while only partly overlapping.
+        handle.set_mark(mark, QRect(300, 340, 240, 26))
+        handle.expand()
+        handle.show()
+        application.processEvents()
+        assert root_at(350, 345) == int(toolbar.winId())
+        assert root_at(350, 355) == int(handle.winId())
+    finally:
+        handle.close()
+        toolbar.close()
+
+
+def test_selecting_a_proposal_shows_the_change_on_the_slide(controller, application):
+    assert _poll_until_lens(controller, application, 1)
+    controller.overlay.proposal_items["font.size@1:2"].setSelected(True)
+    application.processEvents()
+    mark = {mark.key: mark for mark in controller.lens.marks}["1:2"]
+    assert (mark.kind, mark.title, mark.before, mark.after, mark.applied) == (
+        "change",
+        "글자 크기",
+        "11pt",
+        "14pt",
+        False,
+    )
+
+
+def test_lens_hides_when_turned_off_stale_or_powerpoint_leaves(controller, application):
+    assert _poll_until_lens(controller, application, 1)
+    controller.overlay.lens_check.setChecked(False)
+    assert not controller.lens.isVisible()
+    controller.overlay.lens_check.setChecked(True)
+    assert _poll_until_lens(controller, application, 1)
+    controller.overlay.mark_report_stale("재검사 필요")
+    controller.poll_powerpoint()
+    assert not controller.lens.isVisible()
+    controller.tracker.target = None
+    controller.poll_powerpoint()
+    assert not controller.lens.isVisible()
+
+
+def test_unreadable_view_hides_the_lens(controller, application):
+    assert _poll_until_lens(controller, application, 1)
+    controller.slide_view_reader = lambda *_args: None  # 슬라이드 쇼, 여러 슬라이드 보기 등
+    controller._lens_force = True
+    assert _wait_for(lambda: (controller.poll_powerpoint(), not controller.lens.isVisible())[1], application)
+
+
+def test_user_edits_hide_the_lens_but_our_live_edits_keep_it(controller, application):
+    assert _poll_until_lens(controller, application, 1)
+    controller.views["saved"] = False  # 사용자가 직접 고치고 저장하지 않음
+    controller._lens_force = True
+    assert _wait_for(lambda: (controller.poll_powerpoint(), not controller.lens.isVisible())[1], application)
+    controller._live_hash = controller.overlay._report.deck.source_sha256  # 렌즈 체크로 바꾼 상태
+    controller._lens_force = True
+    assert _wait_for(lambda: (controller.poll_powerpoint(), controller.lens.isVisible())[1], application)
+
+
+# ---------------------------------------------------------------- 배지 펼치기·체크
+
+
+def _click(widget, point):
+    for kind in (QMouseEvent.Type.MouseMove, QMouseEvent.Type.MouseButtonPress):
+        event = QMouseEvent(
+            kind,
+            QPointF(point),
+            QPointF(point),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(widget, event)
+
+
+def test_hovering_a_badge_expands_it_and_clicking_a_row_toggles(application, tmp_path):
+    mark = {m.key: m for m in build_marks(_report(tmp_path / "d.pptx"), 1)}["1:2"]
+    handle = BadgeHandle()
+    handle.set_mark(mark, QRect(100, 100, 180, 26))
+    assert handle.geometry() == QRect(100, 100, 180, 26) and not handle.expanded
+    seen = []
+    handle.toggled.connect(lambda ids, checked: seen.append((ids, checked)))
+    handle.expand()  # 마우스를 올림
+    assert handle.expanded and handle.width() >= 300 and handle.height() > 26
+    assert handle._layout()["empty"] is None
+    assert handle._layout()["hint"] is not None
+    assert "체크하면 바로 적용" in handle._layout()["hint_text"]
+    row = handle._layout()["rows"][0]
+    _click(handle, row.center())
+    assert seen == [(("font.size@1:2",), True)]
+    handle.set_busy(True)  # 적용 중에는 다시 누를 수 없음
+    _click(handle, row.center())
+    assert len(seen) == 1
+    handle.set_busy(False)
+    handle.collapse()
+    assert handle.geometry() == QRect(100, 100, 180, 26)
+    handle.close()
+
+
+def test_badge_without_candidates_shows_reason_without_checkbox_instructions(application, tmp_path):
+    report = _report(tmp_path / "d.pptx")
+    finding = next(f for f in report.findings if f.shape_key == "1:4")
+    reason = "위치 속성이 고정되어 수정 후보를 만들 수 없습니다."
+    mark = next(m for m in build_marks(report, 1, skip_reasons={finding.id: reason}) if m.key == "1:4")
+    handle = BadgeHandle()
+    handle.set_mark(mark, QRect(100, 100, 180, 26))
+    seen = []
+    handle.toggled.connect(lambda *args: seen.append(args))
+    try:
+        handle.expand()
+        layout = handle._layout()
+        assert layout["rows"] == [] and layout["hint"] is not None
+        assert "끌어서 이동" in layout["hint_text"] and "체크하면" not in layout["hint_text"]
+        assert "고정을 해제" in layout["empty_text"]
+        _click(handle, layout["empty"].center())
+        assert seen == []
+    finally:
+        handle.close()
+
+
+def test_badges_identify_candidates_before_hovering(application, tmp_path):
+    from slideguard.ui.slide_lens import _label
+
+    marks = {m.key: m for m in build_marks(_report(tmp_path / "d.pptx"), 1)}
+    assert "최소 1 / 권장 0" in _label(marks["1:2"])
+    assert "수정안" not in _label(marks["1:4"])
+
+
+def test_controller_applies_and_reverts_from_the_lens(controller, application):
+    calls = []
+
+    class FakeEditor:
+        applied_ids: set = set()
+
+        def apply(self, report, ids):
+            calls.append(("apply", tuple(ids)))
+            self.applied_ids = set(ids)
+            return LiveResult(applied=list(ids))
+
+        def revert(self, ids):
+            calls.append(("revert", tuple(ids)))
+            self.applied_ids = set()
+            return LiveResult(applied=list(ids))
+
+        def forget(self):
+            self.applied_ids = set()
+
+    controller.live_editor = FakeEditor()
+    assert _poll_until_lens(controller, application, 1)
+    assert set(controller.lens.handles) == {"1:2", "1:3", "1:4"}  # 위치를 모르는 1:5는 요약에만
+    controller.lens.handles["1:2"].toggled.emit(("font.size@1:2",), True)
+    assert _wait_for(lambda: controller._live_task is None and calls, application)
+    application.processEvents()
+    mark = {m.key: m for m in controller.lens.marks}["1:2"]
+    assert calls == [("apply", ("font.size@1:2",))] and mark.applied and mark.options[0].checked
+    controller.lens.option_toggled.emit(("font.size@1:2",), False)
+    assert _wait_for(lambda: controller._live_task is None and len(calls) == 2, application)
+    application.processEvents()
+    assert calls[1] == ("revert", ("font.size@1:2",))
+    assert {m.key: m for m in controller.lens.marks}["1:2"].kind == "warning"
+
+
+def test_failed_live_edit_shows_a_note_on_the_badge(controller, application):
+    class Closed:
+        applied_ids: set = set()
+
+        def apply(self, report, ids):
+            from slideguard.adapters.powerpoint.live_edit import LiveEditUnavailable
+
+            raise LiveEditUnavailable("PowerPoint에서 이 문서가 열려 있을 때만 바로 고칠 수 있습니다.")
+
+        def forget(self):
+            pass
+
+    controller.live_editor = Closed()
+    assert _poll_until_lens(controller, application, 1)
+    controller.lens.option_toggled.emit(("font.size@1:2",), True)
+    assert _wait_for(lambda: controller.lens.handles["1:2"].note != "", application)
+    assert "열려 있을 때만" in controller.lens.handles["1:2"].note
+    assert not controller.lens.handles["1:2"].busy
+
+
+# ---------------------------------------------------------------- 바쁜 커서 줄이기
+
+
+def test_input_activity_asks_once_per_input_after_a_short_pause():
+    state = {"info": (100, 0.05)}
+    activity = InputActivity(lambda: state["info"], settle=0.3)
+    assert not activity.due("lens")  # 아직 입력 중
+    state["info"] = (100, 0.5)
+    assert activity.due("lens")
+    assert not activity.due(
+        "lens"
+    )  # 같은 입력으로는 다시 묻지 않음 (가만히 있으면 PowerPoint를 건드리지 않음)
+    assert activity.due("path")  # 이름별로 따로
+    state["info"] = (250, 0.4)
+    assert activity.due("lens")
+    activity.reset("lens")
+    assert activity.due("lens")
+    assert InputActivity(lambda: None).due("x")  # Windows가 아니면 제한 없음
+
+
+def test_keys_and_wheel_answer_at_once_but_mouse_moves_wait():
+    state = {"info": (1, 5.0), "cursor": (10, 10)}
+    activity = InputActivity(lambda: state["info"], settle=0.2, cursor=lambda: state["cursor"])
+    assert activity.due("lens", quick=True)
+    state["info"] = (2, 0.02)  # PageDown: 커서는 그대로
+    assert activity.due("lens", quick=True)  # 기다리지 않고 바로
+    state["info"], state["cursor"] = (3, 0.02), (40, 60)  # 마우스를 움직이는 중
+    assert not activity.due("lens", quick=True)
+    state["info"] = (3, 0.25)  # 움직임이 멈춤
+    assert activity.due("lens", quick=True)
+    state["info"] = (4, 0.02)  # 타자 중(quick 아님)에는 멈출 때까지 기다림
+    assert not activity.due("lens")
+
+
+def test_idle_user_means_no_more_powerpoint_queries(controller, application):
+    probes = []
+    reader = controller.slide_view_reader
+
+    def counting(path, hwnd):
+        probes.append(path)
+        return reader(path, hwnd)
+
+    controller.slide_view_reader = counting
+    controller.activity = InputActivity(lambda: (7, 10.0))
+    controller._lens_force = True
+    assert _wait_for(lambda: (controller.poll_powerpoint(), len(probes) == 1)[1], application)
+    for _ in range(20):  # 사용자가 아무것도 하지 않음
+        _wait_for(lambda: controller._lens_probe is None, application)
+        controller.poll_powerpoint()
+    assert len(probes) == 2  # 처음 강제로 한 번 + 아직 보지 못한 입력 한 번, 그 뒤로는 묻지 않음
+
+
+def test_density_has_a_separate_slide_wide_badge(tmp_path):
+    report = _report(tmp_path / "d.pptx")
+    report.findings += [
+        _finding("layout.margin:1:9", "layout.margin", "1:9", "review", 4.4, 40.5),
+        _finding("layout.density:1:lines", "layout.density", "1:9", "review", 9, 6),
+    ]
+    marks = {m.key: m for m in build_marks(report, 1)}
+    assert marks["1:9"].title == "여백" and marks["1:9"].more == 0
+    assert marks["1:density"].title == "정보 밀도" and marks["1:density"].more == 0
+    assert "전체" in marks["1:density"].value and "합산" in marks["1:density"].message
+    assert "수정안 만들기" in marks["1:density"].unavailable_reason
+
+
+def test_slide_wide_density_does_not_hide_the_box_own_problem():
+    """정보 밀도는 슬라이드 전체 판정이라, 등급이 더 높아도 상자 자체의 명암비 판정을 배지에 먼저 보여 준다."""
+    report = AnalysisReport(
+        DeckSnapshot("t.pptx", "0" * 64, 1, 960, 540),
+        (
+            _finding("layout.density:2:lines", "layout.density", "2:7", "warning", 14, 6),
+            _finding("contrast:2:7", "contrast", "2:7", "review", 2.6, 4.5),
+        ),
+        (),
+    )
+    marks = {m.key: m for m in build_marks(report, 2)}
+    assert marks["2:7"].title == "명암비" and marks["2:7"].more == 0
+    assert marks["2:density"].title == "정보 밀도"
+
+
+def test_density_badge_shows_latest_split_failure_and_existing_split_route():
+    finding = _finding("layout.density:2:lines", "layout.density", "2:7", "warning", 14, 6)
+    report = AnalysisReport(DeckSnapshot("t.pptx", "hash", 2, 960, 540), [finding])
+    report.proposal_notes[finding.id] = "다단 또는 서로 겹친 본문의 읽기 순서를 확인할 수 없습니다."
+    [mark] = build_marks(report, 2, skip_reasons={finding.id: "이전 사유"})
+    assert "다단" in mark.unavailable_reason and "이전 사유" not in mark.unavailable_reason
+    report.proposal_notes.clear()
+    report.proposals.append(ChangeProposal("slide.split@2:7", finding.id, "2:7", "slide.split", 1, 3, 0.5))
+    [mark] = build_marks(report, 2)
+    assert "검증된 슬라이드 분할안" in mark.unavailable_reason and mark.options == ()
+
+
+def _pointer(widget, kind, local, global_point, buttons):
+    event = QMouseEvent(
+        kind,
+        QPointF(local),
+        QPointF(global_point),
+        Qt.MouseButton.LeftButton if kind != QEvent.Type.MouseMove else Qt.MouseButton.NoButton,
+        buttons,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(widget, event)
+
+
+def test_badge_drag_keeps_target_and_position_across_redraw_zoom_and_slide_changes(application, tmp_path):
+    lens = SlideLens()
+    marks = build_marks(_report(tmp_path / "deck.pptx"), 1)
+    client, slide = QRect(0, 0, 1600, 900), QRect(100, 100, 960, 540)
+    try:
+        lens.set_scene(client, slide, (960, 540), marks, scene_key=("deck", 1))
+        handle = lens.handles["1:2"]
+        original = QRect(handle.anchor)
+        seen = []
+        lens.option_toggled.connect(lambda *args: seen.append(args))
+        press = original.topLeft() + QPoint(20, 10)
+        delta = QPoint(150, 110)
+        _pointer(handle, QEvent.Type.MouseButtonPress, QPoint(20, 10), press, Qt.MouseButton.LeftButton)
+        _pointer(handle, QEvent.Type.MouseMove, QPoint(170, 120), press + delta, Qt.MouseButton.LeftButton)
+        _pointer(
+            handle, QEvent.Type.MouseButtonRelease, QPoint(20, 10), press + delta, Qt.MouseButton.NoButton
+        )
+        moved = original.translated(delta)
+        assert handle.anchor == moved and not seen
+        assert handle.mark.box == DEFAULT_BOX  # only the label moved; target coordinates stayed fixed
+        lens.set_scene(client, slide.translated(20, 30), (960, 540), marks, scene_key=("deck", 1))
+        assert handle.anchor == moved.translated(20, 30)
+        lens.set_scene(client, QRect(100, 100, 480, 270), (960, 540), marks, scene_key=("deck", 1))
+        assert abs(handle.anchor.x() - (100 + (moved.x() - 100) / 2)) <= 1
+        assert abs(handle.anchor.y() - (100 + (moved.y() - 100) / 2)) <= 1
+        lens.set_scene(client, slide, (960, 540), marks, scene_key=("other-deck", 1))
+        assert handle.anchor == original
+        lens.set_scene(client, slide, (960, 540), marks, scene_key=("deck", 1))
+        assert handle.anchor == moved
+    finally:
+        lens.close()
+
+
+def test_hover_focus_tracks_the_label_and_clears_on_leave(application, tmp_path):
+    lens = SlideLens()
+    try:
+        lens.set_scene(
+            QRect(0, 0, 1200, 700),
+            QRect(100, 80, 960, 540),
+            (960, 540),
+            build_marks(_report(tmp_path / "d.pptx"), 1),
+        )
+        first, second = lens.handles["1:2"], lens.handles["1:3"]
+        enter = QEnterEvent(QPointF(5, 5), QPointF(5, 5), QPointF(200, 150))
+        first.enterEvent(enter)
+        assert lens._focused_key == "1:2" and second._dimmed and not first._dimmed
+        second.enterEvent(enter)
+        first.leaveEvent(QEvent(QEvent.Type.Leave))
+        assert lens._focused_key == "1:3" and first._dimmed and not second._dimmed
+        second.leaveEvent(QEvent(QEvent.Type.Leave))
+        assert lens._focused_key is None and not first._dimmed
+    finally:
+        lens.close()
+
+
+def test_focused_area_and_leader_are_painted_above_other_overlapping_marks(application):
+    from slideguard.ui.slide_lens import LensMark
+
+    marks = [
+        LensMark("1:1", Box(100, 100, 200, 100), "warning", "명암비", ""),
+        LensMark("1:2", Box(150, 120, 200, 100), "warning", "글자 크기", ""),
+    ]
+
+    def render(focused=None):
+        result = QImage(800, 450, QImage.Format.Format_ARGB32)
+        result.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(result)
+        paint_lens(
+            painter,
+            QRectF(0, 0, 800, 450),
+            (800, 450),
+            marks,
+            QRectF(result.rect()),
+            badges=False,
+            focused_key=focused,
+            focused_badge=QRectF(450, 300, 180, 26),
+        )
+        painter.end()
+        return result
+
+    normal, focus = render(), render("1:1")
+    assert focus.pixelColor(100, 150).blue() > focus.pixelColor(100, 150).red()
+    assert focus.pixelColor(350, 180).alpha() < normal.pixelColor(350, 180).alpha()
+    # The leader joins the moved label to the focused region, away from either frame.
+    assert any(
+        focus.pixelColor(x, 250).blue() > 200 and focus.pixelColor(x, 250).alpha() > 100
+        for x in range(350, 450)
+    )
+
+
+def test_fill_change_reads_as_color_not_a_dict():
+    from slideguard.ui.slide_lens import _short
+
+    assert _short(None, "shape.fill") == "없음"
+    assert _short({"color": "000000", "transparency": 0.3}, "shape.fill") == "#000000 (불투명 70%)"
+
+
+def test_small_table_cells_show_one_badge_on_the_table():
+    """표 칸마다 배지가 뜨면 표가 배지로 덮인다 (함정 PPT 7쪽) → 표 하나에 배지 하나, 후보도 표에."""
+    cells = tuple(
+        _finding(
+            f"typography:7:5:table_cell:{row},1",
+            "typography",
+            f"7:5:table_cell:{row},1",
+            "warning",
+            10,
+            14,
+            Box(40, 100 + row * 30, 100, 20),
+        )
+        for row in (1, 2, 3)
+    )
+    fix = ChangeProposal("font.size@7:5", "typography:7:5:table_cell:1,1", "7:5", "font.size", 10, 14, 0.4)
+    report = AnalysisReport(DeckSnapshot("t.pptx", "0" * 64, 7, 960, 540), cells, (fix,))
+    marks = build_marks(report, 7)
+    assert [mark.key for mark in marks] == ["7:5"]
+    assert marks[0].box == Box(40, 130, 100, 80) and len(marks[0].options) == 1
+
+
+def test_expanded_badge_is_raised_above_neighbouring_badges(application, monkeypatch):
+    """펼친 카드가 옆 배지 창에 덮여 체크 항목을 누를 수 없던 문제: 펼칠 때 맨 앞으로 올린다."""
+    raised = []
+    monkeypatch.setattr(BadgeHandle, "raise_", lambda self: raised.append(self))
+    handle = BadgeHandle()
+    mark = build_marks(
+        AnalysisReport(
+            DeckSnapshot("t.pptx", "0" * 64, 1, 960, 540),
+            (_finding("typography:1:5", "typography", "1:5", "warning", 10, 14),),
+            (),
+        ),
+        1,
+    )[0]
+    handle.set_mark(mark, QRect(10, 10, 160, 22))
+    handle.expand()
+    assert raised == [handle]
+    handle.close()
+
+
+def test_panel_checkbox_goes_to_the_slide_and_applies_to_the_open_document(controller, application):
+    """상단 패널의 수정 후보 체크도 렌즈처럼 열린 문서에 바로 적용하고, 그 슬라이드로 이동한다."""
+    from slideguard.adapters.powerpoint.live_edit import LiveResult
+
+    calls, moved = [], []
+
+    class Editor:
+        applied_ids: set = set()
+
+        def apply(self, report, ids):
+            calls.append(("apply", tuple(ids)))
+            self.applied_ids = set(ids)
+            return LiveResult(applied=list(ids))
+
+        def revert(self, ids):
+            calls.append(("revert", tuple(ids)))
+            self.applied_ids = set()
+            return LiveResult(applied=list(ids))
+
+        def forget(self):
+            pass
+
+    controller.live_editor = Editor()
+    controller.slide_navigator = lambda path, slide: moved.append(slide) or True
+    item = controller.overlay.proposal_items["font.size@1:2"]
+    item.setSelected(True)
+    assert _wait_for(lambda: calls == [("apply", ("font.size@1:2",))], application)
+    assert moved == [1]
+    assert _wait_for(lambda: controller._live_task is None, application)
+    item.setSelected(False)
+    assert _wait_for(lambda: calls[-1] == ("revert", ("font.size@1:2",)), application)
+    assert moved == [1]  # 해제할 때는 이동하지 않음
+
+
+def test_unknown_cell_findings_join_the_table_badge():
+    cells = (
+        _finding("contrast:7:5:table_cell:2,1", "contrast", "7:5:table_cell:2,1", "unknown", None, None),
+        _finding("contrast:7:5:table_cell:1,2", "contrast", "7:5:table_cell:1,2", "warning", 4.0, 4.5),
+    )
+    report = AnalysisReport(DeckSnapshot("t.pptx", "0" * 64, 7, 960, 540), cells, ())
+    assert sorted(mark.key for mark in build_marks(report, 7)) == ["7:5", "7:5:table_cell:1,2"]
+
+
+def test_new_rules_have_short_badge_text():
+    from slideguard.ui.slide_lens import metric_text, rule_title
+
+    cases = [
+        ("color_vision.contrast", 2.35, 3.0, ("2.4:1", "최소 3:1"), "색약 명암비"),
+        ("color_vision.color_only", 7.3, 15.0, ("구분 어려움", ""), "색만으로 강조"),
+        ("consistency.title_position", "100,72", "43,29", ("위치 다름", ""), "제목 위치"),
+        ("consistency.title_size", 24.0, 32.0, ("24pt", "다른 쪽 32pt"), "제목 크기"),
+        ("image_text.size", 11.2, 14.0, ("약 11.2pt", "최소 14pt"), "그림 속 글자"),
+    ]
+    for rule, measured, expected, text, title in cases:
+        finding = Finding(f"{rule}:1:2", rule, "1:2", "review", "", measured, expected, "")
+        assert metric_text(finding) == text and rule_title(finding) == title
+
+
+def test_panel_batch_checkbox_checks_every_same_place_fix(controller, application):
+    """상단 패널: '같은 자리 일괄 적용' 체크 하나로 여러 슬라이드 후보를 함께 체크하고, 개별 체크도 그대로."""
+    from slideguard.domain.models import Shape, TextRun
+
+    page = [
+        Shape(
+            n,
+            9,
+            "쪽 번호",
+            Box(880, 500, 60, 24),
+            text=str(n),
+            runs=(TextRun(str(n), 10.0),),
+            supported=True,
+            placeholder_type=13,
+        )
+        for n in (1, 2)
+    ]
+    findings = tuple(
+        _finding(f"typography:{n}:9:1", "typography", f"{n}:9", "warning", 10.0, 14.0) for n in (1, 2)
+    )
+    proposals = tuple(
+        ChangeProposal(f"font.size@{n}:9", f"typography:{n}:9:1", f"{n}:9", "font.size", 10.0, 14.0, 0.1)
+        for n in (1, 2)
+    )
+    path = controller.overlay._report.deck.source_path
+    report = AnalysisReport(DeckSnapshot(path, "abc", 2, 960, 540, shapes=tuple(page)), findings, proposals)
+    calls = []
+    controller.toggle_live_edit = lambda ids, checked: calls.append((tuple(ids), checked))
+    controller.overlay.show_report(report)
+    panel = controller.overlay
+    [(batch, members)] = panel.batch_items
+    assert members == ("font.size@1:9", "font.size@2:9") and "쪽 번호 · 그룹 2쪽" in batch.text()
+    assert all(item.isHidden() for item in panel.proposal_items.values())
+    batch.setCheckState(Qt.CheckState.Checked)
+    assert set(panel.selected_proposal_ids()) == {"font.size@1:9", "font.size@2:9"}
+    assert calls[-1] == (members, True)
+    panel.proposal_items["font.size@2:9"].setSelected(False)  # 하나만 해제
+    assert batch.checkState() == Qt.CheckState.Unchecked
+    assert panel.selected_proposal_ids() == ("font.size@1:9",)
+    assert calls[-1] == (("font.size@2:9",), False)
+    batch.setCheckState(Qt.CheckState.Checked)
+    batch.setCheckState(Qt.CheckState.Unchecked)
+    assert panel.selected_proposal_ids() == ()
+    assert calls[-1] == (members, False)
+
+
+def test_change_badge_explains_why_the_colour_changes():
+    """글자색 수정을 고르면 배지 설명에 '명암비 전 → 후 (기준)'이 붙는다."""
+    from slideguard.domain.models import AnalysisReport, Box, ChangeProposal, DeckSnapshot, Finding, Shape
+    from slideguard.ui.slide_lens import build_marks, change_reason
+
+    shape = Shape(1, 5, "쪽 번호", Box(800, 480, 100, 40), text="12/23", background=(0x80, 0x90, 0x80))
+    deck = DeckSnapshot("d.pptx", "0" * 64, 1, 960, 540, shapes=(shape,))
+    finding = Finding(
+        id="contrast:1:5",
+        rule_id="contrast",
+        shape_key="1:5",
+        severity="warning",
+        message="글자와 배경의 명암비가 낮습니다",
+        measured=1.4,
+        expected=4.5,
+        evidence="글자 #A0A8B0 / 배경 #809080",
+        box=shape.box,
+    )
+    proposal = ChangeProposal("prop@1:5", "contrast:1:5", "1:5", "font.color", "A0A8B0", "000000", 0.5)
+    report = AnalysisReport(deck, [finding], [proposal])
+    reason = change_reason(report, proposal)
+    assert "명암비" in reason and "→" in reason and "기준 4.5:1" in reason
+    [mark] = build_marks(report, 1, selected_ids={"prop@1:5"})
+    assert "왜 바꾸나요?" in mark.message
